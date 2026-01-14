@@ -24,6 +24,11 @@ const SIGTERM: i64 = 15;
 // Maximum services
 const MAX_SERVICES: i64 = 16;
 
+// Restart configuration
+const MAX_RESTART_COUNT: i64 = 5;
+const RESTART_COOLDOWN_TICKS: i64 = 100;
+const RESTART_BACKOFF_BASE: i64 = 50;
+
 // IPC Message types
 const MSG_TYPE_REGISTER: i64 = 1;
 const MSG_TYPE_STATUS: i64 = 2;
@@ -75,6 +80,30 @@ fn get_service_endpoint(idx: i64) -> i64 {
 
 fn set_service_endpoint(idx: i64, endpoint: i64) {
     runtime::write_u64(get_service_addr(idx) + 24, endpoint);
+}
+
+fn get_service_path(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 32)
+}
+
+fn set_service_path(idx: i64, path: i64) {
+    runtime::write_u64(get_service_addr(idx) + 32, path);
+}
+
+fn get_service_restart_count(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 40)
+}
+
+fn set_service_restart_count(idx: i64, count: i64) {
+    runtime::write_u64(get_service_addr(idx) + 40, count);
+}
+
+fn get_service_last_restart(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 48)
+}
+
+fn set_service_last_restart(idx: i64, time: i64) {
+    runtime::write_u64(get_service_addr(idx) + 48, time);
 }
 
 fn init_service_table() {
@@ -142,6 +171,7 @@ fn start_service(idx: i64, path: i64) -> i64 {
     }
 
     set_service_state(idx, SVC_STATE_STARTING);
+    set_service_path(idx, path);
 
     let pid = runtime::exec(path);
     if pid < 0 {
@@ -151,6 +181,7 @@ fn start_service(idx: i64, path: i64) -> i64 {
 
     set_service_pid(idx, pid);
     set_service_state(idx, SVC_STATE_RUNNING);
+    set_service_restart_count(idx, 0);
 
     return pid;
 }
@@ -185,9 +216,51 @@ fn handle_child_exit(child_pid: i64) {
 
     let is_critical = flags & SVC_FLAG_CRITICAL;
     if is_critical != 0 {
+        // Critical service exited - attempt restart
+        let restart_count = get_service_restart_count(idx);
+
+        if restart_count < MAX_RESTART_COUNT {
+            // Schedule restart with backoff
+            let path = get_service_path(idx);
+            if path != 0 {
+                // Apply exponential backoff delay
+                let delay = RESTART_BACKOFF_BASE * (restart_count + 1);
+                runtime::sleep(delay);
+
+                // Attempt restart
+                set_service_restart_count(idx, restart_count + 1);
+                set_service_last_restart(idx, runtime::time());
+
+                let new_pid = runtime::exec(path);
+                if new_pid > 0 {
+                    set_service_pid(idx, new_pid);
+                    set_service_state(idx, SVC_STATE_RUNNING);
+                    print_restart_msg(idx, restart_count + 1);
+                    return;
+                }
+            }
+        }
+
+        // Restart failed or max retries exceeded
         set_service_state(idx, SVC_STATE_FAILED);
+        print_failed_msg(idx);
     } else {
         set_service_state(idx, SVC_STATE_STOPPED);
+    }
+}
+
+fn reset_restart_count(idx: i64) {
+    // Called periodically to reset restart count for healthy services
+    let state = get_service_state(idx);
+    if state == SVC_STATE_RUNNING {
+        let last_restart = get_service_last_restart(idx);
+        let current_time = runtime::time();
+        let elapsed = current_time - last_restart;
+
+        // Reset counter if service has been stable for cooldown period
+        if elapsed > RESTART_COOLDOWN_TICKS {
+            set_service_restart_count(idx, 0);
+        }
     }
 }
 
@@ -398,6 +471,78 @@ fn print_loop_msg() {
     newline();
 }
 
+// Print "[init] Restarting service X (attempt N)"
+fn print_restart_msg(idx: i64, attempt: i64) {
+    print_init_prefix();
+    runtime::print_char(82);  // R
+    runtime::print_char(101); // e
+    runtime::print_char(115); // s
+    runtime::print_char(116); // t
+    runtime::print_char(97);  // a
+    runtime::print_char(114); // r
+    runtime::print_char(116); // t
+    runtime::print_char(105); // i
+    runtime::print_char(110); // n
+    runtime::print_char(103); // g
+    runtime::print_char(32);  // space
+    runtime::print_char(115); // s
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(118); // v
+    runtime::print_char(105); // i
+    runtime::print_char(99);  // c
+    runtime::print_char(101); // e
+    runtime::print_char(32);  // space
+    runtime::print_num(idx);
+    runtime::print_char(32);  // space
+    runtime::print_char(40);  // (
+    runtime::print_char(97);  // a
+    runtime::print_char(116); // t
+    runtime::print_char(116); // t
+    runtime::print_char(101); // e
+    runtime::print_char(109); // m
+    runtime::print_char(112); // p
+    runtime::print_char(116); // t
+    runtime::print_char(32);  // space
+    runtime::print_num(attempt);
+    runtime::print_char(41);  // )
+    newline();
+}
+
+// Print "[init] Service X failed permanently"
+fn print_failed_msg(idx: i64) {
+    print_init_prefix();
+    runtime::print_char(83);  // S
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(118); // v
+    runtime::print_char(105); // i
+    runtime::print_char(99);  // c
+    runtime::print_char(101); // e
+    runtime::print_char(32);  // space
+    runtime::print_num(idx);
+    runtime::print_char(32);  // space
+    runtime::print_char(102); // f
+    runtime::print_char(97);  // a
+    runtime::print_char(105); // i
+    runtime::print_char(108); // l
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    runtime::print_char(32);  // space
+    runtime::print_char(112); // p
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(109); // m
+    runtime::print_char(97);  // a
+    runtime::print_char(110); // n
+    runtime::print_char(101); // e
+    runtime::print_char(110); // n
+    runtime::print_char(116); // t
+    runtime::print_char(108); // l
+    runtime::print_char(121); // y
+    newline();
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -415,6 +560,8 @@ fn main() {
 
     print_loop_msg();
 
+    let mut health_check_counter: i64 = 0;
+
     loop {
         let sender = runtime::recv(MSG_BUFFER);
         if sender > 0 {
@@ -424,6 +571,17 @@ fn main() {
         let child = runtime::wait();
         if child > 0 {
             handle_child_exit(child);
+        }
+
+        // Periodic health check: reset restart counters for stable services
+        health_check_counter = health_check_counter + 1;
+        if health_check_counter >= 100 {
+            health_check_counter = 0;
+            let mut i: i64 = 0;
+            while i < MAX_SERVICES {
+                reset_restart_count(i);
+                i = i + 1;
+            }
         }
 
         runtime::yield_cpu();

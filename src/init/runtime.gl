@@ -1,5 +1,7 @@
 // Genesis Runtime Library
 // Syscall wrappers for userspace programs
+//
+// This module is used by init. For standalone library, see lib/libruntime.gl
 
 // ============================================================================
 // Syscall Numbers (must match kernel)
@@ -67,8 +69,7 @@ pub const SVC_INPUT: i64 = 50;
 // Low-level Syscall Functions
 // ============================================================================
 
-// Syscall with no arguments
-pub fn syscall0(num: i64) -> i64 {
+fn syscall0(num: i64) -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
@@ -81,8 +82,7 @@ pub fn syscall0(num: i64) -> i64 {
     result
 }
 
-// Syscall with 1 argument
-pub fn syscall1(num: i64, arg1: i64) -> i64 {
+fn syscall1(num: i64, arg1: i64) -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
@@ -96,8 +96,7 @@ pub fn syscall1(num: i64, arg1: i64) -> i64 {
     result
 }
 
-// Syscall with 2 arguments
-pub fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
+fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
@@ -112,8 +111,7 @@ pub fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
     result
 }
 
-// Syscall with 3 arguments
-pub fn syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+fn syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
     let mut result: i64 = 0;
     unsafe {
         asm!(
@@ -129,41 +127,51 @@ pub fn syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
     result
 }
 
+fn syscall4(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // ============================================================================
 // Process Management
 // ============================================================================
 
-// Yield CPU to scheduler
 pub fn yield_cpu() {
     syscall0(SYS_YIELD);
 }
 
-// Get current process ID
 pub fn getpid() -> i64 {
     syscall0(SYS_GETPID)
 }
 
-// Get parent process ID
 pub fn getppid() -> i64 {
     syscall0(SYS_GETPPID)
 }
 
-// Exit current process
 pub fn exit() {
     syscall0(SYS_EXIT);
 }
 
-// Execute ELF binary (path_ptr points to null-terminated path string)
 pub fn exec(path_ptr: i64) -> i64 {
     syscall1(SYS_EXEC, path_ptr)
 }
 
-// Send signal to process
 pub fn kill(pid: i64, signal: i64) -> i64 {
     syscall2(SYS_KILL, pid, signal)
 }
 
-// Wait for child process (returns child PID or -1)
 pub fn wait() -> i64 {
     syscall0(SYS_WAIT)
 }
@@ -172,15 +180,30 @@ pub fn wait() -> i64 {
 // Console I/O
 // ============================================================================
 
-// Print a single character
 pub fn print_char(c: i64) {
     syscall1(SYS_PRINT, c);
 }
 
-// Print a number in decimal
+pub fn print_str(s: i64) {
+    let mut ptr = s;
+    loop {
+        let c = read_byte(ptr);
+        if c == 0 {
+            break;
+        }
+        print_char(c);
+        ptr = ptr + 1;
+    }
+}
+
+pub fn println(s: i64) {
+    print_str(s);
+    print_char(10);
+}
+
 pub fn print_num(n: i64) {
     if n < 0 {
-        print_char(45); // '-'
+        print_char(45);
         print_num(0 - n);
         return;
     }
@@ -194,12 +217,10 @@ pub fn print_num(n: i64) {
 // IPC - Inter-Process Communication
 // ============================================================================
 
-// Send message to process
 pub fn send(dest_pid: i64, msg_ptr: i64) -> i64 {
     syscall2(SYS_SEND, dest_pid, msg_ptr)
 }
 
-// Receive message (blocking)
 pub fn recv(buffer_ptr: i64) -> i64 {
     syscall1(SYS_RECV, buffer_ptr)
 }

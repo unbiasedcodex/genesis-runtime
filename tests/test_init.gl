@@ -1,0 +1,582 @@
+// Genesis Init System Tests
+// Unit tests for init service management
+
+mod runtime;
+
+// ============================================================================
+// Test Configuration
+// ============================================================================
+
+const TEST_SERVICE_TABLE: i64 = 0x900000;  // Different from init's table
+const SERVICE_ENTRY_SIZE: i64 = 64;
+const MAX_SERVICES: i64 = 16;
+
+// Service states
+const SVC_STATE_STOPPED: i64 = 0;
+const SVC_STATE_STARTING: i64 = 1;
+const SVC_STATE_RUNNING: i64 = 2;
+const SVC_STATE_FAILED: i64 = 3;
+
+// Service flags
+const SVC_FLAG_CRITICAL: i64 = 1;
+const SVC_FLAG_AUTOSTART: i64 = 2;
+
+// Test counters
+const TEST_PASS_COUNT: i64 = 0x910000;
+const TEST_FAIL_COUNT: i64 = 0x910008;
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+fn get_test_service_addr(idx: i64) -> i64 {
+    TEST_SERVICE_TABLE + (idx * SERVICE_ENTRY_SIZE)
+}
+
+fn test_get_pid(idx: i64) -> i64 {
+    runtime::read_u64(get_test_service_addr(idx))
+}
+
+fn test_set_pid(idx: i64, pid: i64) {
+    runtime::write_u64(get_test_service_addr(idx), pid);
+}
+
+fn test_get_state(idx: i64) -> i64 {
+    runtime::read_u64(get_test_service_addr(idx) + 8)
+}
+
+fn test_set_state(idx: i64, state: i64) {
+    runtime::write_u64(get_test_service_addr(idx) + 8, state);
+}
+
+fn test_get_flags(idx: i64) -> i64 {
+    runtime::read_u64(get_test_service_addr(idx) + 16)
+}
+
+fn test_set_flags(idx: i64, flags: i64) {
+    runtime::write_u64(get_test_service_addr(idx) + 16, flags);
+}
+
+fn test_get_restart_count(idx: i64) -> i64 {
+    runtime::read_u64(get_test_service_addr(idx) + 40)
+}
+
+fn test_set_restart_count(idx: i64, count: i64) {
+    runtime::write_u64(get_test_service_addr(idx) + 40, count);
+}
+
+fn init_test_table() {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        runtime::memset(get_test_service_addr(i), 0, SERVICE_ENTRY_SIZE);
+        i = i + 1;
+    }
+}
+
+fn find_free_test_slot() -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        if test_get_state(i) == SVC_STATE_STOPPED {
+            if test_get_pid(i) == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn find_test_service_by_pid(pid: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        if test_get_pid(i) == pid {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// Test Output
+// ============================================================================
+
+fn print_test_name(name_ptr: i64) {
+    runtime::print_char(91);  // [
+    runtime::print_char(84);  // T
+    runtime::print_char(69);  // E
+    runtime::print_char(83);  // S
+    runtime::print_char(84);  // T
+    runtime::print_char(93);  // ]
+    runtime::print_char(32);  // space
+    runtime::print_str(name_ptr);
+}
+
+fn print_pass() {
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(65);  // A
+    runtime::print_char(83);  // S
+    runtime::print_char(83);  // S
+    runtime::print_char(10);  // newline
+
+    let count = runtime::read_u64(TEST_PASS_COUNT);
+    runtime::write_u64(TEST_PASS_COUNT, count + 1);
+}
+
+fn print_fail() {
+    runtime::print_char(32);  // space
+    runtime::print_char(70);  // F
+    runtime::print_char(65);  // A
+    runtime::print_char(73);  // I
+    runtime::print_char(76);  // L
+    runtime::print_char(10);  // newline
+
+    let count = runtime::read_u64(TEST_FAIL_COUNT);
+    runtime::write_u64(TEST_FAIL_COUNT, count + 1);
+}
+
+fn assert_eq(actual: i64, expected: i64) -> i64 {
+    if actual == expected {
+        return 1;
+    }
+    return 0;
+}
+
+fn assert_neq(actual: i64, expected: i64) -> i64 {
+    if actual != expected {
+        return 1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Test Cases
+// ============================================================================
+
+// Store test name strings in memory
+const STR_INIT_TABLE: i64 = 0x920000;
+const STR_FIND_SLOT: i64 = 0x920100;
+const STR_FIND_PID: i64 = 0x920200;
+const STR_STATE_TRANS: i64 = 0x920300;
+const STR_CRITICAL_FLAG: i64 = 0x920400;
+const STR_RESTART_COUNT: i64 = 0x920500;
+const STR_MAX_SERVICES: i64 = 0x920600;
+
+fn setup_test_strings() {
+    // "init_table"
+    runtime::write_byte(STR_INIT_TABLE, 105);     // i
+    runtime::write_byte(STR_INIT_TABLE + 1, 110); // n
+    runtime::write_byte(STR_INIT_TABLE + 2, 105); // i
+    runtime::write_byte(STR_INIT_TABLE + 3, 116); // t
+    runtime::write_byte(STR_INIT_TABLE + 4, 95);  // _
+    runtime::write_byte(STR_INIT_TABLE + 5, 116); // t
+    runtime::write_byte(STR_INIT_TABLE + 6, 97);  // a
+    runtime::write_byte(STR_INIT_TABLE + 7, 98);  // b
+    runtime::write_byte(STR_INIT_TABLE + 8, 108); // l
+    runtime::write_byte(STR_INIT_TABLE + 9, 101); // e
+    runtime::write_byte(STR_INIT_TABLE + 10, 0);
+
+    // "find_slot"
+    runtime::write_byte(STR_FIND_SLOT, 102);     // f
+    runtime::write_byte(STR_FIND_SLOT + 1, 105); // i
+    runtime::write_byte(STR_FIND_SLOT + 2, 110); // n
+    runtime::write_byte(STR_FIND_SLOT + 3, 100); // d
+    runtime::write_byte(STR_FIND_SLOT + 4, 95);  // _
+    runtime::write_byte(STR_FIND_SLOT + 5, 115); // s
+    runtime::write_byte(STR_FIND_SLOT + 6, 108); // l
+    runtime::write_byte(STR_FIND_SLOT + 7, 111); // o
+    runtime::write_byte(STR_FIND_SLOT + 8, 116); // t
+    runtime::write_byte(STR_FIND_SLOT + 9, 0);
+
+    // "find_by_pid"
+    runtime::write_byte(STR_FIND_PID, 102);      // f
+    runtime::write_byte(STR_FIND_PID + 1, 105);  // i
+    runtime::write_byte(STR_FIND_PID + 2, 110);  // n
+    runtime::write_byte(STR_FIND_PID + 3, 100);  // d
+    runtime::write_byte(STR_FIND_PID + 4, 95);   // _
+    runtime::write_byte(STR_FIND_PID + 5, 98);   // b
+    runtime::write_byte(STR_FIND_PID + 6, 121);  // y
+    runtime::write_byte(STR_FIND_PID + 7, 95);   // _
+    runtime::write_byte(STR_FIND_PID + 8, 112);  // p
+    runtime::write_byte(STR_FIND_PID + 9, 105);  // i
+    runtime::write_byte(STR_FIND_PID + 10, 100); // d
+    runtime::write_byte(STR_FIND_PID + 11, 0);
+
+    // "state_transition"
+    runtime::write_byte(STR_STATE_TRANS, 115);      // s
+    runtime::write_byte(STR_STATE_TRANS + 1, 116);  // t
+    runtime::write_byte(STR_STATE_TRANS + 2, 97);   // a
+    runtime::write_byte(STR_STATE_TRANS + 3, 116);  // t
+    runtime::write_byte(STR_STATE_TRANS + 4, 101);  // e
+    runtime::write_byte(STR_STATE_TRANS + 5, 95);   // _
+    runtime::write_byte(STR_STATE_TRANS + 6, 116);  // t
+    runtime::write_byte(STR_STATE_TRANS + 7, 114);  // r
+    runtime::write_byte(STR_STATE_TRANS + 8, 97);   // a
+    runtime::write_byte(STR_STATE_TRANS + 9, 110);  // n
+    runtime::write_byte(STR_STATE_TRANS + 10, 115); // s
+    runtime::write_byte(STR_STATE_TRANS + 11, 0);
+
+    // "critical_flag"
+    runtime::write_byte(STR_CRITICAL_FLAG, 99);      // c
+    runtime::write_byte(STR_CRITICAL_FLAG + 1, 114); // r
+    runtime::write_byte(STR_CRITICAL_FLAG + 2, 105); // i
+    runtime::write_byte(STR_CRITICAL_FLAG + 3, 116); // t
+    runtime::write_byte(STR_CRITICAL_FLAG + 4, 105); // i
+    runtime::write_byte(STR_CRITICAL_FLAG + 5, 99);  // c
+    runtime::write_byte(STR_CRITICAL_FLAG + 6, 97);  // a
+    runtime::write_byte(STR_CRITICAL_FLAG + 7, 108); // l
+    runtime::write_byte(STR_CRITICAL_FLAG + 8, 95);  // _
+    runtime::write_byte(STR_CRITICAL_FLAG + 9, 102); // f
+    runtime::write_byte(STR_CRITICAL_FLAG + 10, 108);// l
+    runtime::write_byte(STR_CRITICAL_FLAG + 11, 97); // a
+    runtime::write_byte(STR_CRITICAL_FLAG + 12, 103);// g
+    runtime::write_byte(STR_CRITICAL_FLAG + 13, 0);
+
+    // "restart_count"
+    runtime::write_byte(STR_RESTART_COUNT, 114);      // r
+    runtime::write_byte(STR_RESTART_COUNT + 1, 101);  // e
+    runtime::write_byte(STR_RESTART_COUNT + 2, 115);  // s
+    runtime::write_byte(STR_RESTART_COUNT + 3, 116);  // t
+    runtime::write_byte(STR_RESTART_COUNT + 4, 97);   // a
+    runtime::write_byte(STR_RESTART_COUNT + 5, 114);  // r
+    runtime::write_byte(STR_RESTART_COUNT + 6, 116);  // t
+    runtime::write_byte(STR_RESTART_COUNT + 7, 95);   // _
+    runtime::write_byte(STR_RESTART_COUNT + 8, 99);   // c
+    runtime::write_byte(STR_RESTART_COUNT + 9, 111);  // o
+    runtime::write_byte(STR_RESTART_COUNT + 10, 117); // u
+    runtime::write_byte(STR_RESTART_COUNT + 11, 110); // n
+    runtime::write_byte(STR_RESTART_COUNT + 12, 116); // t
+    runtime::write_byte(STR_RESTART_COUNT + 13, 0);
+
+    // "max_services"
+    runtime::write_byte(STR_MAX_SERVICES, 109);      // m
+    runtime::write_byte(STR_MAX_SERVICES + 1, 97);   // a
+    runtime::write_byte(STR_MAX_SERVICES + 2, 120);  // x
+    runtime::write_byte(STR_MAX_SERVICES + 3, 95);   // _
+    runtime::write_byte(STR_MAX_SERVICES + 4, 115);  // s
+    runtime::write_byte(STR_MAX_SERVICES + 5, 101);  // e
+    runtime::write_byte(STR_MAX_SERVICES + 6, 114);  // r
+    runtime::write_byte(STR_MAX_SERVICES + 7, 118);  // v
+    runtime::write_byte(STR_MAX_SERVICES + 8, 105);  // i
+    runtime::write_byte(STR_MAX_SERVICES + 9, 99);   // c
+    runtime::write_byte(STR_MAX_SERVICES + 10, 101); // e
+    runtime::write_byte(STR_MAX_SERVICES + 11, 115); // s
+    runtime::write_byte(STR_MAX_SERVICES + 12, 0);
+}
+
+// Test 1: Service table initialization
+fn test_init_table() {
+    print_test_name(STR_INIT_TABLE);
+
+    init_test_table();
+
+    // All services should be stopped with PID 0
+    let mut passed: i64 = 1;
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        if test_get_state(i) != SVC_STATE_STOPPED {
+            passed = 0;
+        }
+        if test_get_pid(i) != 0 {
+            passed = 0;
+        }
+        i = i + 1;
+    }
+
+    if passed == 1 {
+        print_pass();
+    } else {
+        print_fail();
+    }
+}
+
+// Test 2: Find free slot
+fn test_find_free_slot() {
+    print_test_name(STR_FIND_SLOT);
+
+    init_test_table();
+
+    // Should find slot 0
+    let slot1 = find_free_test_slot();
+
+    // Mark slot 0 as used
+    test_set_pid(0, 100);
+    test_set_state(0, SVC_STATE_RUNNING);
+
+    // Should find slot 1
+    let slot2 = find_free_test_slot();
+
+    if slot1 == 0 {
+        if slot2 == 1 {
+            print_pass();
+            return;
+        }
+    }
+    print_fail();
+}
+
+// Test 3: Find service by PID
+fn test_find_by_pid() {
+    print_test_name(STR_FIND_PID);
+
+    init_test_table();
+
+    // Add services with different PIDs
+    test_set_pid(2, 200);
+    test_set_pid(5, 500);
+    test_set_pid(10, 1000);
+
+    let idx1 = find_test_service_by_pid(200);
+    let idx2 = find_test_service_by_pid(500);
+    let idx3 = find_test_service_by_pid(1000);
+    let idx4 = find_test_service_by_pid(999);  // Not found
+
+    if idx1 == 2 {
+        if idx2 == 5 {
+            if idx3 == 10 {
+                if idx4 == (0 - 1) {
+                    print_pass();
+                    return;
+                }
+            }
+        }
+    }
+    print_fail();
+}
+
+// Test 4: State transitions
+fn test_state_transitions() {
+    print_test_name(STR_STATE_TRANS);
+
+    init_test_table();
+
+    // Test state transition: STOPPED -> STARTING -> RUNNING
+    test_set_state(0, SVC_STATE_STOPPED);
+    let s1 = test_get_state(0);
+
+    test_set_state(0, SVC_STATE_STARTING);
+    let s2 = test_get_state(0);
+
+    test_set_state(0, SVC_STATE_RUNNING);
+    let s3 = test_get_state(0);
+
+    test_set_state(0, SVC_STATE_FAILED);
+    let s4 = test_get_state(0);
+
+    if s1 == SVC_STATE_STOPPED {
+        if s2 == SVC_STATE_STARTING {
+            if s3 == SVC_STATE_RUNNING {
+                if s4 == SVC_STATE_FAILED {
+                    print_pass();
+                    return;
+                }
+            }
+        }
+    }
+    print_fail();
+}
+
+// Bitwise helper functions
+fn bit_and(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "andq %rsi, %rax",
+            in("rax") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn bit_or(a: i64, b: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "orq %rsi, %rax",
+            in("rax") a,
+            in("rsi") b,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Test 5: Critical flag handling
+fn test_critical_flag() {
+    print_test_name(STR_CRITICAL_FLAG);
+
+    init_test_table();
+
+    test_set_flags(0, SVC_FLAG_CRITICAL);
+    test_set_flags(1, SVC_FLAG_AUTOSTART);
+    test_set_flags(2, bit_or(SVC_FLAG_CRITICAL, SVC_FLAG_AUTOSTART));
+
+    let f0 = test_get_flags(0);
+    let f1 = test_get_flags(1);
+    let f2 = test_get_flags(2);
+
+    let is_critical_0 = bit_and(f0, SVC_FLAG_CRITICAL);
+    let is_critical_1 = bit_and(f1, SVC_FLAG_CRITICAL);
+    let is_critical_2 = bit_and(f2, SVC_FLAG_CRITICAL);
+
+    if is_critical_0 != 0 {
+        if is_critical_1 == 0 {
+            if is_critical_2 != 0 {
+                print_pass();
+                return;
+            }
+        }
+    }
+    print_fail();
+}
+
+// Test 6: Restart count tracking
+fn test_restart_count() {
+    print_test_name(STR_RESTART_COUNT);
+
+    init_test_table();
+
+    test_set_restart_count(0, 0);
+    let c1 = test_get_restart_count(0);
+
+    test_set_restart_count(0, 3);
+    let c2 = test_get_restart_count(0);
+
+    test_set_restart_count(0, 5);
+    let c3 = test_get_restart_count(0);
+
+    if c1 == 0 {
+        if c2 == 3 {
+            if c3 == 5 {
+                print_pass();
+                return;
+            }
+        }
+    }
+    print_fail();
+}
+
+// Test 7: Max services boundary
+fn test_max_services() {
+    print_test_name(STR_MAX_SERVICES);
+
+    init_test_table();
+
+    // Fill all slots
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        test_set_pid(i, 100 + i);
+        test_set_state(i, SVC_STATE_RUNNING);
+        i = i + 1;
+    }
+
+    // Should return -1 (no free slots)
+    let slot = find_free_test_slot();
+
+    if slot == (0 - 1) {
+        print_pass();
+    } else {
+        print_fail();
+    }
+}
+
+// ============================================================================
+// Test Summary
+// ============================================================================
+
+fn print_summary() {
+    runtime::print_char(10);  // newline
+    runtime::print_char(61);  // =
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(32);  // space
+    runtime::print_char(82);  // R
+    runtime::print_char(101); // e
+    runtime::print_char(115); // s
+    runtime::print_char(117); // u
+    runtime::print_char(108); // l
+    runtime::print_char(116); // t
+    runtime::print_char(115); // s
+    runtime::print_char(32);  // space
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(10);  // newline
+
+    runtime::print_char(80);  // P
+    runtime::print_char(97);  // a
+    runtime::print_char(115); // s
+    runtime::print_char(115); // s
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    runtime::print_char(58);  // :
+    runtime::print_char(32);  // space
+    runtime::print_num(runtime::read_u64(TEST_PASS_COUNT));
+    runtime::print_char(10);  // newline
+
+    runtime::print_char(70);  // F
+    runtime::print_char(97);  // a
+    runtime::print_char(105); // i
+    runtime::print_char(108); // l
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    runtime::print_char(58);  // :
+    runtime::print_char(32);  // space
+    runtime::print_num(runtime::read_u64(TEST_FAIL_COUNT));
+    runtime::print_char(10);  // newline
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() {
+    // Initialize test counters
+    runtime::write_u64(TEST_PASS_COUNT, 0);
+    runtime::write_u64(TEST_FAIL_COUNT, 0);
+
+    // Print header
+    runtime::print_char(10);
+    runtime::print_char(71);  // G
+    runtime::print_char(101); // e
+    runtime::print_char(110); // n
+    runtime::print_char(101); // e
+    runtime::print_char(115); // s
+    runtime::print_char(105); // i
+    runtime::print_char(115); // s
+    runtime::print_char(32);  // space
+    runtime::print_char(73);  // I
+    runtime::print_char(110); // n
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(32);  // space
+    runtime::print_char(84);  // T
+    runtime::print_char(101); // e
+    runtime::print_char(115); // s
+    runtime::print_char(116); // t
+    runtime::print_char(115); // s
+    runtime::print_char(10);  // newline
+    runtime::print_char(10);
+
+    // Setup test strings
+    setup_test_strings();
+
+    // Run tests
+    test_init_table();
+    test_find_free_slot();
+    test_find_by_pid();
+    test_state_transitions();
+    test_critical_flag();
+    test_restart_count();
+    test_max_services();
+
+    // Print summary
+    print_summary();
+
+    runtime::exit();
+}

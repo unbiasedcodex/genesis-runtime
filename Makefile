@@ -39,12 +39,19 @@ clean:
 # Install to kernel ISO
 install: all
 	@if [ -z "$(DESTDIR)" ]; then echo "Usage: make install DESTDIR=/path/to/iso"; exit 1; fi
-	mkdir -p $(DESTDIR)/boot/runtime
-	cp $(BUILD_DIR)/*.elf $(DESTDIR)/boot/runtime/
+	mkdir -p $(DESTDIR)/boot
+	cp $(BUILD_DIR)/init.elf $(DESTDIR)/boot/
 
-# Run tests
-test:
-	@echo "Tests not yet implemented"
+# Tests
+test: $(BUILD_DIR)/test_init.elf
+	@echo "Tests built: $(BUILD_DIR)/test_init.elf"
+	@echo "Run with QEMU to execute tests"
+
+$(BUILD_DIR)/test_init.elf: $(BUILD_DIR)/test_init.o linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/test_init.o
+
+$(BUILD_DIR)/test_init.o: tests/test_init.gl tests/runtime.gl | $(BUILD_DIR)
+	$(GLC) build tests/test_init.gl $(GLCFLAGS) -o $@
 
 # Check tools
 check:
