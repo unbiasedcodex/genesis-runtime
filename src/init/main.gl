@@ -1,0 +1,431 @@
+// Genesis Init System
+// PID 1 - First userspace process
+// Manages service lifecycle and system initialization
+
+mod runtime;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Service states
+const SVC_STATE_STOPPED: i64 = 0;
+const SVC_STATE_STARTING: i64 = 1;
+const SVC_STATE_RUNNING: i64 = 2;
+const SVC_STATE_FAILED: i64 = 3;
+
+// Service flags
+const SVC_FLAG_CRITICAL: i64 = 1;
+const SVC_FLAG_AUTOSTART: i64 = 2;
+
+// Signals (duplicated from runtime for access)
+const SIGTERM: i64 = 15;
+
+// Maximum services
+const MAX_SERVICES: i64 = 16;
+
+// IPC Message types
+const MSG_TYPE_REGISTER: i64 = 1;
+const MSG_TYPE_STATUS: i64 = 2;
+const MSG_TYPE_START: i64 = 3;
+const MSG_TYPE_STOP: i64 = 4;
+const MSG_TYPE_RESTART: i64 = 5;
+const MSG_TYPE_HEARTBEAT: i64 = 6;
+
+// Memory layout
+const SERVICE_TABLE: i64 = 0x810000;
+const SERVICE_ENTRY_SIZE: i64 = 64;
+const MSG_BUFFER: i64 = 0x820000;
+
+// ============================================================================
+// Service Table Management
+// ============================================================================
+
+fn get_service_addr(idx: i64) -> i64 {
+    SERVICE_TABLE + (idx * SERVICE_ENTRY_SIZE)
+}
+
+fn get_service_pid(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx))
+}
+
+fn set_service_pid(idx: i64, pid: i64) {
+    runtime::write_u64(get_service_addr(idx), pid);
+}
+
+fn get_service_state(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 8)
+}
+
+fn set_service_state(idx: i64, state: i64) {
+    runtime::write_u64(get_service_addr(idx) + 8, state);
+}
+
+fn get_service_flags(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 16)
+}
+
+fn set_service_flags(idx: i64, flags: i64) {
+    runtime::write_u64(get_service_addr(idx) + 16, flags);
+}
+
+fn get_service_endpoint(idx: i64) -> i64 {
+    runtime::read_u64(get_service_addr(idx) + 24)
+}
+
+fn set_service_endpoint(idx: i64, endpoint: i64) {
+    runtime::write_u64(get_service_addr(idx) + 24, endpoint);
+}
+
+fn init_service_table() {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        let addr = get_service_addr(i);
+        runtime::memset(addr, 0, SERVICE_ENTRY_SIZE);
+        i = i + 1;
+    }
+}
+
+fn find_service_by_pid(pid: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        if get_service_pid(i) == pid {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn find_free_slot() -> i64 {
+    let mut i: i64 = 0;
+    while i < MAX_SERVICES {
+        if get_service_state(i) == SVC_STATE_STOPPED {
+            if get_service_pid(i) == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// Service Lifecycle
+// ============================================================================
+
+fn register_service(endpoint: i64, flags: i64) -> i64 {
+    let slot = find_free_slot();
+    if slot < 0 {
+        return 0 - 1;
+    }
+
+    set_service_pid(slot, 0);
+    set_service_state(slot, SVC_STATE_STOPPED);
+    set_service_flags(slot, flags);
+    set_service_endpoint(slot, endpoint);
+
+    return slot;
+}
+
+fn start_service(idx: i64, path: i64) -> i64 {
+    if idx < 0 {
+        return 0 - 1;
+    }
+    if idx >= MAX_SERVICES {
+        return 0 - 1;
+    }
+
+    let state = get_service_state(idx);
+    if state == SVC_STATE_RUNNING {
+        return 0;
+    }
+
+    set_service_state(idx, SVC_STATE_STARTING);
+
+    let pid = runtime::exec(path);
+    if pid < 0 {
+        set_service_state(idx, SVC_STATE_FAILED);
+        return 0 - 1;
+    }
+
+    set_service_pid(idx, pid);
+    set_service_state(idx, SVC_STATE_RUNNING);
+
+    return pid;
+}
+
+fn stop_service(idx: i64) -> i64 {
+    if idx < 0 {
+        return 0 - 1;
+    }
+    if idx >= MAX_SERVICES {
+        return 0 - 1;
+    }
+
+    let pid = get_service_pid(idx);
+    if pid > 0 {
+        runtime::kill(pid, SIGTERM);
+    }
+
+    set_service_pid(idx, 0);
+    set_service_state(idx, SVC_STATE_STOPPED);
+
+    return 0;
+}
+
+fn handle_child_exit(child_pid: i64) {
+    let idx = find_service_by_pid(child_pid);
+    if idx < 0 {
+        return;
+    }
+
+    let flags = get_service_flags(idx);
+    set_service_pid(idx, 0);
+
+    let is_critical = flags & SVC_FLAG_CRITICAL;
+    if is_critical != 0 {
+        set_service_state(idx, SVC_STATE_FAILED);
+    } else {
+        set_service_state(idx, SVC_STATE_STOPPED);
+    }
+}
+
+// ============================================================================
+// IPC Message Handling
+// ============================================================================
+
+fn get_msg_type(buffer: i64) -> i64 {
+    runtime::read_u64(buffer)
+}
+
+fn get_msg_arg1(buffer: i64) -> i64 {
+    runtime::read_u64(buffer + 8)
+}
+
+fn get_msg_arg2(buffer: i64) -> i64 {
+    runtime::read_u64(buffer + 16)
+}
+
+fn send_response(dest: i64, status: i64, value: i64) {
+    runtime::write_u64(MSG_BUFFER + 128, status);
+    runtime::write_u64(MSG_BUFFER + 136, value);
+    runtime::send(dest, MSG_BUFFER + 128);
+}
+
+fn process_message(sender: i64) {
+    let msg_type = get_msg_type(MSG_BUFFER);
+
+    if msg_type == MSG_TYPE_REGISTER {
+        let endpoint = get_msg_arg1(MSG_BUFFER);
+        let flags = get_msg_arg2(MSG_BUFFER);
+        let slot = register_service(endpoint, flags);
+        send_response(sender, 0, slot);
+    } else if msg_type == MSG_TYPE_STATUS {
+        let idx = get_msg_arg1(MSG_BUFFER);
+        let state = get_service_state(idx);
+        send_response(sender, 0, state);
+    } else if msg_type == MSG_TYPE_HEARTBEAT {
+        send_response(sender, 0, 0);
+    } else {
+        send_response(sender, 0 - 1, 0);
+    }
+}
+
+// ============================================================================
+// Output Helpers
+// ============================================================================
+
+fn newline() {
+    runtime::print_char(10);
+}
+
+fn print_line() {
+    // "====================================="
+    let mut i: i64 = 0;
+    while i < 37 {
+        runtime::print_char(61);
+        i = i + 1;
+    }
+    newline();
+}
+
+fn print_banner() {
+    newline();
+    print_line();
+    // "  Genesis Runtime - Init System"
+    runtime::print_char(32);
+    runtime::print_char(32);
+    runtime::print_char(71);  // G
+    runtime::print_char(101); // e
+    runtime::print_char(110); // n
+    runtime::print_char(101); // e
+    runtime::print_char(115); // s
+    runtime::print_char(105); // i
+    runtime::print_char(115); // s
+    runtime::print_char(32);  // space
+    runtime::print_char(82);  // R
+    runtime::print_char(117); // u
+    runtime::print_char(110); // n
+    runtime::print_char(116); // t
+    runtime::print_char(105); // i
+    runtime::print_char(109); // m
+    runtime::print_char(101); // e
+    runtime::print_char(32);  // space
+    runtime::print_char(45);  // -
+    runtime::print_char(32);  // space
+    runtime::print_char(73);  // I
+    runtime::print_char(110); // n
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(32);  // space
+    runtime::print_char(83);  // S
+    runtime::print_char(121); // y
+    runtime::print_char(115); // s
+    runtime::print_char(116); // t
+    runtime::print_char(101); // e
+    runtime::print_char(109); // m
+    newline();
+    // "  Version 0.1.0"
+    runtime::print_char(32);
+    runtime::print_char(32);
+    runtime::print_char(86);  // V
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(115); // s
+    runtime::print_char(105); // i
+    runtime::print_char(111); // o
+    runtime::print_char(110); // n
+    runtime::print_char(32);  // space
+    runtime::print_char(48);  // 0
+    runtime::print_char(46);  // .
+    runtime::print_char(49);  // 1
+    runtime::print_char(46);  // .
+    runtime::print_char(48);  // 0
+    newline();
+    print_line();
+    newline();
+}
+
+// Print "[init] "
+fn print_init_prefix() {
+    runtime::print_char(91);  // [
+    runtime::print_char(105); // i
+    runtime::print_char(110); // n
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(93);  // ]
+    runtime::print_char(32);  // space
+}
+
+// Print "Started with PID "
+fn print_started_msg() {
+    print_init_prefix();
+    runtime::print_char(83);  // S
+    runtime::print_char(116); // t
+    runtime::print_char(97);  // a
+    runtime::print_char(114); // r
+    runtime::print_char(116); // t
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    runtime::print_char(32);  // space
+    runtime::print_char(119); // w
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(104); // h
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(73);  // I
+    runtime::print_char(68);  // D
+    runtime::print_char(32);  // space
+}
+
+// Print "Service table initialized"
+fn print_table_init() {
+    print_init_prefix();
+    runtime::print_char(83);  // S
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(118); // v
+    runtime::print_char(105); // i
+    runtime::print_char(99);  // c
+    runtime::print_char(101); // e
+    runtime::print_char(32);  // space
+    runtime::print_char(116); // t
+    runtime::print_char(97);  // a
+    runtime::print_char(98);  // b
+    runtime::print_char(108); // l
+    runtime::print_char(101); // e
+    runtime::print_char(32);  // space
+    runtime::print_char(105); // i
+    runtime::print_char(110); // n
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(105); // i
+    runtime::print_char(97);  // a
+    runtime::print_char(108); // l
+    runtime::print_char(105); // i
+    runtime::print_char(122); // z
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    newline();
+}
+
+// Print "Entering main loop..."
+fn print_loop_msg() {
+    print_init_prefix();
+    runtime::print_char(69);  // E
+    runtime::print_char(110); // n
+    runtime::print_char(116); // t
+    runtime::print_char(101); // e
+    runtime::print_char(114); // r
+    runtime::print_char(105); // i
+    runtime::print_char(110); // n
+    runtime::print_char(103); // g
+    runtime::print_char(32);  // space
+    runtime::print_char(109); // m
+    runtime::print_char(97);  // a
+    runtime::print_char(105); // i
+    runtime::print_char(110); // n
+    runtime::print_char(32);  // space
+    runtime::print_char(108); // l
+    runtime::print_char(111); // o
+    runtime::print_char(111); // o
+    runtime::print_char(112); // p
+    runtime::print_char(46);  // .
+    runtime::print_char(46);  // .
+    runtime::print_char(46);  // .
+    newline();
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() {
+    print_banner();
+
+    let my_pid = runtime::getpid();
+    print_started_msg();
+    runtime::print_num(my_pid);
+    newline();
+
+    init_service_table();
+    print_table_init();
+
+    print_loop_msg();
+
+    loop {
+        let sender = runtime::recv(MSG_BUFFER);
+        if sender > 0 {
+            process_message(sender);
+        }
+
+        let child = runtime::wait();
+        if child > 0 {
+            handle_child_exit(child);
+        }
+
+        runtime::yield_cpu();
+    }
+}

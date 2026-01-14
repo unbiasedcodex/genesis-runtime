@@ -2,14 +2,13 @@
 # Phase 1: Init System
 
 # Tools
-GLC = glc
+GLC = cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release --
 LD = ld
-NASM = nasm
+OBJCOPY = objcopy
 
 # Flags
 GLCFLAGS = --freestanding --emit-obj
-NASMFLAGS = -f elf64
-LDFLAGS = -m elf_x86_64 --nostdlib
+LDFLAGS = -T linker.ld -m elf_x86_64 --nostdlib
 
 # Output
 BUILD_DIR = build
@@ -23,9 +22,11 @@ all: $(SERVICES)
 # Init system
 init: $(BUILD_DIR)/init.elf
 
-$(BUILD_DIR)/init.elf: src/init/main.gl | $(BUILD_DIR)
-	$(GLC) build $< $(GLCFLAGS) -o $(BUILD_DIR)/init.o
+$(BUILD_DIR)/init.elf: $(BUILD_DIR)/init.o linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/init.o
+
+$(BUILD_DIR)/init.o: src/init/main.gl src/init/runtime.gl | $(BUILD_DIR)
+	$(GLC) build src/init/main.gl $(GLCFLAGS) -o $@
 
 # Create build directory
 $(BUILD_DIR):
@@ -47,7 +48,7 @@ test:
 
 # Check tools
 check:
-	@which $(GLC) > /dev/null || (echo "Error: glc not found" && exit 1)
+	@$(GLC) --version > /dev/null || (echo "Error: glc not found" && exit 1)
 	@echo "Tools OK"
 
 .PHONY: all clean install test check $(SERVICES)

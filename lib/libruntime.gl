@@ -1,0 +1,400 @@
+// Genesis Runtime Library
+// Syscall wrappers for userspace programs
+
+// ============================================================================
+// Syscall Numbers (must match kernel)
+// ============================================================================
+
+pub const SYS_YIELD: i64 = 0;
+pub const SYS_GETPID: i64 = 1;
+pub const SYS_PRINT: i64 = 2;
+pub const SYS_SEND: i64 = 3;
+pub const SYS_RECV: i64 = 4;
+pub const SYS_EXIT: i64 = 5;
+pub const SYS_OPEN: i64 = 6;
+pub const SYS_READ: i64 = 7;
+pub const SYS_WRITE: i64 = 8;
+pub const SYS_CLOSE: i64 = 9;
+pub const SYS_FSTAT: i64 = 10;
+pub const SYS_CAP_CREATE: i64 = 11;
+pub const SYS_CAP_DERIVE: i64 = 12;
+pub const SYS_CAP_GRANT: i64 = 13;
+pub const SYS_CAP_REVOKE: i64 = 14;
+pub const SYS_CAP_LIST: i64 = 15;
+pub const SYS_KB_READ: i64 = 16;
+pub const SYS_KB_AVAIL: i64 = 17;
+pub const SYS_EXEC: i64 = 18;
+pub const SYS_KILL: i64 = 19;
+pub const SYS_WAIT: i64 = 20;
+pub const SYS_GETPPID: i64 = 21;
+pub const SYS_SHMGET: i64 = 22;
+pub const SYS_SHMAT: i64 = 23;
+pub const SYS_SHMDT: i64 = 24;
+pub const SYS_DISK_READ: i64 = 25;
+pub const SYS_DISK_INFO: i64 = 26;
+pub const SYS_DISK_WRITE: i64 = 27;
+pub const SYS_PCI_READ: i64 = 28;
+pub const SYS_PCI_WRITE: i64 = 29;
+pub const SYS_PCI_ENUMERATE: i64 = 30;
+pub const SYS_IRQ_REGISTER: i64 = 31;
+pub const SYS_IRQ_UNREGISTER: i64 = 32;
+pub const SYS_IRQ_ACK: i64 = 33;
+pub const SYS_TIME: i64 = 34;
+pub const SYS_SLEEP: i64 = 35;
+
+// ============================================================================
+// Signals
+// ============================================================================
+
+pub const SIGTERM: i64 = 15;
+pub const SIGKILL: i64 = 9;
+pub const SIGCHLD: i64 = 17;
+pub const SIGUSR1: i64 = 10;
+pub const SIGUSR2: i64 = 12;
+
+// ============================================================================
+// IPC Service Endpoints
+// ============================================================================
+
+pub const SVC_INIT: i64 = 1;
+pub const SVC_FS: i64 = 10;
+pub const SVC_NET: i64 = 20;
+pub const SVC_DISPLAY: i64 = 30;
+pub const SVC_AUDIO: i64 = 40;
+pub const SVC_INPUT: i64 = 50;
+
+// ============================================================================
+// Low-level Syscall Functions
+// ============================================================================
+
+// Syscall with no arguments
+fn syscall0(num: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}
+
+// Syscall with 1 argument
+fn syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}
+
+// Syscall with 2 arguments
+fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}
+
+// Syscall with 3 arguments
+fn syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}
+
+// Syscall with 4 arguments
+fn syscall4(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            lateout("rax") result,
+            options(nostack)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Process Management
+// ============================================================================
+
+// Yield CPU to scheduler
+pub fn yield_cpu() {
+    syscall0(SYS_YIELD);
+}
+
+// Get current process ID
+pub fn getpid() -> i64 {
+    syscall0(SYS_GETPID)
+}
+
+// Get parent process ID
+pub fn getppid() -> i64 {
+    syscall0(SYS_GETPPID)
+}
+
+// Exit current process
+pub fn exit() {
+    syscall0(SYS_EXIT);
+}
+
+// Execute ELF binary (path_ptr points to null-terminated path string)
+pub fn exec(path_ptr: i64) -> i64 {
+    syscall1(SYS_EXEC, path_ptr)
+}
+
+// Send signal to process
+pub fn kill(pid: i64, signal: i64) -> i64 {
+    syscall2(SYS_KILL, pid, signal)
+}
+
+// Wait for child process (returns child PID or -1)
+pub fn wait() -> i64 {
+    syscall0(SYS_WAIT)
+}
+
+// ============================================================================
+// Console I/O
+// ============================================================================
+
+// Print a single character
+pub fn print_char(c: i64) {
+    syscall1(SYS_PRINT, c);
+}
+
+// Print a string (pointer to null-terminated string)
+pub fn print_str(s: i64) {
+    let mut ptr = s;
+    loop {
+        let c = read_byte(ptr);
+        if c == 0 {
+            break;
+        }
+        print_char(c);
+        ptr = ptr + 1;
+    }
+}
+
+// Print string with newline
+pub fn println(s: i64) {
+    print_str(s);
+    print_char(10);
+}
+
+// Print a number in decimal
+pub fn print_num(n: i64) {
+    if n < 0 {
+        print_char(45); // '-'
+        print_num(0 - n);
+        return;
+    }
+    if n >= 10 {
+        print_num(n / 10);
+    }
+    print_char(48 + (n % 10));
+}
+
+// ============================================================================
+// IPC - Inter-Process Communication
+// ============================================================================
+
+// Send message to process
+// msg_ptr: pointer to message buffer
+// Returns: 0 on success, -1 on error
+pub fn send(dest_pid: i64, msg_ptr: i64) -> i64 {
+    syscall2(SYS_SEND, dest_pid, msg_ptr)
+}
+
+// Receive message (blocking)
+// buffer_ptr: pointer to receive buffer (256 bytes)
+// Returns: sender PID or -1 if no message
+pub fn recv(buffer_ptr: i64) -> i64 {
+    syscall1(SYS_RECV, buffer_ptr)
+}
+
+// ============================================================================
+// File Operations (VFS)
+// ============================================================================
+
+// Open file (returns fd or -1 on error)
+pub fn open(path_ptr: i64) -> i64 {
+    syscall1(SYS_OPEN, path_ptr)
+}
+
+// Read from file descriptor
+// Returns bytes read or -1 on error
+pub fn read(fd: i64, buffer_ptr: i64) -> i64 {
+    syscall2(SYS_READ, fd, buffer_ptr)
+}
+
+// Write to file descriptor
+// Returns bytes written or -1 on error
+pub fn write(fd: i64, buffer_ptr: i64) -> i64 {
+    syscall2(SYS_WRITE, fd, buffer_ptr)
+}
+
+// Close file descriptor
+pub fn close(fd: i64) -> i64 {
+    syscall1(SYS_CLOSE, fd)
+}
+
+// Get file size
+pub fn fstat(fd: i64) -> i64 {
+    syscall1(SYS_FSTAT, fd)
+}
+
+// ============================================================================
+// Time
+// ============================================================================
+
+// Get system time (ticks since boot)
+pub fn time() -> i64 {
+    syscall0(SYS_TIME)
+}
+
+// Sleep for specified ticks
+pub fn sleep(ticks: i64) {
+    syscall1(SYS_SLEEP, ticks);
+}
+
+// ============================================================================
+// Shared Memory
+// ============================================================================
+
+// Get/create shared memory region
+// Returns region ID or -1 on error
+pub fn shmget(key: i64, size: i64) -> i64 {
+    syscall2(SYS_SHMGET, key, size)
+}
+
+// Attach to shared memory
+// Returns address or -1 on error
+pub fn shmat(shmid: i64) -> i64 {
+    syscall1(SYS_SHMAT, shmid)
+}
+
+// Detach from shared memory
+pub fn shmdt(addr: i64) -> i64 {
+    syscall1(SYS_SHMDT, addr)
+}
+
+// ============================================================================
+// Keyboard
+// ============================================================================
+
+// Read character from keyboard buffer (returns 0 if none)
+pub fn kb_read() -> i64 {
+    syscall0(SYS_KB_READ)
+}
+
+// Check if keyboard input available
+pub fn kb_avail() -> i64 {
+    syscall0(SYS_KB_AVAIL)
+}
+
+// ============================================================================
+// Memory Helpers
+// ============================================================================
+
+// Read byte from address
+pub fn read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, readonly)
+        );
+    }
+    result
+}
+
+// Write byte to address
+pub fn write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack)
+        );
+    }
+}
+
+// Read 64-bit value from address
+pub fn read_u64(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, readonly)
+        );
+    }
+    result
+}
+
+// Write 64-bit value to address
+pub fn write_u64(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack)
+        );
+    }
+}
+
+// Copy memory
+pub fn memcpy(dest: i64, src: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        write_byte(dest + i, read_byte(src + i));
+        i = i + 1;
+    }
+}
+
+// Set memory to value
+pub fn memset(dest: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        write_byte(dest + i, value);
+        i = i + 1;
+    }
+}
