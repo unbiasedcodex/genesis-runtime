@@ -1,5 +1,5 @@
 # Genesis Runtime Makefile
-# Phase 1: Init System
+# Phase 1: Init System + VFS Server
 
 # Tools
 GLC = cargo run --manifest-path ../genesis-lang/Cargo.toml --bin glc --release --
@@ -8,25 +8,33 @@ OBJCOPY = objcopy
 
 # Flags
 GLCFLAGS = --freestanding --emit-obj
-LDFLAGS = -T linker.ld -m elf_x86_64 --nostdlib
 
 # Output
 BUILD_DIR = build
 
 # Services
-SERVICES = init
+SERVICES = init vfs
 
 # Default target
 all: $(SERVICES)
 
-# Init system
+# Init system (loads at 0x800000)
 init: $(BUILD_DIR)/init.elf
 
 $(BUILD_DIR)/init.elf: $(BUILD_DIR)/init.o linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/init.o
+	$(LD) -T linker.ld -m elf_x86_64 --nostdlib -o $@ $(BUILD_DIR)/init.o
 
 $(BUILD_DIR)/init.o: src/init/main.gl src/init/runtime.gl | $(BUILD_DIR)
 	$(GLC) build src/init/main.gl $(GLCFLAGS) -o $@
+
+# VFS Server (loads at 0x900000)
+vfs: $(BUILD_DIR)/vfs.elf
+
+$(BUILD_DIR)/vfs.elf: $(BUILD_DIR)/vfs.o src/fs/linker.ld
+	$(LD) -T src/fs/linker.ld -m elf_x86_64 --nostdlib -o $@ $(BUILD_DIR)/vfs.o
+
+$(BUILD_DIR)/vfs.o: src/fs/main.gl src/fs/runtime.gl | $(BUILD_DIR)
+	$(GLC) build src/fs/main.gl $(GLCFLAGS) -o $@
 
 # Create build directory
 $(BUILD_DIR):
@@ -41,6 +49,7 @@ install: all
 	@if [ -z "$(DESTDIR)" ]; then echo "Usage: make install DESTDIR=/path/to/iso"; exit 1; fi
 	mkdir -p $(DESTDIR)/boot
 	cp $(BUILD_DIR)/init.elf $(DESTDIR)/boot/
+	cp $(BUILD_DIR)/vfs.elf $(DESTDIR)/boot/
 
 # Tests
 test: $(BUILD_DIR)/test_init.elf

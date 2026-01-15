@@ -1,0 +1,147 @@
+// Genesis Runtime Library for VFS Server
+// Syscall wrappers for userspace programs
+
+// ============================================================================
+// Syscall Numbers (must match kernel)
+// ============================================================================
+
+pub const SYS_YIELD: i64 = 0;
+pub const SYS_GETPID: i64 = 1;
+pub const SYS_PRINT: i64 = 2;
+pub const SYS_SEND: i64 = 3;
+pub const SYS_RECV: i64 = 4;
+pub const SYS_EXIT: i64 = 5;
+
+// RAMFS syscalls for VFS Server
+pub const SYS_RAMFS_FILE_COUNT: i64 = 40;
+pub const SYS_RAMFS_FILE_INFO: i64 = 41;
+pub const SYS_RAMFS_READ_BYTE: i64 = 42;
+pub const SYS_RAMFS_FILE_SIZE: i64 = 43;
+
+// ============================================================================
+// Low-level Syscall Functions
+// ============================================================================
+
+fn syscall0(num: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Process Management
+// ============================================================================
+
+pub fn yield_cpu() {
+    syscall0(SYS_YIELD);
+}
+
+pub fn getpid() -> i64 {
+    syscall0(SYS_GETPID)
+}
+
+pub fn exit() {
+    syscall0(SYS_EXIT);
+}
+
+// ============================================================================
+// Console I/O
+// ============================================================================
+
+pub fn print_char(c: i64) {
+    // Direct syscall to avoid inlining bug where constant gets lost
+    // Don't save result to avoid generating mov to stack
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 2,      // SYS_PRINT = 2 (literal constant)
+            in("rdi") c,
+            lateout("rax") _,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+pub fn print_num(n: i64) {
+    if n < 0 {
+        print_char(45);
+        print_num(0 - n);
+        return;
+    }
+    if n >= 10 {
+        print_num(n / 10);
+    }
+    print_char(48 + (n % 10));
+}
+
+// ============================================================================
+// IPC - Inter-Process Communication
+// ============================================================================
+
+pub fn send(dest_pid: i64, msg: i64) -> i64 {
+    syscall2(SYS_SEND, dest_pid, msg)
+}
+
+pub fn recv() -> i64 {
+    syscall0(SYS_RECV)
+}
+
+// ============================================================================
+// RAMFS Access (VFS Server specific)
+// ============================================================================
+
+// Get number of files in RAMFS
+pub fn ramfs_file_count() -> i64 {
+    syscall0(SYS_RAMFS_FILE_COUNT)
+}
+
+// Get file info: returns flags (0 = unused, 1 = regular file)
+pub fn ramfs_file_info(file_idx: i64) -> i64 {
+    syscall1(SYS_RAMFS_FILE_INFO, file_idx)
+}
+
+// Read a byte from file at offset
+pub fn ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
+    syscall2(SYS_RAMFS_READ_BYTE, file_idx, offset)
+}
+
+// Get file size
+pub fn ramfs_file_size(file_idx: i64) -> i64 {
+    syscall1(SYS_RAMFS_FILE_SIZE, file_idx)
+}

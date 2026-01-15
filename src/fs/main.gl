@@ -1,0 +1,100 @@
+// Genesis VFS Server
+// PID 2 - Virtual File System Server
+// Handles file operations via IPC
+
+mod runtime;
+
+// ============================================================================
+// VFS Command Types (must match shell/clients)
+// ============================================================================
+
+const VFS_OPEN: i64 = 1;
+const VFS_READ: i64 = 2;
+const VFS_WRITE: i64 = 3;
+const VFS_CLOSE: i64 = 4;
+const VFS_STAT: i64 = 5;
+const VFS_LIST: i64 = 8;
+
+// ============================================================================
+// VFS Server Main Entry
+// ============================================================================
+
+fn print_a() {
+    runtime::print_char(65);
+}
+
+fn print_b() {
+    runtime::print_char(66);
+}
+
+fn print_c() {
+    runtime::print_char(67);
+}
+
+fn main() {
+    // Test syscalls from userspace
+    print_a();
+    print_b();
+    print_c();
+
+    // Infinite loop after syscalls
+    loop {}
+}
+
+// ============================================================================
+// VFS Handlers
+// ============================================================================
+
+// VFS Handler: list files
+fn vfs_handle_list() {
+    // Get number of files in filesystem via syscall
+    let used = runtime::ramfs_file_count();
+
+    // Print to serial for debugging
+    runtime::print_char(76);   // L
+    runtime::print_char(58);   // :
+    runtime::print_char(48 + used);  // file count
+    runtime::print_char(32);   // space
+}
+
+// VFS Handler: open file (simplified - just return file index)
+fn vfs_handle_open(msg: i64) {
+    // Parse file index from message (second byte)
+    let file_idx = (msg / 256) % 256;
+
+    if file_idx >= 0 && file_idx < 16 {  // RAMFS_MAX_FILES = 16
+        let flags = runtime::ramfs_file_info(file_idx);
+
+        if flags != 0 {  // FILE_UNUSED = 0
+            runtime::print_char(79);   // O
+            runtime::print_char(58);   // :
+            runtime::print_char(48 + file_idx);  // file index
+            runtime::print_char(32);   // space
+        }
+    }
+}
+
+// VFS Handler: read file
+fn vfs_handle_read(msg: i64) {
+    // Parse: byte 1 = file_idx, byte 2 = offset
+    let file_idx = (msg / 256) % 256;
+    let offset = (msg / 65536) % 256;
+
+    let byte = runtime::ramfs_read_byte(file_idx, offset);
+    if byte >= 0 && byte != 0 {
+        runtime::print_char(byte);  // Output the byte read
+    }
+}
+
+// VFS Handler: get file stat (size)
+fn vfs_handle_stat(msg: i64) {
+    let file_idx = (msg / 256) % 256;
+    let size = runtime::ramfs_file_size(file_idx);
+
+    runtime::print_char(83);   // S
+    runtime::print_char(58);   // :
+    if size >= 0 {
+        runtime::print_char(48 + (size % 10));
+    }
+    runtime::print_char(32);   // space
+}
