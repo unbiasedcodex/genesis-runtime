@@ -1,0 +1,235 @@
+// Genesis Console Server
+// PID 3 - Console Server
+// Handles VGA output and keyboard input via IPC
+
+mod runtime;
+
+// ============================================================================
+// Console Constants
+// ============================================================================
+
+const VGA_WIDTH: i64 = 80;
+const VGA_HEIGHT: i64 = 25;
+
+// Colors
+const COLOR_BLACK: i64 = 0;
+const COLOR_WHITE: i64 = 15;
+const COLOR_GREEN: i64 = 10;
+
+// Console IPC Message Types
+const MSG_PUTCHAR: i64 = 1;      // Write character: [type, x, y, ch, color]
+const MSG_PRINT: i64 = 2;        // Print at cursor: [type, ch] (auto advance cursor)
+const MSG_CLEAR: i64 = 3;        // Clear region: [type, y_start, y_end, color]
+const MSG_GETKEY: i64 = 4;       // Get keyboard char (blocking)
+const MSG_KEYAVAIL: i64 = 5;     // Check if key available
+const MSG_SETCURSOR: i64 = 6;    // Set cursor position: [type, x, y]
+const MSG_SCROLL: i64 = 7;       // Scroll region: [type, y_start, y_end, color]
+
+// Console state memory layout (relative to data section)
+// We'll use simple variables for now
+const CURSOR_X_ADDR: i64 = 0xA80000;   // Data area for console state
+const CURSOR_Y_ADDR: i64 = 0xA80008;
+
+// ============================================================================
+// Console Server Main Entry
+// ============================================================================
+
+fn main() {
+    // Print startup message to serial
+    runtime::print_char(91);   // [
+    runtime::print_char(67);   // C
+    runtime::print_char(79);   // O
+    runtime::print_char(78);   // N
+    runtime::print_char(93);   // ]
+    runtime::print_char(32);   // space
+
+    // Initialize cursor position
+    cursor_set(0, 0);
+
+    // Clear screen and show startup
+    runtime::vga_clear(0, VGA_HEIGHT, COLOR_WHITE);
+
+    // Print startup banner
+    print_banner();
+
+    // Enter main loop
+    console_main_loop();
+}
+
+// ============================================================================
+// Console State Management
+// ============================================================================
+
+fn cursor_x() -> i64 {
+    // Simple static variable simulation - return 0 for now
+    // In a real implementation, we'd read from state memory
+    0
+}
+
+fn cursor_y() -> i64 {
+    0
+}
+
+fn cursor_set(x: i64, y: i64) {
+    runtime::vga_setcursor(x, y);
+}
+
+// ============================================================================
+// Console Output Functions
+// ============================================================================
+
+fn print_banner() {
+    // Print "Genesis Console Server" on first line
+    let green: i64 = COLOR_GREEN;
+    let white: i64 = COLOR_WHITE;
+
+    // "Genesis" in green
+    runtime::vga_putchar(0, 0, 71, green);   // G
+    runtime::vga_putchar(1, 0, 101, green);  // e
+    runtime::vga_putchar(2, 0, 110, green);  // n
+    runtime::vga_putchar(3, 0, 101, green);  // e
+    runtime::vga_putchar(4, 0, 115, green);  // s
+    runtime::vga_putchar(5, 0, 105, green);  // i
+    runtime::vga_putchar(6, 0, 115, green);  // s
+    runtime::vga_putchar(7, 0, 32, white);   // space
+
+    // "Console" in green
+    runtime::vga_putchar(8, 0, 67, green);   // C
+    runtime::vga_putchar(9, 0, 111, green);  // o
+    runtime::vga_putchar(10, 0, 110, green); // n
+    runtime::vga_putchar(11, 0, 115, green); // s
+    runtime::vga_putchar(12, 0, 111, green); // o
+    runtime::vga_putchar(13, 0, 108, green); // l
+    runtime::vga_putchar(14, 0, 101, green); // e
+    runtime::vga_putchar(15, 0, 32, white);  // space
+
+    // "v0.1" in white
+    runtime::vga_putchar(16, 0, 118, white); // v
+    runtime::vga_putchar(17, 0, 48, white);  // 0
+    runtime::vga_putchar(18, 0, 46, white);  // .
+    runtime::vga_putchar(19, 0, 49, white);  // 1
+
+    // Print PID
+    let pid = runtime::getpid();
+    runtime::print_char(80);   // P
+    runtime::print_char(73);   // I
+    runtime::print_char(68);   // D
+    runtime::print_char(58);   // :
+    runtime::print_char(48 + pid);  // PID number
+    runtime::print_char(10);   // newline
+}
+
+// ============================================================================
+// IPC Message Handling
+// ============================================================================
+
+fn handle_message(msg: i64) {
+    // Parse message type (first byte)
+    let msg_type = msg % 256;
+
+    match msg_type {
+        1 => handle_putchar(msg),      // MSG_PUTCHAR
+        2 => handle_print(msg),        // MSG_PRINT
+        3 => handle_clear(msg),        // MSG_CLEAR
+        4 => handle_getkey(msg),       // MSG_GETKEY
+        5 => handle_keyavail(msg),     // MSG_KEYAVAIL
+        6 => handle_setcursor(msg),    // MSG_SETCURSOR
+        7 => handle_scroll(msg),       // MSG_SCROLL
+        _ => {
+            // Unknown message type - log to serial
+            runtime::print_char(63);   // ?
+            runtime::print_char(77);   // M
+            runtime::print_char(83);   // S
+            runtime::print_char(71);   // G
+        },
+    }
+}
+
+fn handle_putchar(msg: i64) {
+    // Format: [type(1), x(1), y(1), ch(1), color(1)]
+    let x = (msg / 256) % 256;
+    let y = (msg / 65536) % 256;
+    let ch = (msg / 16777216) % 256;
+    let color = (msg / 0x100000000) % 256;
+
+    runtime::vga_putchar(x, y, ch, color);
+}
+
+fn handle_print(msg: i64) {
+    // Format: [type(1), ch(1)] - print at cursor and advance
+    let ch = (msg / 256) % 256;
+
+    // For now, just log to serial
+    runtime::print_char(ch);
+}
+
+fn handle_clear(msg: i64) {
+    // Format: [type(1), y_start(1), y_end(1), color(1)]
+    let y_start = (msg / 256) % 256;
+    let y_end = (msg / 65536) % 256;
+    let color = (msg / 16777216) % 256;
+
+    runtime::vga_clear(y_start, y_end, color);
+}
+
+fn handle_getkey(msg: i64) {
+    // Read key and send response back
+    // Note: For now, we just read - proper IPC response needs src_pid tracking
+    let ch = runtime::kb_read();
+    // Response would be sent back to requester
+    runtime::print_char(75);   // K
+    runtime::print_char(58);   // :
+    if ch >= 0 {
+        runtime::print_char(ch);
+    }
+}
+
+fn handle_keyavail(msg: i64) {
+    let avail = runtime::kb_avail();
+    // Response would be sent back
+    runtime::print_char(65);   // A
+    runtime::print_char(58);   // :
+    runtime::print_char(48 + avail);
+}
+
+fn handle_setcursor(msg: i64) {
+    // Format: [type(1), x(1), y(1)]
+    let x = (msg / 256) % 256;
+    let y = (msg / 65536) % 256;
+
+    runtime::vga_setcursor(x, y);
+}
+
+fn handle_scroll(msg: i64) {
+    // Format: [type(1), y_start(1), y_end(1), color(1)]
+    let y_start = (msg / 256) % 256;
+    let y_end = (msg / 65536) % 256;
+    let color = (msg / 16777216) % 256;
+
+    runtime::vga_scroll(y_start, y_end, color);
+}
+
+// ============================================================================
+// Main Loop
+// ============================================================================
+
+fn console_main_loop() {
+    // Main server loop
+    loop {
+        // Check for IPC messages
+        let msg = runtime::recv();
+        if msg != 0 {
+            handle_message(msg);
+        }
+
+        // Also poll keyboard and forward to clients if needed
+        // For now, just check and echo to serial
+        let ch = runtime::kb_read();
+        if ch > 0 {
+            runtime::print_char(ch);
+        }
+
+        // Yield to other processes
+        runtime::yield_cpu();
+    }
+}

@@ -1,11 +1,11 @@
-/* Genesis VFS Server Linker Script */
-/* Base address: 0x900000 */
+/* Genesis Console Server Linker Script */
+/* Base address: 0xA00000 */
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x900000;
+    . = 0xA00000;
 
     .text : {
         *(.text .text.*)
