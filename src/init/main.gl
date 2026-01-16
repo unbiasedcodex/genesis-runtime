@@ -544,6 +544,44 @@ fn print_failed_msg(idx: i64) {
 }
 
 // ============================================================================
+// Service Boot - Phase 4: Init spawns services via exec()
+// ============================================================================
+
+// Packed names for RAMFS lookup (little-endian)
+const NAME_VFS: i64 = 0x00736676;       // "vfs"
+const NAME_CONSOLE: i64 = 0x656C6F736E6F63;  // "console"
+const NAME_SHELL: i64 = 0x6C6C656873;   // "shell"
+
+fn boot_services() {
+    // Combined flags: CRITICAL(1) + AUTOSTART(2) = 3
+    let critical_auto: i64 = 3;
+
+    // VFS Server - critical service
+    let vfs_slot = register_service(SVC_FS, critical_auto);
+    let vfs_pid = runtime::exec(NAME_VFS);
+    if vfs_pid > 0 {
+        set_service_pid(vfs_slot, vfs_pid);
+        set_service_state(vfs_slot, SVC_STATE_RUNNING);
+    }
+
+    // Console Server - critical service
+    let con_slot = register_service(SVC_DISPLAY, critical_auto);
+    let con_pid = runtime::exec(NAME_CONSOLE);
+    if con_pid > 0 {
+        set_service_pid(con_slot, con_pid);
+        set_service_state(con_slot, SVC_STATE_RUNNING);
+    }
+
+    // Shell - autostart but not critical
+    let shell_slot = register_service(0, SVC_FLAG_AUTOSTART);
+    let shell_pid = runtime::exec(NAME_SHELL);
+    if shell_pid > 0 {
+        set_service_pid(shell_slot, shell_pid);
+        set_service_state(shell_slot, SVC_STATE_RUNNING);
+    }
+}
+
+// ============================================================================
 // Main Entry Point
 // ============================================================================
 
@@ -557,6 +595,9 @@ fn main() {
 
     init_service_table();
     print_table_init();
+
+    // Phase 4: Init spawns services
+    boot_services();
 
     print_loop_msg();
 
