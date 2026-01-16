@@ -1,0 +1,241 @@
+// Genesis Shell Server
+// PID 4 - Interactive Shell for Genesis OS
+// Handles user commands and displays output via VGA
+
+mod runtime;
+mod commands;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const KEY_ENTER: i64 = 10;
+const KEY_BACKSPACE: i64 = 8;
+
+const VGA_WIDTH: i64 = 80;
+const CONSOLE_START_ROW: i64 = 14;
+const LINE_MAX: i64 = 80;
+
+const COLOR_WHITE: i64 = 0x0F;
+const COLOR_GREEN: i64 = 0x0A;
+
+// ============================================================================
+// Shell Main Entry Point
+// ============================================================================
+
+fn main() {
+    // Print startup message to serial
+    runtime::print_char(91);   // [
+    runtime::print_char(83);   // S
+    runtime::print_char(72);   // H
+    runtime::print_char(69);   // E
+    runtime::print_char(76);   // L
+    runtime::print_char(76);   // L
+    runtime::print_char(93);   // ]
+    runtime::print_char(32);   // space
+
+    // Zero the shell data section (BSS isn't zeroed automatically)
+    // LINE_BUFFER_ADDR = 0xB80000, LINE_LEN_ADDR = 0xB80100
+    // CURSOR_X_ADDR = 0xB80110, CURSOR_Y_ADDR = 0xB80118
+    // First zero the line buffer
+    let mut i: i64 = 0;
+    while i < 256 {
+        commands::line_set(i, 0);
+        i = i + 1;
+    }
+    // Then explicitly zero the state variables
+    commands::set_line_len(0);
+    commands::set_cursor_x(0);
+    commands::set_cursor_y(0);
+
+    // Initialize shell state with proper values
+    commands::set_cursor_x(0);
+    commands::set_cursor_y(CONSOLE_START_ROW);
+    commands::set_line_len(0);
+
+    // Clear shell area on VGA
+    commands::clear_area();
+
+    // Print welcome message
+    print_welcome();
+
+    // Move to next line and show prompt
+    commands::set_cursor_x(0);
+    commands::set_cursor_y(CONSOLE_START_ROW + 1);
+    commands::prompt();
+
+    // Enter main shell loop
+    shell_main_loop();
+}
+
+// ============================================================================
+// Welcome Banner
+// ============================================================================
+
+fn print_welcome() {
+    // "Genesis Shell v0.0.13"
+    runtime::vga_putchar(0, CONSOLE_START_ROW, 71, COLOR_GREEN);   // G
+    runtime::vga_putchar(1, CONSOLE_START_ROW, 101, COLOR_GREEN);  // e
+    runtime::vga_putchar(2, CONSOLE_START_ROW, 110, COLOR_GREEN);  // n
+    runtime::vga_putchar(3, CONSOLE_START_ROW, 101, COLOR_GREEN);  // e
+    runtime::vga_putchar(4, CONSOLE_START_ROW, 115, COLOR_GREEN);  // s
+    runtime::vga_putchar(5, CONSOLE_START_ROW, 105, COLOR_GREEN);  // i
+    runtime::vga_putchar(6, CONSOLE_START_ROW, 115, COLOR_GREEN);  // s
+    runtime::vga_putchar(7, CONSOLE_START_ROW, 32, COLOR_WHITE);   // space
+    runtime::vga_putchar(8, CONSOLE_START_ROW, 83, COLOR_GREEN);   // S
+    runtime::vga_putchar(9, CONSOLE_START_ROW, 104, COLOR_GREEN);  // h
+    runtime::vga_putchar(10, CONSOLE_START_ROW, 101, COLOR_GREEN); // e
+    runtime::vga_putchar(11, CONSOLE_START_ROW, 108, COLOR_GREEN); // l
+    runtime::vga_putchar(12, CONSOLE_START_ROW, 108, COLOR_GREEN); // l
+    runtime::vga_putchar(13, CONSOLE_START_ROW, 32, COLOR_WHITE);  // space
+    runtime::vga_putchar(14, CONSOLE_START_ROW, 118, COLOR_WHITE); // v
+    runtime::vga_putchar(15, CONSOLE_START_ROW, 48, COLOR_WHITE);  // 0
+    runtime::vga_putchar(16, CONSOLE_START_ROW, 46, COLOR_WHITE);  // .
+    runtime::vga_putchar(17, CONSOLE_START_ROW, 48, COLOR_WHITE);  // 0
+    runtime::vga_putchar(18, CONSOLE_START_ROW, 46, COLOR_WHITE);  // .
+    runtime::vga_putchar(19, CONSOLE_START_ROW, 49, COLOR_WHITE);  // 1
+    runtime::vga_putchar(20, CONSOLE_START_ROW, 51, COLOR_WHITE);  // 3
+
+    // Print PID to serial
+    let pid = runtime::getpid();
+    runtime::print_char(80);   // P
+    runtime::print_char(73);   // I
+    runtime::print_char(68);   // D
+    runtime::print_char(58);   // :
+    runtime::print_char(48 + pid);  // PID number
+    runtime::print_char(10);   // newline
+}
+
+// ============================================================================
+// Command Execution
+// ============================================================================
+
+fn shell_execute() {
+    let len = commands::line_len();
+
+    // Only process non-empty commands
+    if len > 0 {
+        // Match commands
+        // "help" = 104, 101, 108, 112
+        if commands::cmd_match(104, 101, 108, 112, 0, 0, 0, 0) {
+            commands::cmd_help();
+        }
+        // "ps" = 112, 115
+        else if commands::cmd_match(112, 115, 0, 0, 0, 0, 0, 0) {
+            commands::cmd_ps();
+        }
+        // "caps" = 99, 97, 112, 115
+        else if commands::cmd_match(99, 97, 112, 115, 0, 0, 0, 0) {
+            commands::cmd_caps();
+        }
+        // "files" = 102, 105, 108, 101, 115
+        else if commands::cmd_match(102, 105, 108, 101, 115, 0, 0, 0) {
+            commands::cmd_files();
+        }
+        // "echo " = 101, 99, 104, 111, 32
+        else if commands::line_get(0) == 101 && commands::line_get(1) == 99 &&
+                commands::line_get(2) == 104 && commands::line_get(3) == 111 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_echo();
+        }
+        // "clear" = 99, 108, 101, 97, 114
+        else if commands::cmd_match(99, 108, 101, 97, 114, 0, 0, 0) {
+            commands::cmd_clear();
+        }
+        // "run " = 114, 117, 110, 32
+        else if commands::line_get(0) == 114 && commands::line_get(1) == 117 &&
+                commands::line_get(2) == 110 && commands::line_get(3) == 32 {
+            commands::cmd_run();
+        }
+        // "kill " = 107, 105, 108, 108, 32
+        else if commands::line_get(0) == 107 && commands::line_get(1) == 105 &&
+                commands::line_get(2) == 108 && commands::line_get(3) == 108 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_kill();
+        }
+        // "disk" = 100, 105, 115, 107
+        else if commands::cmd_match(100, 105, 115, 107, 0, 0, 0, 0) {
+            commands::cmd_disk();
+        }
+        // "sector " = 115, 101, 99, 116, 111, 114, 32
+        else if commands::line_get(0) == 115 && commands::line_get(1) == 101 &&
+                commands::line_get(2) == 99 && commands::line_get(3) == 116 &&
+                commands::line_get(4) == 111 && commands::line_get(5) == 114 &&
+                commands::line_get(6) == 32 {
+            commands::cmd_sector();
+        }
+        else {
+            // Unknown command
+            commands::print_str(63, 32, 0, 0, 0, 0, 0, 0);  // "? "
+            // Echo first few chars
+            let mut i: i64 = 0;
+            while i < 8 && i < len {
+                let ch = commands::line_get(i);
+                if ch != 0 {
+                    commands::putchar(ch);
+                }
+                i = i + 1;
+            }
+            commands::putchar(10);
+        }
+    }
+}
+
+// ============================================================================
+// Main Shell Loop
+// ============================================================================
+
+fn shell_main_loop() {
+    loop {
+        // Check for keyboard input
+        let ch = runtime::kb_read();
+        if ch > 0 {
+            process_key(ch);
+        }
+
+        runtime::yield_cpu();
+    }
+}
+
+// Separate function to process keys - works around compiler optimization bug
+fn process_key(ch: i64) {
+    let line_len = commands::line_len();
+
+    if ch == KEY_ENTER {
+        // Execute command on Enter
+        handle_enter(line_len);
+    } else if ch == KEY_BACKSPACE {
+        // Backspace: remove last char
+        if line_len > 0 {
+            commands::set_line_len(line_len - 1);
+            commands::line_set(line_len - 1, 0);
+            commands::putchar(ch);
+        }
+    } else if line_len < LINE_MAX - 1 {
+        // Regular character: add to buffer and display
+        commands::line_set(line_len, ch);
+        commands::set_line_len(line_len + 1);
+        commands::putchar(ch);
+
+        // Also echo to serial for debugging
+        runtime::print_char(ch);
+    }
+}
+
+// Handle Enter key - separate function to ensure shell_execute is called
+fn handle_enter(line_len: i64) {
+    // Newline
+    commands::putchar(10);
+
+    // Null-terminate line buffer
+    commands::line_set(line_len, 0);
+
+    // Execute command
+    shell_execute();
+
+    // Clear line buffer
+    commands::line_clear();
+
+    // Show new prompt
+    commands::prompt();
+}

@@ -1,0 +1,430 @@
+// Genesis Runtime Library for Shell Server
+// Syscall wrappers for userspace shell
+
+// ============================================================================
+// Syscall Numbers (must match kernel)
+// ============================================================================
+
+pub const SYS_YIELD: i64 = 0;
+pub const SYS_GETPID: i64 = 1;
+pub const SYS_PRINT: i64 = 2;
+pub const SYS_SEND: i64 = 3;
+pub const SYS_RECV: i64 = 4;
+pub const SYS_EXIT: i64 = 5;
+
+// Keyboard syscalls
+pub const SYS_KB_READ: i64 = 16;
+pub const SYS_KB_AVAIL: i64 = 17;
+
+// ELF Loader syscall
+pub const SYS_EXEC: i64 = 18;
+
+// Signal syscalls
+pub const SYS_KILL: i64 = 19;
+pub const SYS_WAIT: i64 = 20;
+pub const SYS_GETPPID: i64 = 21;
+
+// Disk syscalls
+pub const SYS_DISK_READ: i64 = 25;
+pub const SYS_DISK_INFO: i64 = 26;
+
+// VGA syscalls
+pub const SYS_VGA_PUTCHAR: i64 = 36;
+pub const SYS_VGA_SETCURSOR: i64 = 37;
+pub const SYS_VGA_CLEAR: i64 = 38;
+pub const SYS_VGA_SCROLL: i64 = 39;
+
+// Capability syscalls
+pub const SYS_CAP_LIST: i64 = 15;
+
+// RAMFS syscalls
+pub const SYS_RAMFS_FILE_COUNT: i64 = 40;
+pub const SYS_RAMFS_FILE_INFO: i64 = 41;
+pub const SYS_RAMFS_READ_BYTE: i64 = 42;
+pub const SYS_RAMFS_FILE_SIZE: i64 = 43;
+pub const SYS_RAMFS_READ_NAME: i64 = 46;
+
+// Process info syscalls
+pub const SYS_PROC_COUNT: i64 = 44;
+pub const SYS_PROC_STATE: i64 = 45;
+
+// ============================================================================
+// Low-level Syscall Functions
+// ============================================================================
+
+fn syscall0(num: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall2(num: i64, arg1: i64, arg2: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall4(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Process Management
+// ============================================================================
+
+pub fn yield_cpu() {
+    syscall0(SYS_YIELD);
+}
+
+pub fn getpid() -> i64 {
+    syscall0(SYS_GETPID)
+}
+
+pub fn exit() {
+    syscall0(SYS_EXIT);
+}
+
+pub fn getppid() -> i64 {
+    syscall0(SYS_GETPPID)
+}
+
+// ============================================================================
+// Serial I/O (for debugging)
+// ============================================================================
+
+pub fn print_char(c: i64) {
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 2,      // SYS_PRINT = 2 (literal constant)
+            in("rdi") c,
+            lateout("rax") _,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+pub fn print_num(n: i64) {
+    if n < 0 {
+        print_char(45);  // '-'
+        print_num(0 - n);
+        return;
+    }
+    if n >= 10 {
+        print_num(n / 10);
+    }
+    print_char(48 + (n % 10));
+}
+
+pub fn print_str8(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64) {
+    if s0 != 0 { print_char(s0); }
+    if s1 != 0 { print_char(s1); }
+    if s2 != 0 { print_char(s2); }
+    if s3 != 0 { print_char(s3); }
+    if s4 != 0 { print_char(s4); }
+    if s5 != 0 { print_char(s5); }
+    if s6 != 0 { print_char(s6); }
+    if s7 != 0 { print_char(s7); }
+}
+
+pub fn print_newline() {
+    print_char(10);
+}
+
+// ============================================================================
+// IPC - Inter-Process Communication
+// ============================================================================
+
+pub fn send(dest_pid: i64, msg: i64) -> i64 {
+    syscall2(SYS_SEND, dest_pid, msg)
+}
+
+pub fn recv() -> i64 {
+    syscall0(SYS_RECV)
+}
+
+// ============================================================================
+// Keyboard Access
+// ============================================================================
+
+// Read character from keyboard buffer
+// Returns: ASCII character, or -1 if buffer empty
+pub fn kb_read() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 16,  // SYS_KB_READ = 16 (literal constant)
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Check if keyboard buffer has data
+// Returns: 1 if data available, 0 otherwise
+pub fn kb_avail() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 17,  // SYS_KB_AVAIL = 17 (literal constant)
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// VGA Access
+// ============================================================================
+
+// Write character at position with color
+// x: column (0-79), y: row (0-24), ch: ASCII char, color: attribute byte
+pub fn vga_putchar(x: i64, y: i64, ch: i64, color: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 36,  // SYS_VGA_PUTCHAR = 36 (literal)
+            in("rdi") x,
+            in("rsi") y,
+            in("rdx") ch,
+            in("r10") color,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Set hardware cursor position
+// x: column (0-79), y: row (0-24)
+pub fn vga_setcursor(x: i64, y: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 37,  // SYS_VGA_SETCURSOR = 37 (literal)
+            in("rdi") x,
+            in("rsi") y,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Clear screen region
+// y_start: first row, y_end: last row (exclusive), color: fill color
+pub fn vga_clear(y_start: i64, y_end: i64, color: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 38,  // SYS_VGA_CLEAR = 38 (literal)
+            in("rdi") y_start,
+            in("rsi") y_end,
+            in("rdx") color,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Scroll screen region up by one line
+// y_start: first row, y_end: last row (exclusive), color: fill color for new line
+pub fn vga_scroll(y_start: i64, y_end: i64, color: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 39,  // SYS_VGA_SCROLL = 39 (literal)
+            in("rdi") y_start,
+            in("rsi") y_end,
+            in("rdx") color,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Process Execution
+// ============================================================================
+
+// Execute ELF binary from RAMFS
+// name_lo: packed filename (first 8 chars in little-endian)
+// Returns: new PID on success, negative error on failure
+pub fn exec(name_lo: i64) -> i64 {
+    syscall1(SYS_EXEC, name_lo)
+}
+
+// ============================================================================
+// Signal Management
+// ============================================================================
+
+// Send signal to process
+// pid: target process ID
+// signum: signal number (e.g., 15=SIGTERM, 9=SIGKILL)
+// Returns: 0 on success, negative error on failure
+pub fn kill(pid: i64, signum: i64) -> i64 {
+    syscall2(SYS_KILL, pid, signum)
+}
+
+// Wait for child process to change state
+// pid: process ID to wait for (-1 for any child)
+// Returns: terminated child PID, or negative error
+pub fn wait(pid: i64) -> i64 {
+    syscall1(SYS_WAIT, pid)
+}
+
+// ============================================================================
+// Disk Access
+// ============================================================================
+
+// Read disk sectors
+// lba: logical block address
+// count: number of sectors to read
+// buffer: destination address
+// Returns: bytes read, or negative error
+pub fn disk_read(lba: i64, count: i64, buffer: i64) -> i64 {
+    syscall3(SYS_DISK_READ, lba, count, buffer)
+}
+
+// Get disk information
+// info_type: 0=present, 1=total_sectors
+// Returns: requested value
+pub fn disk_info(info_type: i64) -> i64 {
+    syscall1(SYS_DISK_INFO, info_type)
+}
+
+// ============================================================================
+// RAMFS Access
+// ============================================================================
+
+// Get number of files in RAMFS
+pub fn ramfs_file_count() -> i64 {
+    syscall0(SYS_RAMFS_FILE_COUNT)
+}
+
+// Get file info (flags)
+// file_idx: file index
+// Returns: file flags (0=unused, 1=regular file)
+pub fn ramfs_file_info(file_idx: i64) -> i64 {
+    syscall1(SYS_RAMFS_FILE_INFO, file_idx)
+}
+
+// Get file size
+// file_idx: file index
+// Returns: file size in bytes
+pub fn ramfs_file_size(file_idx: i64) -> i64 {
+    syscall1(SYS_RAMFS_FILE_SIZE, file_idx)
+}
+
+// Read byte from file
+// file_idx: file index
+// offset: byte offset within file
+// Returns: byte value (0-255), or negative error
+pub fn ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
+    syscall2(SYS_RAMFS_READ_BYTE, file_idx, offset)
+}
+
+// Read filename character
+// file_idx: file index
+// char_idx: character index (0-7)
+// Returns: ASCII character, or 0 if past end
+pub fn ramfs_read_name(file_idx: i64, char_idx: i64) -> i64 {
+    syscall2(SYS_RAMFS_READ_NAME, file_idx, char_idx)
+}
+
+// ============================================================================
+// Capability Access
+// ============================================================================
+
+// Get capability info at index
+// cap_idx: capability slot index (0-3)
+// Returns: packed info (type * 65536 + target * 256 + rights), or negative error
+pub fn cap_list(cap_idx: i64) -> i64 {
+    syscall1(SYS_CAP_LIST, cap_idx)
+}
+
+// ============================================================================
+// Process Info Access
+// ============================================================================
+
+// Get number of active processes
+// Returns: count of processes
+pub fn proc_count() -> i64 {
+    syscall0(SYS_PROC_COUNT)
+}
+
+// Get process state by PID
+// pid: process ID
+// Returns: state (0=unused, 1=ready, 2=running, 3=waiting, 4=zombie, 5=stopped)
+pub fn proc_state(pid: i64) -> i64 {
+    syscall1(SYS_PROC_STATE, pid)
+}
