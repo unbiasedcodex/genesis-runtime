@@ -543,6 +543,31 @@ fn print_failed_msg(idx: i64) {
     newline();
 }
 
+// Print "[init] Child exited: PID X"
+fn print_child_exit(pid: i64) {
+    print_init_prefix();
+    runtime::print_char(67);  // C
+    runtime::print_char(104); // h
+    runtime::print_char(105); // i
+    runtime::print_char(108); // l
+    runtime::print_char(100); // d
+    runtime::print_char(32);  // space
+    runtime::print_char(101); // e
+    runtime::print_char(120); // x
+    runtime::print_char(105); // i
+    runtime::print_char(116); // t
+    runtime::print_char(101); // e
+    runtime::print_char(100); // d
+    runtime::print_char(58);  // :
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(73);  // I
+    runtime::print_char(68);  // D
+    runtime::print_char(32);  // space
+    runtime::print_num(pid);
+    newline();
+}
+
 // ============================================================================
 // Service Boot - Phase 4: Init spawns services via exec()
 // ============================================================================
@@ -603,6 +628,7 @@ fn boot_services() {
 
     // VFS Server - critical service
     let vfs_slot = register_service(runtime::SVC_FS, critical_auto);
+    set_service_path(vfs_slot, NAME_VFS);
     let vfs_pid = runtime::exec(NAME_VFS);
     if vfs_pid > 0 {
         set_service_pid(vfs_slot, vfs_pid);
@@ -612,6 +638,7 @@ fn boot_services() {
 
     // Console Server - critical service
     let con_slot = register_service(runtime::SVC_DISPLAY, critical_auto);
+    set_service_path(con_slot, NAME_CONSOLE);
     let con_pid = runtime::exec(NAME_CONSOLE);
     if con_pid > 0 {
         set_service_pid(con_slot, con_pid);
@@ -621,6 +648,7 @@ fn boot_services() {
 
     // Shell - autostart but not critical
     let shell_slot = register_service(0, SVC_FLAG_AUTOSTART);
+    set_service_path(shell_slot, NAME_SHELL);
     let shell_pid = runtime::exec(NAME_SHELL);
     if shell_pid > 0 {
         set_service_pid(shell_slot, shell_pid);
@@ -660,6 +688,7 @@ fn main() {
         // Use non-blocking wait to avoid blocking init
         let child = runtime::wait_nohang();
         if child > 0 {
+            print_child_exit(child);
             handle_child_exit(child);
         }
 
