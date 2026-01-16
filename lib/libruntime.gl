@@ -52,6 +52,9 @@ pub const SIGCHLD: i64 = 17;
 pub const SIGUSR1: i64 = 10;
 pub const SIGUSR2: i64 = 12;
 
+// Wait flags (must match kernel)
+pub const WAIT_NOHANG: i64 = 1;
+
 // ============================================================================
 // IPC Service Endpoints
 // ============================================================================
@@ -181,9 +184,25 @@ pub fn kill(pid: i64, signal: i64) -> i64 {
     syscall2(SYS_KILL, pid, signal)
 }
 
-// Wait for child process (returns child PID or -1)
+// Wait for any child (blocking)
 pub fn wait() -> i64 {
-    syscall0(SYS_WAIT)
+    syscall2(SYS_WAIT, 0 - 1, 0)
+}
+
+// Wait for any child (non-blocking)
+// Returns: child PID if exited, 0 if no child exited, negative on error
+pub fn wait_nohang() -> i64 {
+    syscall2(SYS_WAIT, 0 - 1, WAIT_NOHANG)
+}
+
+// Wait for specific child (blocking)
+pub fn waitpid(pid: i64) -> i64 {
+    syscall2(SYS_WAIT, pid, 0)
+}
+
+// Wait for specific child (non-blocking)
+pub fn waitpid_nohang(pid: i64) -> i64 {
+    syscall2(SYS_WAIT, pid, WAIT_NOHANG)
 }
 
 // ============================================================================

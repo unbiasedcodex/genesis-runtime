@@ -552,24 +552,71 @@ const NAME_VFS: i64 = 0x00736676;       // "vfs"
 const NAME_CONSOLE: i64 = 0x656C6F736E6F63;  // "console"
 const NAME_SHELL: i64 = 0x6C6C656873;   // "shell"
 
+// Print "[init] VFS started PID "
+fn print_service_started_vfs(pid: i64) {
+    print_init_prefix();
+    runtime::print_char(86);  // V
+    runtime::print_char(70);  // F
+    runtime::print_char(83);  // S
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(73);  // I
+    runtime::print_char(68);  // D
+    runtime::print_char(58);  // :
+    runtime::print_num(pid);
+    newline();
+}
+
+// Print "[init] Console started PID "
+fn print_service_started_con(pid: i64) {
+    print_init_prefix();
+    runtime::print_char(67);  // C
+    runtime::print_char(79);  // O
+    runtime::print_char(78);  // N
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(73);  // I
+    runtime::print_char(68);  // D
+    runtime::print_char(58);  // :
+    runtime::print_num(pid);
+    newline();
+}
+
+// Print "[init] Shell started PID "
+fn print_service_started_shell(pid: i64) {
+    print_init_prefix();
+    runtime::print_char(83);  // S
+    runtime::print_char(72);  // H
+    runtime::print_char(76);  // L
+    runtime::print_char(32);  // space
+    runtime::print_char(80);  // P
+    runtime::print_char(73);  // I
+    runtime::print_char(68);  // D
+    runtime::print_char(58);  // :
+    runtime::print_num(pid);
+    newline();
+}
+
 fn boot_services() {
     // Combined flags: CRITICAL(1) + AUTOSTART(2) = 3
     let critical_auto: i64 = 3;
 
     // VFS Server - critical service
-    let vfs_slot = register_service(SVC_FS, critical_auto);
+    let vfs_slot = register_service(runtime::SVC_FS, critical_auto);
     let vfs_pid = runtime::exec(NAME_VFS);
     if vfs_pid > 0 {
         set_service_pid(vfs_slot, vfs_pid);
         set_service_state(vfs_slot, SVC_STATE_RUNNING);
+        print_service_started_vfs(vfs_pid);
     }
 
     // Console Server - critical service
-    let con_slot = register_service(SVC_DISPLAY, critical_auto);
+    let con_slot = register_service(runtime::SVC_DISPLAY, critical_auto);
     let con_pid = runtime::exec(NAME_CONSOLE);
     if con_pid > 0 {
         set_service_pid(con_slot, con_pid);
         set_service_state(con_slot, SVC_STATE_RUNNING);
+        print_service_started_con(con_pid);
     }
 
     // Shell - autostart but not critical
@@ -578,6 +625,7 @@ fn boot_services() {
     if shell_pid > 0 {
         set_service_pid(shell_slot, shell_pid);
         set_service_state(shell_slot, SVC_STATE_RUNNING);
+        print_service_started_shell(shell_pid);
     }
 }
 
@@ -609,7 +657,8 @@ fn main() {
             process_message(sender);
         }
 
-        let child = runtime::wait();
+        // Use non-blocking wait to avoid blocking init
+        let child = runtime::wait_nohang();
         if child > 0 {
             handle_child_exit(child);
         }

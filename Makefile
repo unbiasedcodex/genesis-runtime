@@ -21,11 +21,14 @@ all: $(SERVICES)
 # Init system (loads at 0x800000)
 init: $(BUILD_DIR)/init.elf
 
-$(BUILD_DIR)/init.elf: $(BUILD_DIR)/init.o linker.ld
-	$(LD) -T linker.ld -m elf_x86_64 --nostdlib -o $@ $(BUILD_DIR)/init.o
+$(BUILD_DIR)/init.elf: $(BUILD_DIR)/init.o $(BUILD_DIR)/start.o src/init/userspace.ld
+	$(LD) -T src/init/userspace.ld -m elf_x86_64 --nostdlib -o $@ $(BUILD_DIR)/start.o $(BUILD_DIR)/init.o
 
 $(BUILD_DIR)/init.o: src/init/main.gl src/init/runtime.gl | $(BUILD_DIR)
 	$(GLC) build src/init/main.gl $(GLCFLAGS) -o $@
+
+$(BUILD_DIR)/start.o: src/init/start.asm | $(BUILD_DIR)
+	nasm -f elf64 -o $@ $<
 
 # VFS Server (loads at 0x900000)
 vfs: $(BUILD_DIR)/vfs.elf
