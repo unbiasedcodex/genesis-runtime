@@ -293,6 +293,10 @@ pub fn cmd_help() {
     print_str(32, 32, 102, 105, 108, 101, 115, 0);
     putchar(10);
 
+    // "  cat   - read file"
+    print_str(32, 32, 99, 97, 116, 0, 0, 0);
+    putchar(10);
+
     // "  echo  - echo text"
     print_str(32, 32, 101, 99, 104, 111, 0, 0);
     putchar(10);
@@ -389,48 +393,212 @@ pub fn cmd_caps() {
     }
 }
 
-// Command: files - list files
+// Command: files - list files via VFS IPC
 pub fn cmd_files() {
     print_str(70, 105, 108, 101, 115, 58, 0, 0);  // "Files:"
     putchar(10);
 
-    let used = runtime::ramfs_file_count();
-    let mut i: i64 = 0;
-    while i < used {
-        let flags = runtime::ramfs_file_info(i);
-        if flags != 0 {
-            // Print file index
-            putchar(48 + i);
-            putchar(58);
-            putchar(32);
+    // Get my PID for the response
+    let my_pid = runtime::getpid();
 
-            // Read and print filename (first 8 chars)
-            let mut j: i64 = 0;
-            while j < 8 {
-                let ch = runtime::ramfs_read_name(i, j);
-                if ch != 0 {
-                    putchar(ch);
-                }
-                j = j + 1;
-            }
+    // Send VFS_LIST request to VFS server (PID 2)
+    let request = runtime::pack_vfs_request(runtime::VFS_LIST, my_pid, 0, 0, 0, 0, 0, 0);
+    runtime::send(runtime::VFS_PID, request);
 
-            // Print size
-            putchar(32);
-            putchar(40);  // (
-            let size = runtime::ramfs_file_size(i);
-            if size < 10 {
-                putchar(48 + size);
-            } else if size < 100 {
-                putchar(48 + (size / 10) % 10);
-                putchar(48 + size % 10);
+    // Wait for file count response
+    let count_resp = wait_vfs_response();
+    if count_resp == 0 {
+        print_str(69, 82, 82, 58, 32, 86, 70, 83);  // "ERR: VFS"
+        putchar(10);
+        return;
+    }
+
+    let status = runtime::msg_byte(count_resp, 0);
+    let file_count = runtime::msg_byte(count_resp, 1);
+
+    // Debug: show count
+    runtime::print_char(35);  // #
+    runtime::print_char(48 + file_count);
+    runtime::print_char(32);
+
+    // Receive file entries until end marker (0xFE)
+    let mut done: i64 = 0;
+    while done == 0 {
+        let file_resp = wait_vfs_response();
+        if file_resp == 0 {
+            done = 1;
+        } else {
+            let marker = runtime::msg_byte(file_resp, 0);
+
+            if marker == 254 {
+                // End marker received
+                done = 1;
+            } else if marker == 255 {
+                // Size message - already handled below
             } else {
-                print_dec(size);
+                // File entry: [index, c0, c1, c2, c3, c4, c5]
+                let file_idx = marker;
+                let c0 = runtime::msg_byte(file_resp, 1);
+                let c1 = runtime::msg_byte(file_resp, 2);
+                let c2 = runtime::msg_byte(file_resp, 3);
+                let c3 = runtime::msg_byte(file_resp, 4);
+                let c4 = runtime::msg_byte(file_resp, 5);
+                let c5 = runtime::msg_byte(file_resp, 6);
+
+                // Print file index
+                putchar(48 + file_idx);
+                putchar(58);
+                putchar(32);
+
+                // Print filename
+                if c0 != 0 { putchar(c0); }
+                if c1 != 0 { putchar(c1); }
+                if c2 != 0 { putchar(c2); }
+                if c3 != 0 { putchar(c3); }
+                if c4 != 0 { putchar(c4); }
+                if c5 != 0 { putchar(c5); }
+
+                // Wait for size message
+                let size_resp = wait_vfs_response();
+                if size_resp != 0 {
+                    let size_marker = runtime::msg_byte(size_resp, 0);
+                    if size_marker == 255 {
+                        let size_lo = runtime::msg_byte(size_resp, 1);
+                        let size_hi = runtime::msg_byte(size_resp, 2);
+                        let size = size_lo + (size_hi * 256);
+
+                        putchar(32);
+                        putchar(40);  // (
+                        print_dec(size);
+                        putchar(66);  // B
+                        putchar(41);  // )
+                    }
+                }
+                putchar(10);
             }
-            putchar(66);  // B
-            putchar(41);  // )
-            putchar(10);
         }
-        i = i + 1;
+    }
+}
+
+// Wait for VFS response with timeout
+fn wait_vfs_response() -> i64 {
+    let mut response: i64 = 0;
+    let mut attempts: i64 = 0;
+    while response == 0 && attempts < 5000 {
+        response = runtime::recv();
+        if response == 0 {
+            runtime::yield_cpu();
+        }
+        attempts = attempts + 1;
+    }
+    response
+}
+
+// Command: cat <filename> - display file contents via VFS IPC
+pub fn cmd_cat() {
+    // Get filename starting at position 4 (after "cat ")
+    let c0 = line_get(4);
+    let c1 = line_get(5);
+    let c2 = line_get(6);
+    let c3 = line_get(7);
+    let c4 = line_get(8);
+    let c5 = line_get(9);
+
+    if c0 == 0 {
+        print_str(85, 115, 97, 103, 101, 58, 32, 0);  // "Usage: "
+        print_str(99, 97, 116, 32, 60, 102, 62, 0);   // "cat <f>"
+        putchar(10);
+        return;
+    }
+
+    let my_pid = runtime::getpid();
+
+    // Send VFS_OPEN request
+    let open_req = runtime::pack_vfs_request(runtime::VFS_OPEN, my_pid, c0, c1, c2, c3, c4, c5);
+    runtime::send(runtime::VFS_PID, open_req);
+
+    // Wait for open response
+    let open_resp = wait_vfs_response();
+    if open_resp == 0 {
+        print_str(69, 82, 82, 58, 32, 86, 70, 83);  // "ERR: VFS"
+        putchar(10);
+        return;
+    }
+
+    let open_status = runtime::msg_byte(open_resp, 0);
+    let file_idx = runtime::msg_byte(open_resp, 1);
+
+    if open_status != 0 {
+        print_str(70, 105, 108, 101, 32, 110, 111, 116);  // "File not"
+        putchar(10);
+        print_str(102, 111, 117, 110, 100, 0, 0, 0);      // "found"
+        putchar(10);
+        return;
+    }
+
+    // Get file size first via VFS_STAT
+    let stat_req = runtime::pack_vfs_request(runtime::VFS_STAT, my_pid, file_idx, 0, 0, 0, 0, 0);
+    runtime::send(runtime::VFS_PID, stat_req);
+
+    let stat_resp = wait_vfs_response();
+    if stat_resp == 0 {
+        return;
+    }
+
+    let stat_status = runtime::msg_byte(stat_resp, 0);
+    let size_lo = runtime::msg_byte(stat_resp, 1);
+    let size_hi = runtime::msg_byte(stat_resp, 2);
+    let size_mid = runtime::msg_byte(stat_resp, 3);
+    let file_size = size_lo + (size_hi * 256) + (size_mid * 65536);
+
+    // Read and display file contents
+    let mut offset: i64 = 0;
+    let mut bytes_displayed: i64 = 0;
+    let max_display: i64 = 256;  // Limit output for display
+
+    while offset < file_size && bytes_displayed < max_display {
+        // Send VFS_READ request
+        let offset_lo = offset % 256;
+        let offset_hi = (offset / 256) % 256;
+        let read_req = runtime::pack_vfs_request(runtime::VFS_READ, my_pid, file_idx, offset_lo, offset_hi, 6, 0, 0);
+        runtime::send(runtime::VFS_PID, read_req);
+
+        // Wait for read response
+        let read_resp = wait_vfs_response();
+        if read_resp == 0 {
+            break;
+        }
+
+        let bytes_read = runtime::msg_byte(read_resp, 0);
+        if bytes_read == 0 {
+            break;
+        }
+
+        // Display bytes
+        let mut i: i64 = 0;
+        while i < bytes_read && bytes_displayed < max_display {
+            let byte = runtime::msg_byte(read_resp, i + 1);
+            // Only print printable ASCII characters
+            if byte >= 32 && byte < 127 {
+                putchar(byte);
+            } else if byte == 10 {
+                putchar(10);  // newline
+            } else if byte == 9 {
+                putchar(32);  // tab -> space
+            }
+            i = i + 1;
+            bytes_displayed = bytes_displayed + 1;
+        }
+
+        offset = offset + bytes_read;
+    }
+
+    putchar(10);
+
+    // Show truncation notice if file was larger
+    if file_size > max_display {
+        print_str(91, 46, 46, 46, 93, 0, 0, 0);  // "[...]"
+        putchar(10);
     }
 }
 

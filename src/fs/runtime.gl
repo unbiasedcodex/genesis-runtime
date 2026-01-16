@@ -17,6 +17,7 @@ pub const SYS_RAMFS_FILE_COUNT: i64 = 40;
 pub const SYS_RAMFS_FILE_INFO: i64 = 41;
 pub const SYS_RAMFS_READ_BYTE: i64 = 42;
 pub const SYS_RAMFS_FILE_SIZE: i64 = 43;
+pub const SYS_RAMFS_READ_NAME: i64 = 46;
 
 // ============================================================================
 // Low-level Syscall Functions
@@ -122,6 +123,52 @@ pub fn recv() -> i64 {
     syscall0(SYS_RECV)
 }
 
+// Receive with sender PID
+// Uses a static buffer to store the sender PID
+// Returns: (message, sender_pid) packed as (msg << 8) | sender_pid? No, too complex
+// Instead, use separate calls
+
+const RECV_SENDER_ADDR: i64 = 0x918000;  // Temp storage in VFS data segment
+
+// Receive message and store sender PID
+// Returns: message data, or -1 if no message
+// Stores sender PID at RECV_SENDER_ADDR
+pub fn recv_from() -> i64 {
+    syscall1(SYS_RECV, RECV_SENDER_ADDR)
+}
+
+// Get the last received message's sender PID
+pub fn get_last_sender() -> i64 {
+    read_u64(RECV_SENDER_ADDR)
+}
+
+fn read_u64(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, readonly, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // ============================================================================
 // RAMFS Access (VFS Server specific)
 // ============================================================================
@@ -144,4 +191,42 @@ pub fn ramfs_read_byte(file_idx: i64, offset: i64) -> i64 {
 // Get file size
 pub fn ramfs_file_size(file_idx: i64) -> i64 {
     syscall1(SYS_RAMFS_FILE_SIZE, file_idx)
+}
+
+// Read filename character
+// file_idx: file index
+// char_idx: character index (0-31)
+// Returns: ASCII character, or 0 if past end
+pub fn ramfs_read_name(file_idx: i64, char_idx: i64) -> i64 {
+    syscall2(SYS_RAMFS_READ_NAME, file_idx, char_idx)
+}
+
+// ============================================================================
+// IPC Message Helpers
+// ============================================================================
+
+// Pack a VFS response message
+// status: result status (0 = success, negative = error)
+// data1, data2: additional data bytes
+pub fn pack_response(status: i64, data1: i64, data2: i64, data3: i64, data4: i64, data5: i64, data6: i64) -> i64 {
+    (status % 256) +
+    ((data1 % 256) * 256) +
+    ((data2 % 256) * 65536) +
+    ((data3 % 256) * 16777216) +
+    ((data4 % 256) * 0x100000000) +
+    ((data5 % 256) * 0x10000000000) +
+    ((data6 % 256) * 0x1000000000000)
+}
+
+// Extract byte from packed message
+pub fn msg_byte(msg: i64, index: i64) -> i64 {
+    if index == 0 { return msg % 256; }
+    if index == 1 { return (msg / 256) % 256; }
+    if index == 2 { return (msg / 65536) % 256; }
+    if index == 3 { return (msg / 16777216) % 256; }
+    if index == 4 { return (msg / 0x100000000) % 256; }
+    if index == 5 { return (msg / 0x10000000000) % 256; }
+    if index == 6 { return (msg / 0x1000000000000) % 256; }
+    if index == 7 { return (msg / 0x100000000000000) % 256; }
+    0
 }

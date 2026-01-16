@@ -132,6 +132,11 @@ fn shell_execute() {
         else if commands::cmd_match(102, 105, 108, 101, 115, 0, 0, 0) {
             commands::cmd_files();
         }
+        // "cat " = 99, 97, 116, 32
+        else if commands::line_get(0) == 99 && commands::line_get(1) == 97 &&
+                commands::line_get(2) == 116 && commands::line_get(3) == 32 {
+            commands::cmd_cat();
+        }
         // "echo " = 101, 99, 104, 111, 32
         else if commands::line_get(0) == 101 && commands::line_get(1) == 99 &&
                 commands::line_get(2) == 104 && commands::line_get(3) == 111 &&

@@ -428,3 +428,63 @@ pub fn proc_count() -> i64 {
 pub fn proc_state(pid: i64) -> i64 {
     syscall1(SYS_PROC_STATE, pid)
 }
+
+// ============================================================================
+// IPC Message Helpers
+// ============================================================================
+
+// VFS command types
+pub const VFS_OPEN: i64 = 1;
+pub const VFS_READ: i64 = 2;
+pub const VFS_STAT: i64 = 5;
+pub const VFS_LIST: i64 = 8;
+
+// VFS server PID
+pub const VFS_PID: i64 = 2;
+
+// Pack a VFS request message
+// cmd: command type
+// sender: sender PID (included so VFS knows who to respond to)
+// d0-d5: additional data bytes
+pub fn pack_vfs_request(cmd: i64, sender: i64, d0: i64, d1: i64, d2: i64, d3: i64, d4: i64, d5: i64) -> i64 {
+    (cmd % 256) +
+    ((sender % 256) * 256) +
+    ((d0 % 256) * 65536) +
+    ((d1 % 256) * 16777216) +
+    ((d2 % 256) * 0x100000000) +
+    ((d3 % 256) * 0x10000000000) +
+    ((d4 % 256) * 0x1000000000000) +
+    ((d5 % 256) * 0x100000000000000)
+}
+
+// Extract byte from packed message
+pub fn msg_byte(msg: i64, index: i64) -> i64 {
+    if index == 0 { return msg % 256; }
+    if index == 1 { return (msg / 256) % 256; }
+    if index == 2 { return (msg / 65536) % 256; }
+    if index == 3 { return (msg / 16777216) % 256; }
+    if index == 4 { return (msg / 0x100000000) % 256; }
+    if index == 5 { return (msg / 0x10000000000) % 256; }
+    if index == 6 { return (msg / 0x1000000000000) % 256; }
+    if index == 7 { return (msg / 0x100000000000000) % 256; }
+    0
+}
+
+// Send VFS request and wait for response
+// Returns the response message
+pub fn vfs_request(request: i64) -> i64 {
+    // Send request to VFS server
+    send(VFS_PID, request);
+
+    // Wait for response (simple polling loop)
+    let mut response: i64 = 0;
+    let mut attempts: i64 = 0;
+    while response == 0 && attempts < 10000 {
+        response = recv();
+        if response == 0 {
+            yield_cpu();
+        }
+        attempts = attempts + 1;
+    }
+    response
+}
