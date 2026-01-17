@@ -136,11 +136,7 @@ fn handle_message(msg: i64) {
         6 => handle_setcursor(msg),    // MSG_SETCURSOR
         7 => handle_scroll(msg),       // MSG_SCROLL
         _ => {
-            // Unknown message type - log to serial
-            runtime::print_char(63);   // ?
-            runtime::print_char(77);   // M
-            runtime::print_char(83);   // S
-            runtime::print_char(71);   // G
+            // Unknown message type - ignore
         },
     }
 }
