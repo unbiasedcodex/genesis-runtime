@@ -10,6 +10,7 @@ mod commands;
 // ============================================================================
 
 const KEY_ENTER: i64 = 10;
+const KEY_ENTER_CR: i64 = 13;  // Carriage return (some keyboards use this)
 const KEY_BACKSPACE: i64 = 8;
 
 const VGA_WIDTH: i64 = 80;
@@ -169,6 +170,22 @@ fn shell_execute() {
                 commands::line_get(6) == 32 {
             commands::cmd_sector();
         }
+        // "health" = 104, 101, 97, 108, 116, 104
+        else if commands::cmd_match(104, 101, 97, 108, 116, 104, 0, 0) {
+            commands::cmd_health();
+        }
+        // "uptime" = 117, 112, 116, 105, 109, 101
+        else if commands::cmd_match(117, 112, 116, 105, 109, 101, 0, 0) {
+            commands::cmd_uptime();
+        }
+        // "whoami" = 119, 104, 111, 97, 109, 105
+        else if commands::cmd_match(119, 104, 111, 97, 109, 105, 0, 0) {
+            commands::cmd_whoami();
+        }
+        // "env" = 101, 110, 118
+        else if commands::cmd_match(101, 110, 118, 0, 0, 0, 0, 0) {
+            commands::cmd_env();
+        }
         else {
             // Unknown command
             commands::print_str(63, 32, 0, 0, 0, 0, 0, 0);  // "? "
@@ -191,11 +208,38 @@ fn shell_execute() {
 // ============================================================================
 
 fn shell_main_loop() {
+    // Debug: entering loop
+    runtime::print_char(76);  // L
+    runtime::print_char(79);  // O
+    runtime::print_char(79);  // O
+    runtime::print_char(80);  // P
+    runtime::print_char(10);  // newline
+
+    // Track iterations for periodic zombie reaping
+    let mut iter_count: i64 = 0;
+
     loop {
         // Check for keyboard input
         let ch = runtime::kb_read();
         if ch > 0 {
+            // Debug: got char
+            runtime::print_char(71);  // G
+            runtime::print_char(58);  // :
             process_key(ch);
+        }
+
+        // Reap zombie children periodically (every 1000 iterations)
+        iter_count = iter_count + 1;
+        if iter_count >= 1000 {
+            iter_count = 0;
+            let reaped = runtime::reap_zombies();
+            if reaped > 0 {
+                // Debug: reaped a zombie
+                runtime::print_char(90);  // Z
+                runtime::print_char(58);  // :
+                runtime::print_num(reaped);
+                runtime::print_char(32);  // space
+            }
         }
 
         runtime::yield_cpu();
@@ -206,7 +250,15 @@ fn shell_main_loop() {
 fn process_key(ch: i64) {
     let line_len = commands::line_len();
 
-    if ch == KEY_ENTER {
+    // Debug: show K* for each key
+    runtime::print_char(75);  // K
+    runtime::print_char(42);  // *
+
+    if ch == KEY_ENTER || ch == KEY_ENTER_CR {
+        // Debug: Enter detected
+        runtime::print_char(69);  // E
+        runtime::print_char(78);  // N
+        runtime::print_char(84);  // T
         // Execute command on Enter
         handle_enter(line_len);
     } else if ch == KEY_BACKSPACE {

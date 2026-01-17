@@ -218,12 +218,8 @@ fn console_main_loop() {
             handle_message(msg);
         }
 
-        // Also poll keyboard and forward to clients if needed
-        // For now, just check and echo to serial
-        let ch = runtime::kb_read();
-        if ch > 0 {
-            runtime::print_char(ch);
-        }
+        // NOTE: Keyboard is read directly by Shell (PID 4), not here.
+        // Console only handles IPC messages for VGA output.
 
         // Yield to other processes
         runtime::yield_cpu();

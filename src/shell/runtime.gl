@@ -48,6 +48,9 @@ pub const SYS_RAMFS_READ_NAME: i64 = 46;
 pub const SYS_PROC_COUNT: i64 = 44;
 pub const SYS_PROC_STATE: i64 = 45;
 
+// Time syscalls
+pub const SYS_TIME: i64 = 34;
+
 // ============================================================================
 // Low-level Syscall Functions
 // ============================================================================
@@ -335,11 +338,21 @@ pub fn kill(pid: i64, signum: i64) -> i64 {
     syscall2(SYS_KILL, pid, signum)
 }
 
+// Wait flags
+pub const WAIT_NOHANG: i64 = 1;
+
 // Wait for child process to change state
 // pid: process ID to wait for (-1 for any child)
-// Returns: terminated child PID, or negative error
-pub fn wait(pid: i64) -> i64 {
-    syscall1(SYS_WAIT, pid)
+// flags: WAIT_NOHANG=1 for non-blocking
+// Returns: terminated child PID, 0 if NOHANG and no zombie, or negative error
+pub fn wait(pid: i64, flags: i64) -> i64 {
+    syscall2(SYS_WAIT, pid, flags)
+}
+
+// Non-blocking wait to reap any zombie children
+// Returns: reaped child PID, or 0 if no zombies
+pub fn reap_zombies() -> i64 {
+    wait(0 - 1, WAIT_NOHANG)  // -1 = any child, WAIT_NOHANG = non-blocking
 }
 
 // ============================================================================
@@ -427,6 +440,16 @@ pub fn proc_count() -> i64 {
 // Returns: state (0=unused, 1=ready, 2=running, 3=waiting, 4=zombie, 5=stopped)
 pub fn proc_state(pid: i64) -> i64 {
     syscall1(SYS_PROC_STATE, pid)
+}
+
+// ============================================================================
+// Time Access
+// ============================================================================
+
+// Get current tick count (system uptime in timer ticks)
+// Returns: number of ticks since boot
+pub fn time() -> i64 {
+    syscall0(SYS_TIME)
 }
 
 // ============================================================================

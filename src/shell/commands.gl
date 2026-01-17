@@ -146,9 +146,13 @@ pub fn line_clear() {
 
 // Write character at cursor and advance
 // Note: Column 0 has a bug where characters disappear, so we use column 1 as minimum
+// Also outputs to serial for debugging/testing
 pub fn putchar(ch: i64) {
     let mut cx = cursor_x();
     let mut cy = cursor_y();
+
+    // Also send to serial for debugging
+    runtime::print_char(ch);
 
     if ch == 10 {
         // Newline: move to next row, start at column 1 (workaround for col 0 bug)
@@ -241,6 +245,11 @@ pub fn prompt() {
     let cx = cursor_x();
     let cy = cursor_y();
 
+    // Also send prompt to serial
+    runtime::print_char(10);  // newline
+    runtime::print_char(62);  // >
+    runtime::print_char(32);  // space
+
     runtime::vga_putchar(cx, cy, 62, COLOR_GREEN);      // >
     runtime::vga_putchar(cx + 1, cy, 32, COLOR_GREEN);  // space
 
@@ -320,6 +329,22 @@ pub fn cmd_help() {
     // "  sector - read sector"
     print_str(32, 32, 115, 101, 99, 116, 111, 114);
     putchar(10);
+
+    // "  health - service status"
+    print_str(32, 32, 104, 101, 97, 108, 116, 104);  // "  health"
+    putchar(10);
+
+    // "  uptime - system uptime"
+    print_str(32, 32, 117, 112, 116, 105, 109, 101);  // "  uptime"
+    putchar(10);
+
+    // "  whoami - process info"
+    print_str(32, 32, 119, 104, 111, 97, 109, 105);  // "  whoami"
+    putchar(10);
+
+    // "  env    - system info"
+    print_str(32, 32, 101, 110, 118, 0, 0, 0);  // "  env"
+    putchar(10);
 }
 
 // Command: ps - show processes
@@ -398,6 +423,9 @@ pub fn cmd_files() {
     print_str(70, 105, 108, 101, 115, 58, 0, 0);  // "Files:"
     putchar(10);
 
+    // Clear any pending messages first
+    drain_pending_messages();
+
     // Get my PID for the response
     let my_pid = runtime::getpid();
 
@@ -407,14 +435,15 @@ pub fn cmd_files() {
 
     // Wait for file count response
     let count_resp = wait_vfs_response();
-    if count_resp == 0 {
+    if count_resp < 0 {
         print_str(69, 82, 82, 58, 32, 86, 70, 83);  // "ERR: VFS"
         putchar(10);
         return;
     }
 
-    let status = runtime::msg_byte(count_resp, 0);
-    let file_count = runtime::msg_byte(count_resp, 1);
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+    let status = count_resp % 256;
+    let file_count = (count_resp / 256) % 256;
 
     // Debug: show count
     runtime::print_char(35);  // #
@@ -425,10 +454,11 @@ pub fn cmd_files() {
     let mut done: i64 = 0;
     while done == 0 {
         let file_resp = wait_vfs_response();
-        if file_resp == 0 {
+        if file_resp < 0 {
             done = 1;
         } else {
-            let marker = runtime::msg_byte(file_resp, 0);
+            // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+            let marker = file_resp % 256;
 
             if marker == 254 {
                 // End marker received
@@ -438,12 +468,12 @@ pub fn cmd_files() {
             } else {
                 // File entry: [index, c0, c1, c2, c3, c4, c5]
                 let file_idx = marker;
-                let c0 = runtime::msg_byte(file_resp, 1);
-                let c1 = runtime::msg_byte(file_resp, 2);
-                let c2 = runtime::msg_byte(file_resp, 3);
-                let c3 = runtime::msg_byte(file_resp, 4);
-                let c4 = runtime::msg_byte(file_resp, 5);
-                let c5 = runtime::msg_byte(file_resp, 6);
+                let c0 = (file_resp / 256) % 256;
+                let c1 = (file_resp / 65536) % 256;
+                let c2 = (file_resp / 16777216) % 256;
+                let c3 = (file_resp / 0x100000000) % 256;
+                let c4 = (file_resp / 0x10000000000) % 256;
+                let c5 = (file_resp / 0x1000000000000) % 256;
 
                 // Print file index
                 putchar(48 + file_idx);
@@ -460,11 +490,11 @@ pub fn cmd_files() {
 
                 // Wait for size message
                 let size_resp = wait_vfs_response();
-                if size_resp != 0 {
-                    let size_marker = runtime::msg_byte(size_resp, 0);
+                if size_resp >= 0 {
+                    let size_marker = size_resp % 256;
                     if size_marker == 255 {
-                        let size_lo = runtime::msg_byte(size_resp, 1);
-                        let size_hi = runtime::msg_byte(size_resp, 2);
+                        let size_lo = (size_resp / 256) % 256;
+                        let size_hi = (size_resp / 65536) % 256;
                         let size = size_lo + (size_hi * 256);
 
                         putchar(32);
@@ -480,18 +510,44 @@ pub fn cmd_files() {
     }
 }
 
+// Drain any pending messages from queue (clear stale messages)
+fn drain_pending_messages() {
+    let mut msg = runtime::recv();
+    // recv() returns 0 for "no message" or -1, only positive values are real messages
+    while msg > 0 {
+        // Debug: show we're draining a message
+        runtime::print_char(68);  // D
+        runtime::print_char(58);  // :
+        runtime::print_num(msg);
+        runtime::print_char(32);
+        msg = runtime::recv();
+    }
+}
+
 // Wait for VFS response with timeout
+// Returns >=0 for valid message, -1 for timeout/no response
+// NOTE: recv() returns -1 for "no message", but 0 can be a valid response!
 fn wait_vfs_response() -> i64 {
-    let mut response: i64 = 0;
+    let mut response: i64 = 0 - 1;  // Start with -1 (no message)
     let mut attempts: i64 = 0;
-    while response == 0 && attempts < 5000 {
+    // Wait until we get a non-negative response (valid message)
+    // recv() returns -1 for "no message", >= 0 for valid message
+    while response < 0 && attempts < 10000 {
         response = runtime::recv();
-        if response == 0 {
+        if response < 0 {
             runtime::yield_cpu();
         }
         attempts = attempts + 1;
     }
-    response
+    if response < 0 {
+        // Debug: timeout
+        runtime::print_char(84);  // T
+        runtime::print_char(79);  // O
+        runtime::print_char(32);  // space
+        0 - 1  // Return -1 for timeout
+    } else {
+        response
+    }
 }
 
 // Command: cat <filename> - display file contents via VFS IPC
@@ -511,6 +567,9 @@ pub fn cmd_cat() {
         return;
     }
 
+    // Clear any pending messages first
+    drain_pending_messages();
+
     let my_pid = runtime::getpid();
 
     // Send VFS_OPEN request
@@ -519,14 +578,15 @@ pub fn cmd_cat() {
 
     // Wait for open response
     let open_resp = wait_vfs_response();
-    if open_resp == 0 {
+    if open_resp < 0 {
         print_str(69, 82, 82, 58, 32, 86, 70, 83);  // "ERR: VFS"
         putchar(10);
         return;
     }
 
-    let open_status = runtime::msg_byte(open_resp, 0);
-    let file_idx = runtime::msg_byte(open_resp, 1);
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+    let open_status = open_resp % 256;
+    let file_idx = (open_resp / 256) % 256;
 
     if open_status != 0 {
         print_str(70, 105, 108, 101, 32, 110, 111, 116);  // "File not"
@@ -541,14 +601,14 @@ pub fn cmd_cat() {
     runtime::send(runtime::VFS_PID, stat_req);
 
     let stat_resp = wait_vfs_response();
-    if stat_resp == 0 {
+    if stat_resp < 0 {
         return;
     }
 
-    let stat_status = runtime::msg_byte(stat_resp, 0);
-    let size_lo = runtime::msg_byte(stat_resp, 1);
-    let size_hi = runtime::msg_byte(stat_resp, 2);
-    let size_mid = runtime::msg_byte(stat_resp, 3);
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+    let size_lo = (stat_resp / 256) % 256;
+    let size_hi = (stat_resp / 65536) % 256;
+    let size_mid = (stat_resp / 16777216) % 256;
     let file_size = size_lo + (size_hi * 256) + (size_mid * 65536);
 
     // Read and display file contents
@@ -565,28 +625,47 @@ pub fn cmd_cat() {
 
         // Wait for read response
         let read_resp = wait_vfs_response();
-        if read_resp == 0 {
+        if read_resp < 0 {
             break;
         }
 
-        let bytes_read = runtime::msg_byte(read_resp, 0);
+        // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+        let bytes_read = read_resp % 256;
         if bytes_read == 0 {
             break;
         }
 
-        // Display bytes
-        let mut i: i64 = 0;
-        while i < bytes_read && bytes_displayed < max_display {
-            let byte = runtime::msg_byte(read_resp, i + 1);
-            // Only print printable ASCII characters
-            if byte >= 32 && byte < 127 {
-                putchar(byte);
-            } else if byte == 10 {
-                putchar(10);  // newline
-            } else if byte == 9 {
-                putchar(32);  // tab -> space
-            }
-            i = i + 1;
+        // Extract all 6 data bytes upfront (bytes 1-6 of the response)
+        let b0 = (read_resp / 256) % 256;
+        let b1 = (read_resp / 65536) % 256;
+        let b2 = (read_resp / 16777216) % 256;
+        let b3 = (read_resp / 0x100000000) % 256;
+        let b4 = (read_resp / 0x10000000000) % 256;
+        let b5 = (read_resp / 0x1000000000000) % 256;
+
+        // Display bytes using unrolled loop (can't use dynamic indexing with direct computation)
+        if bytes_read > 0 && bytes_displayed < max_display {
+            print_byte_if_printable(b0);
+            bytes_displayed = bytes_displayed + 1;
+        }
+        if bytes_read > 1 && bytes_displayed < max_display {
+            print_byte_if_printable(b1);
+            bytes_displayed = bytes_displayed + 1;
+        }
+        if bytes_read > 2 && bytes_displayed < max_display {
+            print_byte_if_printable(b2);
+            bytes_displayed = bytes_displayed + 1;
+        }
+        if bytes_read > 3 && bytes_displayed < max_display {
+            print_byte_if_printable(b3);
+            bytes_displayed = bytes_displayed + 1;
+        }
+        if bytes_read > 4 && bytes_displayed < max_display {
+            print_byte_if_printable(b4);
+            bytes_displayed = bytes_displayed + 1;
+        }
+        if bytes_read > 5 && bytes_displayed < max_display {
+            print_byte_if_printable(b5);
             bytes_displayed = bytes_displayed + 1;
         }
 
@@ -599,6 +678,17 @@ pub fn cmd_cat() {
     if file_size > max_display {
         print_str(91, 46, 46, 46, 93, 0, 0, 0);  // "[...]"
         putchar(10);
+    }
+}
+
+// Helper: print byte if it's printable ASCII, newline, or tab
+fn print_byte_if_printable(byte: i64) {
+    if byte >= 32 && byte < 127 {
+        putchar(byte);
+    } else if byte == 10 {
+        putchar(10);  // newline
+    } else if byte == 9 {
+        putchar(32);  // tab -> space
     }
 }
 
@@ -825,4 +915,223 @@ pub fn cmd_sector() {
         }
         i = i + 1;
     }
+}
+
+// Command: health - show system service health status
+pub fn cmd_health() {
+    // Print header: "Service Status:"
+    print_str(83, 101, 114, 118, 105, 99, 101, 32);  // "Service "
+    print_str(83, 116, 97, 116, 117, 115, 58, 0);    // "Status:"
+    putchar(10);
+
+    // Service PIDs
+    let init_pid: i64 = 1;
+    let vfs_pid: i64 = 2;
+    let console_pid: i64 = 3;
+    let shell_pid: i64 = 4;
+
+    // Check Init (PID 1)
+    print_str(73, 110, 105, 116, 40, 49, 41, 58);   // "Init(1):"
+    putchar(32);
+    let init_state = runtime::proc_state(init_pid);
+    print_service_status(init_state, init_pid);
+    putchar(10);
+
+    // Check VFS (PID 2)
+    print_str(86, 70, 83, 40, 50, 41, 58, 32);      // "VFS(2): "
+    let vfs_state = runtime::proc_state(vfs_pid);
+    print_service_status(vfs_state, vfs_pid);
+    putchar(10);
+
+    // Check Console (PID 3)
+    print_str(67, 111, 110, 115, 111, 108, 101, 40); // "Console("
+    putchar(51);  // 3
+    putchar(41);  // )
+    putchar(58);  // :
+    putchar(32);  // space
+    let console_state = runtime::proc_state(console_pid);
+    print_service_status(console_state, console_pid);
+    putchar(10);
+
+    // Check Shell (PID 4)
+    print_str(83, 104, 101, 108, 108, 40, 52, 41);  // "Shell(4)"
+    putchar(58);  // :
+    putchar(32);  // space
+    let shell_state = runtime::proc_state(shell_pid);
+    print_service_status(shell_state, shell_pid);
+    putchar(10);
+
+    // Optional: Ping VFS to verify it responds
+    putchar(10);
+    print_str(86, 70, 83, 32, 80, 105, 110, 103);   // "VFS Ping"
+    putchar(58);  // :
+    putchar(32);  // space
+
+    // Try to ping VFS with a simple STAT request for file 0
+    drain_pending_messages();
+    let my_pid = runtime::getpid();
+    let ping_req = runtime::pack_vfs_request(runtime::VFS_STAT, my_pid, 0, 0, 0, 0, 0, 0);
+    runtime::send(runtime::VFS_PID, ping_req);
+
+    // Wait for response (shorter timeout for ping)
+    let mut response: i64 = 0 - 1;
+    let mut attempts: i64 = 0;
+    while response < 0 && attempts < 5000 {
+        response = runtime::recv();
+        if response < 0 {
+            runtime::yield_cpu();
+        }
+        attempts = attempts + 1;
+    }
+
+    if response >= 0 {
+        print_str(79, 75, 0, 0, 0, 0, 0, 0);        // "OK"
+    } else {
+        print_str(78, 79, 32, 82, 69, 83, 80, 0);   // "NO RESP"
+    }
+    putchar(10);
+}
+
+// Helper: print service status based on state
+fn print_service_status(state: i64, pid: i64) {
+    let my_pid = runtime::getpid();
+
+    // If this is our own process (shell), show RUNNING
+    if pid == my_pid {
+        print_str(82, 85, 78, 78, 73, 78, 71, 0);   // "RUNNING"
+    } else if state == PROC_STATE_READY {
+        print_str(79, 75, 0, 0, 0, 0, 0, 0);        // "OK"
+    } else if state == PROC_STATE_RUNNING {
+        print_str(79, 75, 0, 0, 0, 0, 0, 0);        // "OK"
+    } else if state == PROC_STATE_WAITING {
+        print_str(79, 75, 0, 0, 0, 0, 0, 0);        // "OK" (waiting is normal for servers)
+    } else if state == PROC_STATE_ZOMBIE {
+        print_str(90, 79, 77, 66, 73, 69, 0, 0);    // "ZOMBIE"
+    } else if state == PROC_STATE_STOPPED {
+        print_str(83, 84, 79, 80, 80, 69, 68, 0);   // "STOPPED"
+    } else if state == PROC_STATE_UNUSED {
+        print_str(68, 79, 87, 78, 0, 0, 0, 0);      // "DOWN"
+    } else {
+        print_str(85, 78, 75, 78, 79, 87, 78, 0);   // "UNKNOWN"
+    }
+}
+
+// Command: uptime - show system uptime in ticks
+pub fn cmd_uptime() {
+    let ticks = runtime::time();
+
+    // Print "Uptime: "
+    print_str(85, 112, 116, 105, 109, 101, 58, 32);  // "Uptime: "
+    print_dec(ticks);
+    // Print " ticks"
+    print_str(32, 116, 105, 99, 107, 115, 0, 0);  // " ticks"
+    putchar(10);
+
+    // Also show approximate seconds (assuming ~100 ticks/second typical timer rate)
+    // Note: actual tick rate depends on kernel timer configuration
+    let seconds = ticks / 100;
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+
+    // Print "(~"
+    putchar(40);  // (
+    putchar(126); // ~
+
+    // Format: HH:MM:SS or just seconds if small
+    if hours > 0 {
+        print_dec(hours);
+        putchar(104);  // h
+        putchar(32);   // space
+        let rem_min = minutes - (hours * 60);
+        print_dec(rem_min);
+        putchar(109);  // m
+    } else if minutes > 0 {
+        print_dec(minutes);
+        putchar(109);  // m
+        putchar(32);   // space
+        let rem_sec = seconds - (minutes * 60);
+        print_dec(rem_sec);
+        putchar(115);  // s
+    } else {
+        print_dec(seconds);
+        putchar(115);  // s
+    }
+
+    putchar(41);  // )
+    putchar(10);
+}
+
+// Command: whoami - show current process information
+pub fn cmd_whoami() {
+    let pid = runtime::getpid();
+    let ppid = runtime::getppid();
+
+    // Print "PID: "
+    print_str(80, 73, 68, 58, 32, 0, 0, 0);  // "PID: "
+    print_dec(pid);
+    putchar(10);
+
+    // Print "PPID: "
+    print_str(80, 80, 73, 68, 58, 32, 0, 0);  // "PPID: "
+    print_dec(ppid);
+    putchar(10);
+
+    // Print "Name: shell"
+    print_str(78, 97, 109, 101, 58, 32, 0, 0);  // "Name: "
+    print_str(115, 104, 101, 108, 108, 0, 0, 0);  // "shell"
+    putchar(10);
+
+    // Print state
+    let state = runtime::proc_state(pid);
+    print_str(83, 116, 97, 116, 101, 58, 32, 0);  // "State: "
+    if state == PROC_STATE_READY {
+        print_str(82, 69, 65, 68, 89, 0, 0, 0);    // READY
+    } else if state == PROC_STATE_RUNNING {
+        print_str(82, 85, 78, 78, 73, 78, 71, 0);  // RUNNING
+    } else if state == PROC_STATE_WAITING {
+        print_str(87, 65, 73, 84, 73, 78, 71, 0);  // WAITING
+    } else {
+        print_dec(state);
+    }
+    putchar(10);
+}
+
+// Command: env - show system environment info
+pub fn cmd_env() {
+    // Get disk info
+    let disk_present = runtime::disk_info(0);
+    let disk_sectors = runtime::disk_info(1);
+
+    // Get process count
+    let proc_count = runtime::proc_count();
+
+    // Get uptime
+    let ticks = runtime::time();
+
+    // Print "Procs: "
+    print_str(80, 114, 111, 99, 115, 58, 32, 0);  // "Procs: "
+    print_dec(proc_count);
+    putchar(10);
+
+    // Print "Uptime: "
+    print_str(85, 112, 116, 105, 109, 101, 58, 32);  // "Uptime: "
+    print_dec(ticks);
+    putchar(10);
+
+    // Print "Disk: "
+    print_str(68, 105, 115, 107, 58, 32, 0, 0);  // "Disk: "
+    if disk_present == 0 {
+        print_str(110, 111, 110, 101, 0, 0, 0, 0);  // "none"
+    } else {
+        let mb = disk_sectors / 2048;
+        print_dec(mb);
+        print_str(77, 66, 0, 0, 0, 0, 0, 0);  // "MB"
+    }
+    putchar(10);
+
+    // Print "Files: "
+    print_str(70, 105, 108, 101, 115, 58, 32, 0);  // "Files: "
+    let file_count = runtime::ramfs_file_count();
+    print_dec(file_count);
+    putchar(10);
 }

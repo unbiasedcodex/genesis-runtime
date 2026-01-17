@@ -53,7 +53,8 @@ fn vfs_main_loop() {
             let sender_pid = runtime::get_last_sender();
 
             // Extract command type from byte 0
-            let cmd_type = runtime::msg_byte(msg, 0);
+            // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+            let cmd_type = msg % 256;
 
             // Debug: print received command
             runtime::print_char(86);   // V
@@ -92,6 +93,12 @@ fn vfs_main_loop() {
 // Sends multiple responses, one per file, ending with count=0
 fn vfs_handle_list(sender_pid: i64) {
     let file_count = runtime::ramfs_file_count();
+
+    // Debug: print file count
+    runtime::print_char(67);  // C
+    runtime::print_char(61);  // =
+    runtime::print_char(48 + file_count);
+    runtime::print_char(32);  // space
 
     // Send file count first
     // Response: [status, count, 0, 0, 0, 0, 0]
@@ -139,16 +146,31 @@ fn vfs_handle_list(sender_pid: i64) {
 // Request format: [cmd=1, sender_pid, filename bytes...]
 // Response: [status, file_idx, 0, 0, 0, 0, 0]
 fn vfs_handle_open(sender_pid: i64, msg: i64) {
+    // Debug: entering handler
+    runtime::print_char(79);  // O
+    runtime::print_char(58);  // :
+
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
     // Extract filename from message (bytes 2-7)
-    let c0 = runtime::msg_byte(msg, 2);
-    let c1 = runtime::msg_byte(msg, 3);
-    let c2 = runtime::msg_byte(msg, 4);
-    let c3 = runtime::msg_byte(msg, 5);
-    let c4 = runtime::msg_byte(msg, 6);
-    let c5 = runtime::msg_byte(msg, 7);
+    let c0 = (msg / 65536) % 256;
+    let c1 = (msg / 16777216) % 256;
+    let c2 = (msg / 0x100000000) % 256;
+    let c3 = (msg / 0x10000000000) % 256;
+    let c4 = (msg / 0x1000000000000) % 256;
+    let c5 = (msg / 0x100000000000000) % 256;
+
+    // Debug: print first char
+    runtime::print_char(c0);
+    runtime::print_char(32);  // space
 
     // Search for file by name
     let file_count = runtime::ramfs_file_count();
+
+    // Debug: show file count
+    runtime::print_char(70);  // F
+    runtime::print_char(48 + file_count);  // digit
+    runtime::print_char(32);
+
     let mut i: i64 = 0;
     let mut found: i64 = 0 - 1;
 
@@ -164,17 +186,33 @@ fn vfs_handle_open(sender_pid: i64, msg: i64) {
         i = i + 1;
     }
 
+    // Debug: show result
+    runtime::print_char(82);  // R
+    runtime::print_char(48 + found + 1);  // digit (0 if not found, 1+ if found)
+    runtime::print_char(32);
+
     if found >= 0 {
         let response = runtime::pack_response(VFS_OK, found, 0, 0, 0, 0, 0);
+        // Debug: sending response
+        runtime::print_char(83);  // S
+        runtime::print_char(62);  // >
+        runtime::print_char(48 + sender_pid);  // PID digit
+        runtime::print_char(32);
         runtime::send(sender_pid, response);
+        // Debug: send done
+        runtime::print_char(68);  // D
+        runtime::print_char(32);  // space
     } else {
         let response = runtime::pack_response(VFS_ERR_NOTFOUND, 0, 0, 0, 0, 0, 0);
+        runtime::print_char(78);  // N (not found)
+        runtime::print_char(32);
         runtime::send(sender_pid, response);
     }
 }
 
 // Check if file at index matches given name characters
 // Returns 1 if match, 0 if no match
+// NOTE: Using result variable instead of early returns due to compiler bug
 fn check_filename_match(file_idx: i64, c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64) -> i64 {
     let f0 = runtime::ramfs_read_name(file_idx, 0);
     let f1 = runtime::ramfs_read_name(file_idx, 1);
@@ -183,29 +221,45 @@ fn check_filename_match(file_idx: i64, c0: i64, c1: i64, c2: i64, c3: i64, c4: i
     let f4 = runtime::ramfs_read_name(file_idx, 4);
     let f5 = runtime::ramfs_read_name(file_idx, 5);
 
-    // Match character by character, stopping at null
-    if c0 != f0 { return 0; }
-    if c0 == 0 { return 1; }
-    if c1 != f1 { return 0; }
-    if c1 == 0 { return 1; }
-    if c2 != f2 { return 0; }
-    if c2 == 0 { return 1; }
-    if c3 != f3 { return 0; }
-    if c3 == 0 { return 1; }
-    if c4 != f4 { return 0; }
-    if c4 == 0 { return 1; }
-    if c5 != f5 { return 0; }
-    1
+    // Match character by character using nested ifs to avoid early return bug
+    let mut result: i64 = 0;
+
+    if c0 == f0 {
+        if c0 == 0 {
+            result = 1;
+        } else if c1 == f1 {
+            if c1 == 0 {
+                result = 1;
+            } else if c2 == f2 {
+                if c2 == 0 {
+                    result = 1;
+                } else if c3 == f3 {
+                    if c3 == 0 {
+                        result = 1;
+                    } else if c4 == f4 {
+                        if c4 == 0 {
+                            result = 1;
+                        } else if c5 == f5 {
+                            result = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 // VFS Handler: read file
 // Request format: [cmd=2, sender_pid, file_idx, offset_lo, offset_hi, len, 0, 0]
 // Response: [status, data0, data1, data2, data3, data4, data5]
 fn vfs_handle_read(sender_pid: i64, msg: i64) {
-    let file_idx = runtime::msg_byte(msg, 2);
-    let offset_lo = runtime::msg_byte(msg, 3);
-    let offset_hi = runtime::msg_byte(msg, 4);
-    let read_len = runtime::msg_byte(msg, 5);
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+    let file_idx = (msg / 65536) % 256;
+    let offset_lo = (msg / 16777216) % 256;
+    let offset_hi = (msg / 0x100000000) % 256;
+    let read_len = (msg / 0x10000000000) % 256;
 
     let offset = offset_lo + (offset_hi * 256);
 
@@ -258,7 +312,8 @@ fn vfs_handle_read(sender_pid: i64, msg: i64) {
 // Request format: [cmd=5, sender_pid, file_idx, 0, 0, 0, 0, 0]
 // Response: [status, size_lo, size_hi, size_mid, 0, 0, 0]
 fn vfs_handle_stat(sender_pid: i64, msg: i64) {
-    let file_idx = runtime::msg_byte(msg, 2);
+    // NOTE: Using direct computation due to possible compiler bug with msg_byte()
+    let file_idx = (msg / 65536) % 256;
 
     // Validate file index
     let file_count = runtime::ramfs_file_count();
