@@ -186,6 +186,26 @@ fn shell_execute() {
         else if commands::cmd_match(101, 110, 118, 0, 0, 0, 0, 0) {
             commands::cmd_env();
         }
+        // "net " = 110, 101, 116, 32 (net with subcommands)
+        else if commands::line_get(0) == 110 && commands::line_get(1) == 101 &&
+                commands::line_get(2) == 116 && commands::line_get(3) == 32 {
+            commands::cmd_net();
+        }
+        // "ping " = 112, 105, 110, 103, 32
+        else if commands::line_get(0) == 112 && commands::line_get(1) == 105 &&
+                commands::line_get(2) == 110 && commands::line_get(3) == 103 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_ping();
+        }
+        // "arp" = 97, 114, 112
+        else if commands::cmd_match(97, 114, 112, 0, 0, 0, 0, 0) {
+            commands::cmd_arp();
+        }
+        // "nc " = 110, 99, 32 (netcat)
+        else if commands::line_get(0) == 110 && commands::line_get(1) == 99 &&
+                commands::line_get(2) == 32 {
+            commands::cmd_nc();
+        }
         else {
             // Unknown command
             commands::print_str(63, 32, 0, 0, 0, 0, 0, 0);  // "? "

@@ -1,0 +1,636 @@
+// Genesis Runtime - DNS Resolver
+// Domain Name System client (RFC 1035)
+
+// ============================================================
+// DNS Constants
+// ============================================================
+
+// DNS Server Port
+const DNS_PORT: i64 = 53;
+
+// DNS Header Flags
+const DNS_QR_QUERY: i64 = 0x0000;     // Query
+const DNS_QR_RESPONSE: i64 = 0x8000;  // Response
+const DNS_OPCODE_QUERY: i64 = 0x0000; // Standard query
+const DNS_AA: i64 = 0x0400;           // Authoritative Answer
+const DNS_TC: i64 = 0x0200;           // Truncated
+const DNS_RD: i64 = 0x0100;           // Recursion Desired
+const DNS_RA: i64 = 0x0080;           // Recursion Available
+const DNS_RCODE_OK: i64 = 0x0000;     // No error
+const DNS_RCODE_FORMAT: i64 = 0x0001; // Format error
+const DNS_RCODE_SERVER: i64 = 0x0002; // Server failure
+const DNS_RCODE_NAME: i64 = 0x0003;   // Name error (NXDOMAIN)
+
+// DNS Record Types
+const DNS_TYPE_A: i64 = 1;            // IPv4 address
+const DNS_TYPE_NS: i64 = 2;           // Name server
+const DNS_TYPE_CNAME: i64 = 5;        // Canonical name
+const DNS_TYPE_SOA: i64 = 6;          // Start of authority
+const DNS_TYPE_PTR: i64 = 12;         // Pointer (reverse DNS)
+const DNS_TYPE_MX: i64 = 15;          // Mail exchange
+const DNS_TYPE_TXT: i64 = 16;         // Text record
+const DNS_TYPE_AAAA: i64 = 28;        // IPv6 address
+
+// DNS Class
+const DNS_CLASS_IN: i64 = 1;          // Internet
+
+// DNS Header Size
+const DNS_HEADER_SIZE: i64 = 12;
+
+// DNS Header Offsets
+const DNS_ID: i64 = 0;                // Transaction ID (2 bytes)
+const DNS_FLAGS: i64 = 2;             // Flags (2 bytes)
+const DNS_QDCOUNT: i64 = 4;           // Question count (2 bytes)
+const DNS_ANCOUNT: i64 = 6;           // Answer count (2 bytes)
+const DNS_NSCOUNT: i64 = 8;           // Authority count (2 bytes)
+const DNS_ARCOUNT: i64 = 10;          // Additional count (2 bytes)
+const DNS_QUESTIONS: i64 = 12;        // Questions start here
+
+// DNS Cache
+const DNS_CACHE_ADDR: i64 = 0xB3E000; // DNS cache base
+const DNS_CACHE_SIZE: i64 = 32;       // Max cache entries
+const DNS_CACHE_ENTRY_SIZE: i64 = 64; // Per entry size
+
+// Cache entry offsets
+const DNS_CACHE_NAME: i64 = 0;        // Domain name (48 bytes)
+const DNS_CACHE_IP: i64 = 48;         // IP address (4 bytes)
+const DNS_CACHE_TTL: i64 = 52;        // TTL in ticks (4 bytes)
+const DNS_CACHE_TIME: i64 = 56;       // Cache time (8 bytes)
+
+// DNS Query/Response Buffer
+const DNS_TX_BUF: i64 = 0xB3E800;     // TX buffer (512 bytes)
+const DNS_RX_BUF: i64 = 0xB3EA00;     // RX buffer (512 bytes)
+const DNS_MAX_PACKET: i64 = 512;
+
+// DNS State
+const DNS_STATE_ADDR: i64 = 0xB3EC00;
+const DNS_STATE_ID: i64 = 0;          // Current query ID (2 bytes)
+const DNS_STATE_PENDING: i64 = 2;     // Pending query (1 byte)
+const DNS_STATE_TARGET_IP: i64 = 4;   // Result IP (4 bytes)
+
+// ============================================================
+// DNS Cache Functions
+// ============================================================
+
+// Initialize DNS cache
+pub fn dns_cache_init() {
+    dns_memset(DNS_CACHE_ADDR, 0, DNS_CACHE_SIZE * DNS_CACHE_ENTRY_SIZE);
+}
+
+// Lookup hostname in cache
+// Returns: IP address, or 0 if not found
+pub fn dns_cache_lookup(hostname: i64) -> i64 {
+    let current_time = dns_get_ticks();
+
+    let mut i: i64 = 0;
+    while i < DNS_CACHE_SIZE {
+        let entry = DNS_CACHE_ADDR + (i * DNS_CACHE_ENTRY_SIZE);
+
+        // Check if entry is valid (has IP)
+        let ip = dns_read_u32(entry + DNS_CACHE_IP) as i64;
+        if ip != 0 {
+            // Check if name matches
+            if dns_hostname_match(entry + DNS_CACHE_NAME, hostname) == 1 {
+                // Check TTL
+                let cache_time = dns_read_u64(entry + DNS_CACHE_TIME) as i64;
+                let ttl = dns_read_u32(entry + DNS_CACHE_TTL) as i64;
+                let ttl_ticks = ttl * 100;  // Convert seconds to ticks
+
+                if current_time - cache_time < ttl_ticks {
+                    return ip;
+                } else {
+                    // Expired, clear entry
+                    dns_write_u32(entry + DNS_CACHE_IP, 0);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    0
+}
+
+// Add entry to cache
+pub fn dns_cache_insert(hostname: i64, ip: i64, ttl: i64) {
+    // Find free entry or oldest entry
+    let mut free_entry: i64 = 0;
+    let mut oldest_time: i64 = dns_get_ticks();
+    let mut oldest_entry: i64 = 0;
+
+    let mut i: i64 = 0;
+    while i < DNS_CACHE_SIZE {
+        let entry = DNS_CACHE_ADDR + (i * DNS_CACHE_ENTRY_SIZE);
+        let entry_ip = dns_read_u32(entry + DNS_CACHE_IP) as i64;
+
+        if entry_ip == 0 {
+            free_entry = entry;
+            break;
+        }
+
+        let cache_time = dns_read_u64(entry + DNS_CACHE_TIME) as i64;
+        if cache_time < oldest_time {
+            oldest_time = cache_time;
+            oldest_entry = entry;
+        }
+
+        i = i + 1;
+    }
+
+    let target_entry = if free_entry != 0 { free_entry } else { oldest_entry };
+    if target_entry == 0 {
+        target_entry = DNS_CACHE_ADDR;  // Use first entry
+    }
+
+    // Copy hostname
+    dns_hostname_copy(target_entry + DNS_CACHE_NAME, hostname, 48);
+
+    // Set IP and TTL
+    dns_write_u32(target_entry + DNS_CACHE_IP, ip as u64);
+    dns_write_u32(target_entry + DNS_CACHE_TTL, ttl as u64);
+    dns_write_u64(target_entry + DNS_CACHE_TIME, dns_get_ticks() as u64);
+}
+
+// Compare hostnames
+fn dns_hostname_match(cached: i64, query: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 48 {
+        let c1 = dns_read_byte(cached + i);
+        let c2 = dns_read_byte(query + i);
+
+        // Convert to lowercase for comparison
+        let l1 = if c1 >= 65 && c1 <= 90 { c1 + 32 } else { c1 };
+        let l2 = if c2 >= 65 && c2 <= 90 { c2 + 32 } else { c2 };
+
+        if l1 != l2 {
+            return 0;
+        }
+
+        if l1 == 0 {
+            return 1;  // Both ended
+        }
+
+        i = i + 1;
+    }
+    1
+}
+
+// Copy hostname
+fn dns_hostname_copy(dst: i64, src: i64, max_len: i64) {
+    let mut i: i64 = 0;
+    while i < max_len - 1 {
+        let ch = dns_read_byte(src + i);
+        dns_write_byte(dst + i, ch);
+        if ch == 0 {
+            break;
+        }
+        i = i + 1;
+    }
+    dns_write_byte(dst + max_len - 1, 0);  // Ensure null termination
+}
+
+// ============================================================
+// DNS Query Building
+// ============================================================
+
+// Generate query ID
+fn dns_gen_id() -> i64 {
+    let ticks = dns_get_ticks();
+    (ticks * 1103515245 + 12345) % 65536
+}
+
+// Encode hostname to DNS format (labels)
+// Returns: encoded length
+fn dns_encode_hostname(dst: i64, hostname: i64) -> i64 {
+    let mut src_pos: i64 = 0;
+    let mut dst_pos: i64 = 0;
+    let mut label_start = dst_pos;
+    dst_pos = dst_pos + 1;  // Skip length byte
+
+    loop {
+        let ch = dns_read_byte(hostname + src_pos);
+
+        if ch == 46 || ch == 0 {  // '.' or end
+            // Write label length
+            let label_len = dst_pos - label_start - 1;
+            dns_write_byte(dst + label_start, label_len);
+
+            if ch == 0 {
+                // End of hostname
+                dns_write_byte(dst + dst_pos, 0);  // Root label
+                dst_pos = dst_pos + 1;
+                break;
+            }
+
+            // Start new label
+            label_start = dst_pos;
+            dst_pos = dst_pos + 1;
+        } else {
+            dns_write_byte(dst + dst_pos, ch);
+            dst_pos = dst_pos + 1;
+        }
+
+        src_pos = src_pos + 1;
+    }
+
+    dst_pos
+}
+
+// Build DNS query packet
+// Returns: packet length
+fn dns_build_query(hostname: i64) -> i64 {
+    let pkt = DNS_TX_BUF;
+
+    // Generate and save ID
+    let id = dns_gen_id();
+    dns_write_u16(DNS_STATE_ADDR + DNS_STATE_ID, id as u64);
+
+    // Header
+    dns_write_u16_be(pkt + DNS_ID, id);
+    dns_write_u16_be(pkt + DNS_FLAGS, DNS_RD);  // Recursion desired
+    dns_write_u16_be(pkt + DNS_QDCOUNT, 1);     // One question
+    dns_write_u16_be(pkt + DNS_ANCOUNT, 0);
+    dns_write_u16_be(pkt + DNS_NSCOUNT, 0);
+    dns_write_u16_be(pkt + DNS_ARCOUNT, 0);
+
+    // Question
+    let mut offset = DNS_QUESTIONS;
+
+    // Encode hostname
+    let name_len = dns_encode_hostname(pkt + offset, hostname);
+    offset = offset + name_len;
+
+    // Type (A record)
+    dns_write_u16_be(pkt + offset, DNS_TYPE_A);
+    offset = offset + 2;
+
+    // Class (IN)
+    dns_write_u16_be(pkt + offset, DNS_CLASS_IN);
+    offset = offset + 2;
+
+    offset
+}
+
+// ============================================================
+// DNS Response Parsing
+// ============================================================
+
+// Parse DNS name (handling compression)
+// Returns: next offset in packet
+fn dns_parse_name(pkt: i64, offset: i64, name_out: i64, max_len: i64) -> i64 {
+    let mut pos = offset;
+    let mut out_pos: i64 = 0;
+    let mut first_jump: i64 = 0;
+
+    loop {
+        let len = dns_read_byte(pkt + pos);
+
+        if len == 0 {
+            pos = pos + 1;
+            break;
+        }
+
+        // Check for compression pointer
+        if (len / 64) % 4 == 3 {  // Top 2 bits are 11
+            let ptr = ((len % 64) * 256) + dns_read_byte(pkt + pos + 1);
+            if first_jump == 0 {
+                first_jump = pos + 2;
+            }
+            pos = ptr;
+            continue;
+        }
+
+        // Regular label
+        if out_pos > 0 && out_pos < max_len - 1 {
+            dns_write_byte(name_out + out_pos, 46);  // '.'
+            out_pos = out_pos + 1;
+        }
+
+        pos = pos + 1;
+        let mut i: i64 = 0;
+        while i < len && out_pos < max_len - 1 {
+            dns_write_byte(name_out + out_pos, dns_read_byte(pkt + pos + i));
+            out_pos = out_pos + 1;
+            i = i + 1;
+        }
+        pos = pos + len;
+    }
+
+    dns_write_byte(name_out + out_pos, 0);
+
+    if first_jump != 0 {
+        first_jump
+    } else {
+        pos
+    }
+}
+
+// Parse DNS response
+// Returns: IP address, or 0 on error
+fn dns_parse_response(pkt: i64, length: i64) -> i64 {
+    if length < DNS_HEADER_SIZE {
+        return 0;
+    }
+
+    // Check ID
+    let id = dns_read_u16_be(pkt + DNS_ID);
+    let expected_id = dns_read_u16(DNS_STATE_ADDR + DNS_STATE_ID);
+    if id != expected_id {
+        return 0;
+    }
+
+    // Check flags
+    let flags = dns_read_u16_be(pkt + DNS_FLAGS);
+    if (flags / 0x8000) == 0 {
+        return 0;  // Not a response
+    }
+
+    let rcode = flags % 16;
+    if rcode != 0 {
+        return 0;  // Error response
+    }
+
+    let ancount = dns_read_u16_be(pkt + DNS_ANCOUNT);
+    if ancount == 0 {
+        return 0;  // No answers
+    }
+
+    // Skip question section
+    let qdcount = dns_read_u16_be(pkt + DNS_QDCOUNT);
+    let mut offset = DNS_QUESTIONS;
+
+    let mut i: i64 = 0;
+    let name_buf = DNS_RX_BUF + 400;  // Temp buffer for name
+    while i < qdcount as i64 {
+        offset = dns_parse_name(pkt, offset, name_buf, 64);
+        offset = offset + 4;  // Skip QTYPE and QCLASS
+        i = i + 1;
+    }
+
+    // Parse answers
+    i = 0;
+    while i < ancount as i64 {
+        offset = dns_parse_name(pkt, offset, name_buf, 64);
+
+        let atype = dns_read_u16_be(pkt + offset);
+        offset = offset + 2;
+
+        let aclass = dns_read_u16_be(pkt + offset);
+        offset = offset + 2;
+
+        let ttl = dns_read_u32_be(pkt + offset);
+        offset = offset + 4;
+
+        let rdlength = dns_read_u16_be(pkt + offset);
+        offset = offset + 2;
+
+        if atype == DNS_TYPE_A as u64 && aclass == DNS_CLASS_IN as u64 && rdlength == 4 {
+            // A record found
+            let ip = dns_read_ip(pkt + offset);
+            return ip;
+        }
+
+        offset = offset + rdlength as i64;
+        i = i + 1;
+    }
+
+    0
+}
+
+// ============================================================
+// DNS Resolver API
+// ============================================================
+
+// Resolve hostname to IP (blocking)
+// Returns: IP address, or 0 on failure
+pub fn dns_resolve(hostname: i64) -> i64 {
+    // Check cache first
+    let cached = dns_cache_lookup(hostname);
+    if cached != 0 {
+        return cached;
+    }
+
+    // Get DNS server
+    let dns_server = dns_get_dns_server();
+    if dns_server == 0 {
+        return 0;  // No DNS server configured
+    }
+
+    // Build query
+    let query_len = dns_build_query(hostname);
+
+    // Send via UDP to DNS server
+    dns_write_byte(DNS_STATE_ADDR + DNS_STATE_PENDING, 1);
+    dns_send_udp(dns_server, DNS_PORT, DNS_TX_BUF, query_len);
+
+    // Wait for response (with timeout)
+    let start_time = dns_get_ticks();
+    let timeout = 500;  // 5 seconds at 100Hz
+
+    while dns_get_ticks() - start_time < timeout {
+        // Check for response
+        let len = dns_recv_udp(DNS_RX_BUF, DNS_MAX_PACKET);
+        if len > 0 {
+            let ip = dns_parse_response(DNS_RX_BUF, len);
+            if ip != 0 {
+                // Cache the result
+                dns_cache_insert(hostname, ip, 300);  // 5 minute TTL
+                dns_write_byte(DNS_STATE_ADDR + DNS_STATE_PENDING, 0);
+                return ip;
+            }
+        }
+    }
+
+    dns_write_byte(DNS_STATE_ADDR + DNS_STATE_PENDING, 0);
+    0  // Timeout
+}
+
+// Async resolve - start query
+pub fn dns_resolve_start(hostname: i64) -> i64 {
+    // Check cache
+    let cached = dns_cache_lookup(hostname);
+    if cached != 0 {
+        dns_write_u32(DNS_STATE_ADDR + DNS_STATE_TARGET_IP, cached as u64);
+        return 1;  // Already resolved
+    }
+
+    let dns_server = dns_get_dns_server();
+    if dns_server == 0 {
+        return -1;
+    }
+
+    let query_len = dns_build_query(hostname);
+    dns_write_byte(DNS_STATE_ADDR + DNS_STATE_PENDING, 1);
+    dns_write_u32(DNS_STATE_ADDR + DNS_STATE_TARGET_IP, 0);
+    dns_send_udp(dns_server, DNS_PORT, DNS_TX_BUF, query_len);
+
+    0  // Query sent
+}
+
+// Async resolve - check result
+// Returns: IP if resolved, 0 if pending, -1 on error
+pub fn dns_resolve_check() -> i64 {
+    let pending = dns_read_byte(DNS_STATE_ADDR + DNS_STATE_PENDING);
+    if pending == 0 {
+        return dns_read_u32(DNS_STATE_ADDR + DNS_STATE_TARGET_IP) as i64;
+    }
+
+    // Check for response
+    let len = dns_recv_udp(DNS_RX_BUF, DNS_MAX_PACKET);
+    if len > 0 {
+        let ip = dns_parse_response(DNS_RX_BUF, len);
+        if ip != 0 {
+            dns_write_u32(DNS_STATE_ADDR + DNS_STATE_TARGET_IP, ip as u64);
+            dns_write_byte(DNS_STATE_ADDR + DNS_STATE_PENDING, 0);
+            return ip;
+        }
+    }
+
+    0  // Still pending
+}
+
+// ============================================================
+// IP Address Reading
+// ============================================================
+
+fn dns_read_ip(addr: i64) -> i64 {
+    let b0 = dns_read_byte(addr);
+    let b1 = dns_read_byte(addr + 1);
+    let b2 = dns_read_byte(addr + 2);
+    let b3 = dns_read_byte(addr + 3);
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn dns_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dns_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dns_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dns_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dns_read_u16_be(addr: i64) -> u64 {
+    let hi = dns_read_byte(addr) as u64;
+    let lo = dns_read_byte(addr + 1) as u64;
+    (hi * 256) + lo
+}
+
+fn dns_write_u16_be(addr: i64, value: i64) {
+    dns_write_byte(addr, value / 256);
+    dns_write_byte(addr + 1, value % 256);
+}
+
+fn dns_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dns_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dns_read_u32_be(addr: i64) -> u64 {
+    let b0 = dns_read_byte(addr) as u64;
+    let b1 = dns_read_byte(addr + 1) as u64;
+    let b2 = dns_read_byte(addr + 2) as u64;
+    let b3 = dns_read_byte(addr + 3) as u64;
+    (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+}
+
+fn dns_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn dns_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn dns_memset(dst: i64, value: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        dns_write_byte(dst + i, value);
+        i = i + 1;
+    }
+}
+
+fn dns_get_ticks() -> i64 {
+    dns_read_u64(0x412000) as i64
+}
+
+// External functions (via syscalls)
+fn dns_get_dns_server() -> i64 { 0 }
+fn dns_send_udp(dst: i64, port: i64, data: i64, len: i64) -> i64 { 0 }
+fn dns_recv_udp(buf: i64, max_len: i64) -> i64 { 0 }

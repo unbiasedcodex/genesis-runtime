@@ -511,3 +511,139 @@ pub fn vfs_request(request: i64) -> i64 {
     }
     response
 }
+
+// ============================================================================
+// Network Syscalls
+// ============================================================================
+
+pub const SYS_NET_SOCKET: i64 = 50;
+pub const SYS_NET_BIND: i64 = 51;
+pub const SYS_NET_LISTEN: i64 = 52;
+pub const SYS_NET_ACCEPT: i64 = 53;
+pub const SYS_NET_CONNECT: i64 = 54;
+pub const SYS_NET_SEND: i64 = 55;
+pub const SYS_NET_RECV: i64 = 56;
+pub const SYS_NET_CLOSE: i64 = 57;
+pub const SYS_NET_CONFIG: i64 = 58;
+pub const SYS_NET_STATUS: i64 = 59;
+pub const SYS_NET_RESOLVE: i64 = 60;
+pub const SYS_NET_PING: i64 = 61;
+pub const SYS_NET_ARP: i64 = 62;
+pub const SYS_NET_DHCP: i64 = 63;
+pub const SYS_NET_GETIP: i64 = 64;
+pub const SYS_NET_GETMAC: i64 = 65;
+pub const SYS_NET_POLL: i64 = 66;
+
+// Network status info types
+pub const NET_STATUS_LINK: i64 = 0;       // Link up/down
+pub const NET_STATUS_RX_COUNT: i64 = 1;   // RX packet count
+pub const NET_STATUS_TX_COUNT: i64 = 2;   // TX packet count
+pub const NET_STATUS_INIT: i64 = 3;       // Stack initialized
+
+// Socket types
+pub const SOCK_STREAM: i64 = 1;   // TCP
+pub const SOCK_DGRAM: i64 = 2;    // UDP
+
+// Get network status
+// status_type: 0=link, 1=rx_count, 2=tx_count, 3=initialized
+pub fn net_status(status_type: i64) -> i64 {
+    syscall1(SYS_NET_STATUS, status_type)
+}
+
+// Get current IP address (packed format)
+pub fn net_getip() -> i64 {
+    syscall0(SYS_NET_GETIP)
+}
+
+// Get MAC address bytes
+// Returns low 4 bytes when idx=0, high 2 bytes when idx=1
+pub fn net_getmac(idx: i64) -> i64 {
+    syscall1(SYS_NET_GETMAC, idx)
+}
+
+// Configure network (static IP)
+// ip, mask, gateway: packed IP addresses (a.b.c.d = a*16777216 + b*65536 + c*256 + d)
+pub fn net_config(ip: i64, mask: i64, gateway: i64) -> i64 {
+    syscall3(SYS_NET_CONFIG, ip, mask, gateway)
+}
+
+// Start DHCP auto-configuration
+pub fn net_dhcp() -> i64 {
+    syscall0(SYS_NET_DHCP)
+}
+
+// Ping an IP address
+// target_ip: packed IP address
+// timeout: timeout in ticks
+// Returns: RTT in ticks, or negative error
+pub fn net_ping(target_ip: i64, timeout: i64) -> i64 {
+    syscall2(SYS_NET_PING, target_ip, timeout)
+}
+
+// Resolve hostname to IP via DNS
+// hostname_addr: address of hostname string
+// Returns: packed IP address, or 0 on failure
+pub fn net_resolve(hostname_addr: i64) -> i64 {
+    syscall1(SYS_NET_RESOLVE, hostname_addr)
+}
+
+// ARP lookup
+// ip: packed IP address
+// Returns: MAC address (packed), or 0 if not found
+pub fn net_arp_lookup(ip: i64) -> i64 {
+    syscall1(SYS_NET_ARP, ip)
+}
+
+// Create network socket
+// sock_type: SOCK_STREAM (TCP) or SOCK_DGRAM (UDP)
+// Returns: socket ID, or negative error
+pub fn net_socket(sock_type: i64) -> i64 {
+    syscall1(SYS_NET_SOCKET, sock_type)
+}
+
+// Bind socket to port
+pub fn net_bind(sock_id: i64, port: i64) -> i64 {
+    syscall2(SYS_NET_BIND, sock_id, port)
+}
+
+// Connect socket to remote address
+pub fn net_connect(sock_id: i64, ip: i64, port: i64) -> i64 {
+    syscall3(SYS_NET_CONNECT, sock_id, ip, port)
+}
+
+// Send data on socket
+pub fn net_send_data(sock_id: i64, data_addr: i64, len: i64) -> i64 {
+    syscall3(SYS_NET_SEND, sock_id, data_addr, len)
+}
+
+// Receive data from socket
+pub fn net_recv_data(sock_id: i64, buf_addr: i64, max_len: i64) -> i64 {
+    syscall3(SYS_NET_RECV, sock_id, buf_addr, max_len)
+}
+
+// Close socket
+pub fn net_close(sock_id: i64) -> i64 {
+    syscall1(SYS_NET_CLOSE, sock_id)
+}
+
+// Poll network (process pending packets)
+pub fn net_poll() -> i64 {
+    syscall0(SYS_NET_POLL)
+}
+
+// ============================================================================
+// Network Helpers
+// ============================================================================
+
+// Pack IP address from components (a.b.c.d)
+pub fn pack_ip(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    (a * 16777216) + (b * 65536) + (c * 256) + d
+}
+
+// Extract IP component (0=a, 1=b, 2=c, 3=d from a.b.c.d)
+pub fn ip_byte(ip: i64, idx: i64) -> i64 {
+    if idx == 0 { return (ip / 16777216) % 256; }
+    if idx == 1 { return (ip / 65536) % 256; }
+    if idx == 2 { return (ip / 256) % 256; }
+    ip % 256
+}

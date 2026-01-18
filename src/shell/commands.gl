@@ -345,6 +345,38 @@ pub fn cmd_help() {
     // "  env    - system info"
     print_str(32, 32, 101, 110, 118, 0, 0, 0);  // "  env"
     putchar(10);
+
+    // Network commands
+    putchar(10);
+    print_str(78, 101, 116, 119, 111, 114, 107, 58);  // "Network:"
+    putchar(10);
+
+    // "  net status - net info"
+    print_str(32, 32, 110, 101, 116, 32, 115, 116);  // "  net st"
+    print_str(97, 116, 117, 115, 0, 0, 0, 0);        // "atus"
+    putchar(10);
+
+    // "  net dhcp - auto config"
+    print_str(32, 32, 110, 101, 116, 32, 100, 104);  // "  net dh"
+    print_str(99, 112, 0, 0, 0, 0, 0, 0);            // "cp"
+    putchar(10);
+
+    // "  net config - static IP"
+    print_str(32, 32, 110, 101, 116, 32, 99, 111);   // "  net co"
+    print_str(110, 102, 105, 103, 0, 0, 0, 0);       // "nfig"
+    putchar(10);
+
+    // "  ping - ICMP ping"
+    print_str(32, 32, 112, 105, 110, 103, 0, 0);  // "  ping"
+    putchar(10);
+
+    // "  arp - ARP cache"
+    print_str(32, 32, 97, 114, 112, 0, 0, 0);  // "  arp"
+    putchar(10);
+
+    // "  nc - netcat"
+    print_str(32, 32, 110, 99, 0, 0, 0, 0);  // "  nc"
+    putchar(10);
 }
 
 // Command: ps - show processes
@@ -1134,4 +1166,467 @@ pub fn cmd_env() {
     let file_count = runtime::ramfs_file_count();
     print_dec(file_count);
     putchar(10);
+}
+
+// ============================================================================
+// Network Commands
+// ============================================================================
+
+// Command: net - network subcommands
+// Usage: net status | net dhcp | net config <ip> <mask> <gw>
+pub fn cmd_net() {
+    // Get subcommand starting at position 4 (after "net ")
+    let sub0 = line_get(4);
+    let sub1 = line_get(5);
+    let sub2 = line_get(6);
+    let sub3 = line_get(7);
+    let sub4 = line_get(8);
+    let sub5 = line_get(9);
+
+    // "status" = 115, 116, 97, 116, 117, 115
+    if sub0 == 115 && sub1 == 116 && sub2 == 97 && sub3 == 116 && sub4 == 117 && sub5 == 115 {
+        cmd_net_status();
+    }
+    // "dhcp" = 100, 104, 99, 112
+    else if sub0 == 100 && sub1 == 104 && sub2 == 99 && sub3 == 112 {
+        cmd_net_dhcp();
+    }
+    // "config" = 99, 111, 110, 102, 105, 103
+    else if sub0 == 99 && sub1 == 111 && sub2 == 110 && sub3 == 102 && sub4 == 105 && sub5 == 103 {
+        cmd_net_config();
+    }
+    else {
+        // Print usage
+        print_str(85, 115, 97, 103, 101, 58, 32, 0);  // "Usage: "
+        putchar(10);
+        print_str(32, 32, 110, 101, 116, 32, 115, 116);  // "  net st"
+        print_str(97, 116, 117, 115, 0, 0, 0, 0);        // "atus"
+        putchar(10);
+        print_str(32, 32, 110, 101, 116, 32, 100, 104);  // "  net dh"
+        print_str(99, 112, 0, 0, 0, 0, 0, 0);            // "cp"
+        putchar(10);
+        print_str(32, 32, 110, 101, 116, 32, 99, 111);   // "  net co"
+        print_str(110, 102, 105, 103, 0, 0, 0, 0);       // "nfig"
+        putchar(10);
+    }
+}
+
+// net status - show network status
+fn cmd_net_status() {
+    // Print "=== Network Status ==="
+    print_str(61, 61, 61, 32, 78, 101, 116, 119);  // "=== Netw"
+    print_str(111, 114, 107, 32, 83, 116, 97, 116);  // "ork Stat"
+    print_str(117, 115, 32, 61, 61, 61, 0, 0);  // "us ==="
+    putchar(10);
+
+    // Check if initialized
+    let init = runtime::net_status(runtime::NET_STATUS_INIT);
+    print_str(73, 110, 105, 116, 58, 32, 0, 0);  // "Init: "
+    if init == 1 {
+        print_str(89, 101, 115, 0, 0, 0, 0, 0);  // "Yes"
+    } else {
+        print_str(78, 111, 0, 0, 0, 0, 0, 0);  // "No"
+        putchar(10);
+        return;
+    }
+    putchar(10);
+
+    // Link status
+    let link = runtime::net_status(runtime::NET_STATUS_LINK);
+    print_str(76, 105, 110, 107, 58, 32, 0, 0);  // "Link: "
+    if link == 1 {
+        print_str(85, 80, 0, 0, 0, 0, 0, 0);  // "UP"
+    } else {
+        print_str(68, 79, 87, 78, 0, 0, 0, 0);  // "DOWN"
+    }
+    putchar(10);
+
+    // MAC address
+    print_str(77, 65, 67, 58, 32, 0, 0, 0);  // "MAC: "
+    let mac_lo = runtime::net_getmac(0);  // bytes 0-3
+    let mac_hi = runtime::net_getmac(1);  // bytes 4-5
+    print_hex_byte((mac_lo / 1) % 256);
+    putchar(58);  // :
+    print_hex_byte((mac_lo / 256) % 256);
+    putchar(58);
+    print_hex_byte((mac_lo / 65536) % 256);
+    putchar(58);
+    print_hex_byte((mac_lo / 16777216) % 256);
+    putchar(58);
+    print_hex_byte((mac_hi / 1) % 256);
+    putchar(58);
+    print_hex_byte((mac_hi / 256) % 256);
+    putchar(10);
+
+    // IP address
+    let ip = runtime::net_getip();
+    print_str(73, 80, 58, 32, 0, 0, 0, 0);  // "IP: "
+    if ip != 0 {
+        print_ip(ip);
+    } else {
+        print_str(78, 111, 116, 32, 115, 101, 116, 0);  // "Not set"
+    }
+    putchar(10);
+
+    // RX/TX counts
+    let rx = runtime::net_status(runtime::NET_STATUS_RX_COUNT);
+    let tx = runtime::net_status(runtime::NET_STATUS_TX_COUNT);
+    print_str(82, 88, 58, 32, 0, 0, 0, 0);  // "RX: "
+    print_dec(rx);
+    print_str(32, 84, 88, 58, 32, 0, 0, 0);  // " TX: "
+    print_dec(tx);
+    putchar(10);
+}
+
+// net dhcp - start DHCP
+fn cmd_net_dhcp() {
+    print_str(83, 116, 97, 114, 116, 105, 110, 103);  // "Starting"
+    print_str(32, 68, 72, 67, 80, 46, 46, 46);        // " DHCP..."
+    putchar(10);
+
+    let result = runtime::net_dhcp();
+    if result >= 0 {
+        print_str(68, 72, 67, 80, 32, 79, 75, 0);  // "DHCP OK"
+        putchar(10);
+        // Show the obtained IP
+        let ip = runtime::net_getip();
+        print_str(73, 80, 58, 32, 0, 0, 0, 0);  // "IP: "
+        print_ip(ip);
+        putchar(10);
+    } else {
+        print_str(68, 72, 67, 80, 32, 70, 65, 73);  // "DHCP FAI"
+        print_str(76, 69, 68, 0, 0, 0, 0, 0);       // "LED"
+        putchar(10);
+    }
+}
+
+// net config <ip> <mask> <gw> - configure static IP
+fn cmd_net_config() {
+    // Parse IP addresses starting at position 11 (after "net config ")
+    // For simplicity, this expects: net config a.b.c.d m.m.m.m g.g.g.g
+    // We'll use a simplified parser
+
+    let mut pos: i64 = 11;
+    let ip = parse_ip_at(pos);
+    if ip == 0 {
+        print_str(85, 115, 97, 103, 101, 58, 32, 110);  // "Usage: n"
+        print_str(101, 116, 32, 99, 111, 110, 102, 105);  // "et confi"
+        print_str(103, 32, 60, 105, 112, 62, 0, 0);      // "g <ip>"
+        putchar(10);
+        return;
+    }
+
+    // Skip to next IP (find space, then parse)
+    pos = skip_to_next_ip(pos);
+    let mask = parse_ip_at(pos);
+    if mask == 0 {
+        // Default mask 255.255.255.0
+        let default_mask = runtime::pack_ip(255, 255, 255, 0);
+        let result = runtime::net_config(ip, default_mask, 0);
+        print_str(67, 111, 110, 102, 105, 103, 117, 114);  // "Configur"
+        print_str(101, 100, 0, 0, 0, 0, 0, 0);             // "ed"
+        putchar(10);
+        return;
+    }
+
+    // Skip to gateway
+    pos = skip_to_next_ip(pos);
+    let gw = parse_ip_at(pos);
+
+    let result = runtime::net_config(ip, mask, gw);
+    print_str(67, 111, 110, 102, 105, 103, 117, 114);  // "Configur"
+    print_str(101, 100, 58, 0, 0, 0, 0, 0);            // "ed:"
+    putchar(10);
+    print_str(73, 80, 58, 32, 0, 0, 0, 0);  // "IP: "
+    print_ip(ip);
+    putchar(10);
+}
+
+// Command: ping <ip> - send ICMP echo request
+pub fn cmd_ping() {
+    // Parse IP address starting at position 5 (after "ping ")
+    let ip = parse_ip_at(5);
+
+    if ip == 0 {
+        print_str(85, 115, 97, 103, 101, 58, 32, 112);  // "Usage: p"
+        print_str(105, 110, 103, 32, 60, 105, 112, 62);  // "ing <ip>"
+        putchar(10);
+        return;
+    }
+
+    // Print "Pinging "
+    print_str(80, 105, 110, 103, 105, 110, 103, 32);  // "Pinging "
+    print_ip(ip);
+    putchar(10);
+
+    // Send ping with 1000 tick timeout
+    let mut i: i64 = 0;
+    while i < 4 {
+        let rtt = runtime::net_ping(ip, 1000);
+        if rtt >= 0 {
+            print_str(82, 101, 112, 108, 121, 58, 32, 0);  // "Reply: "
+            print_dec(rtt);
+            print_str(32, 116, 105, 99, 107, 115, 0, 0);  // " ticks"
+        } else {
+            print_str(84, 105, 109, 101, 111, 117, 116, 0);  // "Timeout"
+        }
+        putchar(10);
+        i = i + 1;
+
+        // Small delay between pings
+        let mut delay: i64 = 0;
+        while delay < 10000 {
+            runtime::yield_cpu();
+            delay = delay + 1;
+        }
+    }
+}
+
+// Command: arp - show ARP cache
+pub fn cmd_arp() {
+    print_str(65, 82, 80, 32, 67, 97, 99, 104);  // "ARP Cach"
+    print_str(101, 58, 0, 0, 0, 0, 0, 0);        // "e:"
+    putchar(10);
+
+    // Try to look up common IPs
+    // Gateway is usually at .1 or .2
+    let ip = runtime::net_getip();
+    if ip == 0 {
+        print_str(78, 111, 32, 73, 80, 0, 0, 0);  // "No IP"
+        putchar(10);
+        return;
+    }
+
+    // Print our own entry
+    print_ip(ip);
+    print_str(32, 45, 62, 32, 0, 0, 0, 0);  // " -> "
+    print_str(40, 115, 101, 108, 102, 41, 0, 0);  // "(self)"
+    putchar(10);
+
+    // Try gateway (.1 and .2)
+    let base = ip - (ip % 256);
+    let mut gw_ip = base + 1;
+    let mac = runtime::net_arp_lookup(gw_ip);
+    if mac != 0 {
+        print_ip(gw_ip);
+        print_str(32, 45, 62, 32, 0, 0, 0, 0);  // " -> "
+        print_hex_byte((mac / 1) % 256);
+        putchar(58);
+        print_hex_byte((mac / 256) % 256);
+        putchar(58);
+        print_hex_byte((mac / 65536) % 256);
+        putchar(58);
+        print_hex_byte((mac / 16777216) % 256);
+        putchar(58);
+        let mac_hi = runtime::net_arp_lookup(gw_ip + 0x80000000);  // Flag to get hi bytes
+        print_hex_byte((mac_hi / 1) % 256);
+        putchar(58);
+        print_hex_byte((mac_hi / 256) % 256);
+        putchar(10);
+    }
+}
+
+// Command: nc <ip> <port> - simple netcat
+pub fn cmd_nc() {
+    // Parse IP at position 3 (after "nc ")
+    let ip = parse_ip_at(3);
+    if ip == 0 {
+        print_str(85, 115, 97, 103, 101, 58, 32, 110);  // "Usage: n"
+        print_str(99, 32, 60, 105, 112, 62, 32, 60);    // "c <ip> <"
+        print_str(112, 111, 114, 116, 62, 0, 0, 0);     // "port>"
+        putchar(10);
+        return;
+    }
+
+    // Find port (after IP and space)
+    let mut pos: i64 = 3;
+    pos = skip_to_next_ip(pos);  // Skip past IP
+    let port = parse_number_at(pos);
+    if port == 0 {
+        print_str(78, 101, 101, 100, 32, 112, 111, 114);  // "Need por"
+        print_str(116, 0, 0, 0, 0, 0, 0, 0);              // "t"
+        putchar(10);
+        return;
+    }
+
+    // Print connecting message
+    print_str(67, 111, 110, 110, 101, 99, 116, 105);  // "Connecti"
+    print_str(110, 103, 32, 0, 0, 0, 0, 0);           // "ng "
+    print_ip(ip);
+    putchar(58);
+    print_dec(port);
+    putchar(10);
+
+    // Create TCP socket
+    let sock = runtime::net_socket(runtime::SOCK_STREAM);
+    if sock < 0 {
+        print_str(69, 82, 82, 58, 32, 115, 111, 99);  // "ERR: soc"
+        print_str(107, 101, 116, 0, 0, 0, 0, 0);      // "ket"
+        putchar(10);
+        return;
+    }
+
+    // Connect
+    let result = runtime::net_connect(sock, ip, port);
+    if result < 0 {
+        print_str(69, 82, 82, 58, 32, 99, 111, 110);  // "ERR: con"
+        print_str(110, 101, 99, 116, 0, 0, 0, 0);     // "nect"
+        putchar(10);
+        runtime::net_close(sock);
+        return;
+    }
+
+    print_str(67, 111, 110, 110, 101, 99, 116, 101);  // "Connecte"
+    print_str(100, 33, 0, 0, 0, 0, 0, 0);             // "d!"
+    putchar(10);
+
+    // Simple test: try to receive some data
+    let buf_addr = DISK_BUFFER_ADDR;  // Reuse disk buffer
+    let recv_len = runtime::net_recv_data(sock, buf_addr, 256);
+    if recv_len > 0 {
+        print_str(82, 101, 99, 118, 58, 32, 0, 0);  // "Recv: "
+        print_dec(recv_len);
+        print_str(32, 98, 121, 116, 101, 115, 0, 0);  // " bytes"
+        putchar(10);
+    }
+
+    runtime::net_close(sock);
+    print_str(67, 108, 111, 115, 101, 100, 0, 0);  // "Closed"
+    putchar(10);
+}
+
+// ============================================================================
+// Network Helper Functions
+// ============================================================================
+
+// Print IP address in dotted decimal
+fn print_ip(ip: i64) {
+    print_dec(runtime::ip_byte(ip, 0));
+    putchar(46);  // .
+    print_dec(runtime::ip_byte(ip, 1));
+    putchar(46);
+    print_dec(runtime::ip_byte(ip, 2));
+    putchar(46);
+    print_dec(runtime::ip_byte(ip, 3));
+}
+
+// Print hex byte (2 digits)
+fn print_hex_byte(b: i64) {
+    let hi = (b / 16) % 16;
+    let lo = b % 16;
+    if hi < 10 {
+        putchar(48 + hi);
+    } else {
+        putchar(65 + hi - 10);
+    }
+    if lo < 10 {
+        putchar(48 + lo);
+    } else {
+        putchar(65 + lo - 10);
+    }
+}
+
+// Parse IP address from line buffer at given position
+// Returns packed IP or 0 on error
+fn parse_ip_at(start: i64) -> i64 {
+    let mut pos = start;
+    let len = line_len();
+
+    // Skip leading spaces
+    while pos < len && line_get(pos) == 32 {
+        pos = pos + 1;
+    }
+
+    // Parse four octets
+    let mut octets: [i64; 4] = [0; 4];
+    let mut octet_idx: i64 = 0;
+    let mut current: i64 = 0;
+    let mut has_digit: i64 = 0;
+
+    while pos < len && octet_idx < 4 {
+        let ch = line_get(pos);
+        if ch >= 48 && ch <= 57 {
+            // Digit
+            current = current * 10 + (ch - 48);
+            has_digit = 1;
+        } else if ch == 46 && has_digit == 1 {
+            // Dot - save octet and move to next
+            octets[octet_idx as usize] = current;
+            octet_idx = octet_idx + 1;
+            current = 0;
+            has_digit = 0;
+        } else if ch == 32 || ch == 0 {
+            // Space or end - save last octet
+            if has_digit == 1 {
+                octets[octet_idx as usize] = current;
+                octet_idx = octet_idx + 1;
+            }
+            pos = len;  // Exit loop
+        } else {
+            // Invalid character
+            pos = len;
+        }
+        pos = pos + 1;
+    }
+
+    // Need exactly 4 octets
+    if octet_idx != 4 {
+        return 0;
+    }
+
+    // Validate ranges
+    let mut i: i64 = 0;
+    while i < 4 {
+        if octets[i as usize] > 255 {
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    runtime::pack_ip(octets[0], octets[1], octets[2], octets[3])
+}
+
+// Skip to next token (past current word and space)
+fn skip_to_next_ip(start: i64) -> i64 {
+    let mut pos = start;
+    let len = line_len();
+
+    // Skip non-spaces (current token)
+    while pos < len && line_get(pos) != 32 && line_get(pos) != 0 {
+        pos = pos + 1;
+    }
+
+    // Skip spaces
+    while pos < len && line_get(pos) == 32 {
+        pos = pos + 1;
+    }
+
+    pos
+}
+
+// Parse number at position
+fn parse_number_at(start: i64) -> i64 {
+    let mut pos = start;
+    let len = line_len();
+
+    // Skip leading spaces
+    while pos < len && line_get(pos) == 32 {
+        pos = pos + 1;
+    }
+
+    let mut num: i64 = 0;
+    let mut has_digit: i64 = 0;
+
+    while pos < len {
+        let ch = line_get(pos);
+        if ch >= 48 && ch <= 57 {
+            num = num * 10 + (ch - 48);
+            has_digit = 1;
+        } else {
+            pos = len;  // Exit
+        }
+        pos = pos + 1;
+    }
+
+    if has_digit == 1 { num } else { 0 }
 }
