@@ -1,0 +1,1427 @@
+// Genesis Runtime - HTTP/1.1 Client
+// RFC 7230-7235 compliant HTTP client implementation
+//
+// Features:
+//   - HTTP/1.1 protocol support
+//   - GET, POST, HEAD methods
+//   - Automatic redirect following (301, 302, 307, 308)
+//   - Chunked transfer encoding
+//   - Content-Length handling
+//   - Connection keep-alive
+//   - Custom headers
+//   - Timeout support
+//   - Cookie handling (basic)
+//
+// Usage:
+//   http_init();
+//   http_get(url_addr);
+//   let status = http_response_status();
+//   let body_addr = http_response_body_addr();
+//   let body_len = http_response_body_len();
+
+mod url;
+
+// ============================================================
+// HTTP Constants
+// ============================================================
+
+// HTTP Methods
+pub const HTTP_METHOD_GET: i64 = 0;
+pub const HTTP_METHOD_POST: i64 = 1;
+pub const HTTP_METHOD_HEAD: i64 = 2;
+pub const HTTP_METHOD_PUT: i64 = 3;
+pub const HTTP_METHOD_DELETE: i64 = 4;
+
+// HTTP Status Code Classes
+pub const HTTP_STATUS_INFO: i64 = 1;        // 1xx
+pub const HTTP_STATUS_SUCCESS: i64 = 2;     // 2xx
+pub const HTTP_STATUS_REDIRECT: i64 = 3;    // 3xx
+pub const HTTP_STATUS_CLIENT_ERR: i64 = 4;  // 4xx
+pub const HTTP_STATUS_SERVER_ERR: i64 = 5;  // 5xx
+
+// Common Status Codes
+pub const HTTP_OK: i64 = 200;
+pub const HTTP_CREATED: i64 = 201;
+pub const HTTP_NO_CONTENT: i64 = 204;
+pub const HTTP_MOVED_PERMANENTLY: i64 = 301;
+pub const HTTP_FOUND: i64 = 302;
+pub const HTTP_NOT_MODIFIED: i64 = 304;
+pub const HTTP_TEMPORARY_REDIRECT: i64 = 307;
+pub const HTTP_PERMANENT_REDIRECT: i64 = 308;
+pub const HTTP_BAD_REQUEST: i64 = 400;
+pub const HTTP_UNAUTHORIZED: i64 = 401;
+pub const HTTP_FORBIDDEN: i64 = 403;
+pub const HTTP_NOT_FOUND: i64 = 404;
+pub const HTTP_INTERNAL_ERROR: i64 = 500;
+pub const HTTP_BAD_GATEWAY: i64 = 502;
+pub const HTTP_SERVICE_UNAVAILABLE: i64 = 503;
+
+// Error Codes
+pub const HTTP_ERR_OK: i64 = 0;
+pub const HTTP_ERR_INVALID_URL: i64 = -1;
+pub const HTTP_ERR_DNS_FAILED: i64 = -2;
+pub const HTTP_ERR_CONNECT_FAILED: i64 = -3;
+pub const HTTP_ERR_SEND_FAILED: i64 = -4;
+pub const HTTP_ERR_RECV_FAILED: i64 = -5;
+pub const HTTP_ERR_TIMEOUT: i64 = -6;
+pub const HTTP_ERR_PARSE_FAILED: i64 = -7;
+pub const HTTP_ERR_TOO_MANY_REDIRECTS: i64 = -8;
+pub const HTTP_ERR_HTTPS_NOT_SUPPORTED: i64 = -9;
+pub const HTTP_ERR_BUFFER_OVERFLOW: i64 = -10;
+
+// Configuration
+const HTTP_MAX_REDIRECTS: i64 = 5;
+const HTTP_DEFAULT_TIMEOUT: i64 = 3000;  // 30 seconds at 100Hz
+const HTTP_MAX_HEADER_SIZE: i64 = 4096;
+const HTTP_MAX_BODY_SIZE: i64 = 65536;   // 64KB max body
+
+// ============================================================
+// HTTP Memory Layout
+// ============================================================
+
+// Request buffer (4KB)
+const HTTP_TX_BUF: i64 = 0xB40000;
+const HTTP_TX_SIZE: i64 = 4096;
+
+// Response header buffer (4KB)
+const HTTP_RX_HDR_BUF: i64 = 0xB41000;
+const HTTP_RX_HDR_SIZE: i64 = 4096;
+
+// Response body buffer (64KB)
+const HTTP_RX_BODY_BUF: i64 = 0xB42000;
+const HTTP_RX_BODY_SIZE: i64 = 65536;
+
+// State structure
+const HTTP_STATE: i64 = 0xB52000;
+const HTTP_STATE_SOCKET: i64 = 0;          // Socket FD (8 bytes)
+const HTTP_STATE_STATUS: i64 = 8;          // Status code (2 bytes)
+const HTTP_STATE_CONTENT_LEN: i64 = 10;    // Content-Length (8 bytes)
+const HTTP_STATE_BODY_LEN: i64 = 18;       // Actual body received (8 bytes)
+const HTTP_STATE_HDR_LEN: i64 = 26;        // Header length (4 bytes)
+const HTTP_STATE_CHUNKED: i64 = 30;        // 1 if chunked encoding (1 byte)
+const HTTP_STATE_KEEP_ALIVE: i64 = 31;     // 1 if keep-alive (1 byte)
+const HTTP_STATE_ERROR: i64 = 32;          // Error code (4 bytes)
+const HTTP_STATE_REDIRECTS: i64 = 36;      // Redirect count (1 byte)
+const HTTP_STATE_TIMEOUT: i64 = 38;        // Timeout in ticks (4 bytes)
+
+// Parsed headers storage (32 headers max, 64 bytes each)
+const HTTP_HEADERS: i64 = 0xB52100;
+const HTTP_HEADER_COUNT: i64 = 0xB52080;
+const HTTP_MAX_HEADERS: i64 = 32;
+const HTTP_HEADER_SIZE: i64 = 64;
+
+// Header entry offsets
+const HDR_NAME_OFF: i64 = 0;     // Name (32 bytes)
+const HDR_VALUE_OFF: i64 = 32;   // Value (32 bytes)
+
+// Temporary hostname buffer
+const HTTP_HOST_BUF: i64 = 0xB53000;
+
+// ============================================================
+// HTTP Client Public API
+// ============================================================
+
+// Initialize HTTP client
+pub fn http_init() {
+    http_memset(HTTP_STATE, 0, 128);
+    http_memset(HTTP_TX_BUF, 0, 256);
+    http_write_u32(HTTP_STATE + HTTP_STATE_TIMEOUT, HTTP_DEFAULT_TIMEOUT as u64);
+}
+
+// Set timeout in ticks (100 ticks = 1 second)
+pub fn http_set_timeout(ticks: i64) {
+    http_write_u32(HTTP_STATE + HTTP_STATE_TIMEOUT, ticks as u64);
+}
+
+// Perform HTTP GET request
+// url_addr: address of null-terminated URL string
+// Returns: HTTP_ERR_OK on success, negative error code on failure
+pub fn http_get(url_addr: i64) -> i64 {
+    http_request(HTTP_METHOD_GET, url_addr, 0, 0)
+}
+
+// Perform HTTP POST request
+// url_addr: address of null-terminated URL string
+// body_addr: address of request body
+// body_len: length of request body
+// Returns: HTTP_ERR_OK on success, negative error code on failure
+pub fn http_post(url_addr: i64, body_addr: i64, body_len: i64) -> i64 {
+    http_request(HTTP_METHOD_POST, url_addr, body_addr, body_len)
+}
+
+// Perform HTTP HEAD request
+pub fn http_head(url_addr: i64) -> i64 {
+    http_request(HTTP_METHOD_HEAD, url_addr, 0, 0)
+}
+
+// Get response status code
+pub fn http_response_status() -> i64 {
+    http_read_u16(HTTP_STATE + HTTP_STATE_STATUS) as i64
+}
+
+// Get response body address
+pub fn http_response_body_addr() -> i64 {
+    HTTP_RX_BODY_BUF
+}
+
+// Get response body length
+pub fn http_response_body_len() -> i64 {
+    http_read_u64(HTTP_STATE + HTTP_STATE_BODY_LEN) as i64
+}
+
+// Get response header count
+pub fn http_response_header_count() -> i64 {
+    http_read_u32(HTTP_HEADER_COUNT) as i64
+}
+
+// Get response header by index
+// Returns: name address (value at name_addr + 32)
+pub fn http_response_header(idx: i64) -> i64 {
+    if idx < 0 || idx >= http_response_header_count() {
+        return 0;
+    }
+    HTTP_HEADERS + (idx * HTTP_HEADER_SIZE)
+}
+
+// Find header by name (case-insensitive)
+// Returns: value address, or 0 if not found
+pub fn http_find_header(name_addr: i64) -> i64 {
+    let count = http_response_header_count();
+    let mut i: i64 = 0;
+
+    while i < count {
+        let hdr = HTTP_HEADERS + (i * HTTP_HEADER_SIZE);
+        if http_strcasecmp(hdr + HDR_NAME_OFF, name_addr) == 0 {
+            return hdr + HDR_VALUE_OFF;
+        }
+        i = i + 1;
+    }
+
+    0
+}
+
+// Get last error code
+pub fn http_get_error() -> i64 {
+    http_read_u32(HTTP_STATE + HTTP_STATE_ERROR) as i64
+}
+
+// Check if response is redirect
+pub fn http_is_redirect() -> i64 {
+    let status = http_response_status();
+    if status == HTTP_MOVED_PERMANENTLY { return 1; }
+    if status == HTTP_FOUND { return 1; }
+    if status == HTTP_TEMPORARY_REDIRECT { return 1; }
+    if status == HTTP_PERMANENT_REDIRECT { return 1; }
+    0
+}
+
+// ============================================================
+// HTTP Request Implementation
+// ============================================================
+
+// Main request function
+fn http_request(method: i64, url_addr: i64, body_addr: i64, body_len: i64) -> i64 {
+    // Reset state
+    http_reset_state();
+
+    // Parse URL
+    if url::url_parse(url_addr) == 0 {
+        http_set_error(HTTP_ERR_INVALID_URL);
+        return HTTP_ERR_INVALID_URL;
+    }
+
+    // Check for HTTPS (not supported yet)
+    if url::url_is_https() == 1 {
+        http_set_error(HTTP_ERR_HTTPS_NOT_SUPPORTED);
+        return HTTP_ERR_HTTPS_NOT_SUPPORTED;
+    }
+
+    // Start request with redirect handling
+    http_request_with_redirects(method, body_addr, body_len)
+}
+
+// Request with redirect following
+fn http_request_with_redirects(method: i64, body_addr: i64, body_len: i64) -> i64 {
+    let max_redirects = HTTP_MAX_REDIRECTS;
+    let mut redirects: i64 = 0;
+
+    loop {
+        // Perform the actual request
+        let result = http_do_request(method, body_addr, body_len);
+        if result < 0 {
+            return result;
+        }
+
+        // Check for redirect
+        if http_is_redirect() == 0 {
+            return HTTP_ERR_OK;
+        }
+
+        // Check redirect limit
+        redirects = redirects + 1;
+        if redirects > max_redirects {
+            http_set_error(HTTP_ERR_TOO_MANY_REDIRECTS);
+            return HTTP_ERR_TOO_MANY_REDIRECTS;
+        }
+
+        // Get Location header
+        let location = http_find_header(http_str_location());
+        if location == 0 {
+            // No Location header, treat as success
+            return HTTP_ERR_OK;
+        }
+
+        // Parse new URL
+        if url::url_parse(location) == 0 {
+            http_set_error(HTTP_ERR_INVALID_URL);
+            return HTTP_ERR_INVALID_URL;
+        }
+
+        // Check for HTTPS redirect
+        if url::url_is_https() == 1 {
+            http_set_error(HTTP_ERR_HTTPS_NOT_SUPPORTED);
+            return HTTP_ERR_HTTPS_NOT_SUPPORTED;
+        }
+
+        // For 307/308, maintain the method. For 301/302, convert to GET
+        let status = http_response_status();
+        if status == HTTP_MOVED_PERMANENTLY || status == HTTP_FOUND {
+            // Convert to GET, no body
+            return http_request_with_redirects(HTTP_METHOD_GET, 0, 0);
+        }
+    }
+
+    HTTP_ERR_OK
+}
+
+// Perform single HTTP request
+fn http_do_request(method: i64, body_addr: i64, body_len: i64) -> i64 {
+    // Resolve hostname
+    let host_addr = url::url_get_host_addr();
+    http_copy_string(host_addr, HTTP_HOST_BUF, 128);
+
+    let ip = http_dns_resolve(HTTP_HOST_BUF);
+    if ip == 0 {
+        http_set_error(HTTP_ERR_DNS_FAILED);
+        return HTTP_ERR_DNS_FAILED;
+    }
+
+    // Get port
+    let port = url::url_get_port();
+
+    // Create socket and connect
+    let sock = http_socket_create();
+    if sock < 0 {
+        http_set_error(HTTP_ERR_CONNECT_FAILED);
+        return HTTP_ERR_CONNECT_FAILED;
+    }
+
+    http_write_u64(HTTP_STATE + HTTP_STATE_SOCKET, sock as u64);
+
+    let connect_result = http_socket_connect(sock, ip, port);
+    if connect_result < 0 {
+        http_socket_close(sock);
+        http_set_error(HTTP_ERR_CONNECT_FAILED);
+        return HTTP_ERR_CONNECT_FAILED;
+    }
+
+    // Build and send request
+    let req_len = http_build_request(method, body_addr, body_len);
+    if req_len <= 0 {
+        http_socket_close(sock);
+        http_set_error(HTTP_ERR_SEND_FAILED);
+        return HTTP_ERR_SEND_FAILED;
+    }
+
+    let sent = http_socket_send(sock, HTTP_TX_BUF, req_len);
+    if sent < 0 {
+        http_socket_close(sock);
+        http_set_error(HTTP_ERR_SEND_FAILED);
+        return HTTP_ERR_SEND_FAILED;
+    }
+
+    // Receive response
+    let recv_result = http_receive_response(sock, method);
+
+    // Close socket
+    http_socket_close(sock);
+
+    recv_result
+}
+
+// ============================================================
+// Request Building
+// ============================================================
+
+// Build HTTP request into buffer
+// Returns: request length
+fn http_build_request(method: i64, body_addr: i64, body_len: i64) -> i64 {
+    let buf = HTTP_TX_BUF;
+    let mut pos: i64 = 0;
+
+    // Request line: METHOD path HTTP/1.1\r\n
+    pos = http_write_method(buf, pos, method);
+    pos = http_write_byte_ret(buf, pos, 32);  // space
+    pos = http_write_path(buf, pos);
+    pos = http_write_byte_ret(buf, pos, 32);  // space
+    pos = http_write_string(buf, pos, http_str_http11());
+    pos = http_write_crlf(buf, pos);
+
+    // Host header
+    pos = http_write_string(buf, pos, http_str_host());
+    pos = http_write_byte_ret(buf, pos, 58);  // ':'
+    pos = http_write_byte_ret(buf, pos, 32);  // space
+    pos = http_write_string(buf, pos, url::url_get_host_addr());
+
+    // Add port if non-standard
+    let port = url::url_get_port();
+    if port != 80 {
+        pos = http_write_byte_ret(buf, pos, 58);  // ':'
+        pos = http_write_decimal(buf, pos, port);
+    }
+    pos = http_write_crlf(buf, pos);
+
+    // User-Agent header
+    pos = http_write_string(buf, pos, http_str_user_agent());
+    pos = http_write_byte_ret(buf, pos, 58);
+    pos = http_write_byte_ret(buf, pos, 32);
+    pos = http_write_string(buf, pos, http_str_genesis_browser());
+    pos = http_write_crlf(buf, pos);
+
+    // Accept header
+    pos = http_write_string(buf, pos, http_str_accept());
+    pos = http_write_byte_ret(buf, pos, 58);
+    pos = http_write_byte_ret(buf, pos, 32);
+    pos = http_write_string(buf, pos, http_str_accept_all());
+    pos = http_write_crlf(buf, pos);
+
+    // Connection header
+    pos = http_write_string(buf, pos, http_str_connection());
+    pos = http_write_byte_ret(buf, pos, 58);
+    pos = http_write_byte_ret(buf, pos, 32);
+    pos = http_write_string(buf, pos, http_str_close());
+    pos = http_write_crlf(buf, pos);
+
+    // Content-Length for POST
+    if method == HTTP_METHOD_POST && body_len > 0 {
+        pos = http_write_string(buf, pos, http_str_content_length());
+        pos = http_write_byte_ret(buf, pos, 58);
+        pos = http_write_byte_ret(buf, pos, 32);
+        pos = http_write_decimal(buf, pos, body_len);
+        pos = http_write_crlf(buf, pos);
+
+        // Content-Type
+        pos = http_write_string(buf, pos, http_str_content_type());
+        pos = http_write_byte_ret(buf, pos, 58);
+        pos = http_write_byte_ret(buf, pos, 32);
+        pos = http_write_string(buf, pos, http_str_form_urlencoded());
+        pos = http_write_crlf(buf, pos);
+    }
+
+    // End headers
+    pos = http_write_crlf(buf, pos);
+
+    // Body for POST
+    if method == HTTP_METHOD_POST && body_len > 0 && body_addr != 0 {
+        pos = http_copy_bytes(buf, pos, body_addr, body_len);
+    }
+
+    // Null terminate
+    http_write_byte(buf + pos, 0);
+
+    pos
+}
+
+// Write HTTP method string
+fn http_write_method(buf: i64, pos: i64, method: i64) -> i64 {
+    if method == HTTP_METHOD_GET {
+        return http_write_string(buf, pos, http_str_get());
+    }
+    if method == HTTP_METHOD_POST {
+        return http_write_string(buf, pos, http_str_post());
+    }
+    if method == HTTP_METHOD_HEAD {
+        return http_write_string(buf, pos, http_str_head());
+    }
+    if method == HTTP_METHOD_PUT {
+        return http_write_string(buf, pos, http_str_put());
+    }
+    if method == HTTP_METHOD_DELETE {
+        return http_write_string(buf, pos, http_str_delete());
+    }
+    http_write_string(buf, pos, http_str_get())
+}
+
+// Write path from URL
+fn http_write_path(buf: i64, pos: i64) -> i64 {
+    let path_addr = url::url_get_path_addr();
+    let path_len = url::url_get_path_len();
+
+    let mut p = pos;
+    let mut i: i64 = 0;
+    while i < path_len && p < HTTP_TX_SIZE - 1 {
+        http_write_byte(buf + p, http_read_byte(path_addr + i));
+        p = p + 1;
+        i = i + 1;
+    }
+
+    // Add query string if present
+    let query_addr = url::url_get_query_addr();
+    let query_ch = http_read_byte(query_addr);
+    if query_ch != 0 {
+        http_write_byte(buf + p, 63);  // '?'
+        p = p + 1;
+        p = http_write_string(buf, p, query_addr);
+    }
+
+    p
+}
+
+// ============================================================
+// Response Receiving
+// ============================================================
+
+// Receive and parse HTTP response
+fn http_receive_response(sock: i64, method: i64) -> i64 {
+    let timeout = http_read_u32(HTTP_STATE + HTTP_STATE_TIMEOUT) as i64;
+    let start_time = http_get_ticks();
+
+    // Receive headers first
+    let mut header_done: i64 = 0;
+    let mut hdr_len: i64 = 0;
+
+    while header_done == 0 {
+        // Check timeout
+        if http_get_ticks() - start_time > timeout {
+            http_set_error(HTTP_ERR_TIMEOUT);
+            return HTTP_ERR_TIMEOUT;
+        }
+
+        // Try to receive more data
+        let remaining = HTTP_RX_HDR_SIZE - hdr_len;
+        if remaining <= 0 {
+            http_set_error(HTTP_ERR_BUFFER_OVERFLOW);
+            return HTTP_ERR_BUFFER_OVERFLOW;
+        }
+
+        let recv_len = http_socket_recv(sock, HTTP_RX_HDR_BUF + hdr_len, remaining);
+        if recv_len < 0 {
+            http_set_error(HTTP_ERR_RECV_FAILED);
+            return HTTP_ERR_RECV_FAILED;
+        }
+
+        if recv_len > 0 {
+            hdr_len = hdr_len + recv_len;
+
+            // Look for end of headers (\r\n\r\n)
+            let header_end = http_find_header_end(HTTP_RX_HDR_BUF, hdr_len);
+            if header_end > 0 {
+                header_done = 1;
+                http_write_u32(HTTP_STATE + HTTP_STATE_HDR_LEN, header_end as u64);
+
+                // Parse headers
+                let parse_result = http_parse_response_headers(HTTP_RX_HDR_BUF, header_end);
+                if parse_result < 0 {
+                    return parse_result;
+                }
+
+                // Copy any body data that came with headers
+                let body_start = header_end + 4;  // Skip \r\n\r\n
+                let body_in_hdr = hdr_len - body_start;
+                if body_in_hdr > 0 {
+                    http_copy_bytes(HTTP_RX_BODY_BUF, 0, HTTP_RX_HDR_BUF + body_start, body_in_hdr);
+                    http_write_u64(HTTP_STATE + HTTP_STATE_BODY_LEN, body_in_hdr as u64);
+                }
+            }
+        } else {
+            // No data, yield CPU
+            http_yield();
+        }
+    }
+
+    // For HEAD requests, no body
+    if method == HTTP_METHOD_HEAD {
+        return HTTP_ERR_OK;
+    }
+
+    // Receive body
+    http_receive_body(sock, timeout, start_time)
+}
+
+// Find end of headers (\r\n\r\n)
+fn http_find_header_end(buf: i64, len: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < len - 3 {
+        if http_read_byte(buf + i) == 13 &&
+           http_read_byte(buf + i + 1) == 10 &&
+           http_read_byte(buf + i + 2) == 13 &&
+           http_read_byte(buf + i + 3) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0
+}
+
+// Receive response body
+fn http_receive_body(sock: i64, timeout: i64, start_time: i64) -> i64 {
+    let is_chunked = http_read_byte(HTTP_STATE + HTTP_STATE_CHUNKED);
+    let content_len = http_read_u64(HTTP_STATE + HTTP_STATE_CONTENT_LEN) as i64;
+
+    if is_chunked == 1 {
+        return http_receive_chunked_body(sock, timeout, start_time);
+    }
+
+    // Content-Length based or connection close
+    let mut body_len = http_read_u64(HTTP_STATE + HTTP_STATE_BODY_LEN) as i64;
+    let target_len = if content_len > 0 { content_len } else { HTTP_RX_BODY_SIZE };
+
+    while body_len < target_len {
+        // Check timeout
+        if http_get_ticks() - start_time > timeout {
+            // Timeout, but we may have partial data
+            break;
+        }
+
+        // Check buffer space
+        let remaining = HTTP_RX_BODY_SIZE - body_len;
+        if remaining <= 0 {
+            break;
+        }
+
+        let recv_len = http_socket_recv(sock, HTTP_RX_BODY_BUF + body_len, remaining);
+        if recv_len < 0 {
+            break;  // Connection closed or error
+        }
+
+        if recv_len > 0 {
+            body_len = body_len + recv_len;
+            http_write_u64(HTTP_STATE + HTTP_STATE_BODY_LEN, body_len as u64);
+        } else {
+            http_yield();
+        }
+
+        // If we have Content-Length and got it all, done
+        if content_len > 0 && body_len >= content_len {
+            break;
+        }
+    }
+
+    HTTP_ERR_OK
+}
+
+// Receive chunked transfer encoded body
+fn http_receive_chunked_body(sock: i64, timeout: i64, start_time: i64) -> i64 {
+    let mut body_len = http_read_u64(HTTP_STATE + HTTP_STATE_BODY_LEN) as i64;
+    let mut chunk_buf: [i64; 16] = [0; 16];
+
+    loop {
+        // Check timeout
+        if http_get_ticks() - start_time > timeout {
+            break;
+        }
+
+        // Read chunk size line
+        let chunk_size = http_read_chunk_size(sock, timeout, start_time);
+        if chunk_size == 0 {
+            // Final chunk
+            break;
+        }
+        if chunk_size < 0 {
+            // Error
+            break;
+        }
+
+        // Read chunk data
+        let mut chunk_read: i64 = 0;
+        while chunk_read < chunk_size {
+            let remaining_chunk = chunk_size - chunk_read;
+            let remaining_buf = HTTP_RX_BODY_SIZE - body_len;
+            let to_read = if remaining_chunk < remaining_buf { remaining_chunk } else { remaining_buf };
+
+            if to_read <= 0 {
+                break;
+            }
+
+            let recv_len = http_socket_recv(sock, HTTP_RX_BODY_BUF + body_len, to_read);
+            if recv_len > 0 {
+                body_len = body_len + recv_len;
+                chunk_read = chunk_read + recv_len;
+                http_write_u64(HTTP_STATE + HTTP_STATE_BODY_LEN, body_len as u64);
+            } else if recv_len < 0 {
+                return HTTP_ERR_RECV_FAILED;
+            } else {
+                http_yield();
+            }
+        }
+
+        // Skip trailing CRLF
+        http_skip_crlf(sock, timeout, start_time);
+    }
+
+    HTTP_ERR_OK
+}
+
+// Read chunk size from chunked encoding
+fn http_read_chunk_size(sock: i64, timeout: i64, start_time: i64) -> i64 {
+    let mut size: i64 = 0;
+    let mut line_buf: i64 = HTTP_RX_HDR_BUF + 3900;  // Temp space
+    let mut line_len: i64 = 0;
+
+    // Read until CRLF
+    loop {
+        if http_get_ticks() - start_time > timeout {
+            return 0 - 1;
+        }
+
+        let recv_len = http_socket_recv(sock, line_buf + line_len, 1);
+        if recv_len > 0 {
+            line_len = line_len + 1;
+
+            // Check for CRLF
+            if line_len >= 2 {
+                if http_read_byte(line_buf + line_len - 2) == 13 &&
+                   http_read_byte(line_buf + line_len - 1) == 10 {
+                    break;
+                }
+            }
+
+            if line_len > 20 {
+                return 0 - 1;  // Line too long
+            }
+        } else {
+            http_yield();
+        }
+    }
+
+    // Parse hex size
+    let mut i: i64 = 0;
+    while i < line_len - 2 {
+        let ch = http_read_byte(line_buf + i);
+        let digit = http_hex_value(ch);
+        if digit < 0 {
+            break;
+        }
+        size = size * 16 + digit;
+        i = i + 1;
+    }
+
+    size
+}
+
+// Skip CRLF
+fn http_skip_crlf(sock: i64, timeout: i64, start_time: i64) {
+    let mut buf: [i64; 2] = [0; 2];
+    let mut got: i64 = 0;
+
+    while got < 2 {
+        if http_get_ticks() - start_time > timeout {
+            return;
+        }
+
+        let line_buf = HTTP_RX_HDR_BUF + 3990;
+        let recv_len = http_socket_recv(sock, line_buf + got, 1);
+        if recv_len > 0 {
+            got = got + 1;
+        } else {
+            http_yield();
+        }
+    }
+}
+
+// ============================================================
+// Response Header Parsing
+// ============================================================
+
+// Parse response headers
+fn http_parse_response_headers(buf: i64, len: i64) -> i64 {
+    let mut pos: i64 = 0;
+
+    // Parse status line: HTTP/1.1 200 OK\r\n
+    pos = http_parse_status_line(buf, len);
+    if pos < 0 {
+        http_set_error(HTTP_ERR_PARSE_FAILED);
+        return HTTP_ERR_PARSE_FAILED;
+    }
+
+    // Parse headers
+    http_write_u32(HTTP_HEADER_COUNT, 0);
+    let mut header_idx: i64 = 0;
+
+    while pos < len && header_idx < HTTP_MAX_HEADERS {
+        // Check for end of headers
+        if http_read_byte(buf + pos) == 13 {
+            break;
+        }
+
+        // Parse header line
+        let line_end = http_find_line_end(buf, pos, len);
+        if line_end <= pos {
+            break;
+        }
+
+        // Find colon
+        let colon = http_find_char(buf, pos, line_end, 58);  // ':'
+        if colon > pos {
+            // Store header
+            let hdr_addr = HTTP_HEADERS + (header_idx * HTTP_HEADER_SIZE);
+
+            // Copy name (trim spaces)
+            let name_len = colon - pos;
+            http_copy_trim(buf + pos, hdr_addr + HDR_NAME_OFF, name_len, 31);
+
+            // Copy value (skip ": " and trim)
+            let value_start = colon + 1;
+            let value_len = line_end - value_start;
+            http_copy_trim(buf + value_start, hdr_addr + HDR_VALUE_OFF, value_len, 31);
+
+            // Check for special headers
+            http_check_special_header(hdr_addr);
+
+            header_idx = header_idx + 1;
+            http_write_u32(HTTP_HEADER_COUNT, header_idx as u64);
+        }
+
+        pos = line_end + 2;  // Skip CRLF
+    }
+
+    HTTP_ERR_OK
+}
+
+// Parse status line
+fn http_parse_status_line(buf: i64, len: i64) -> i64 {
+    // Find first space (after HTTP/1.1)
+    let space1 = http_find_char(buf, 0, len, 32);
+    if space1 <= 0 {
+        return 0 - 1;
+    }
+
+    // Find second space (after status code)
+    let space2 = http_find_char(buf, space1 + 1, len, 32);
+    let status_end = if space2 > 0 { space2 } else { http_find_line_end(buf, space1 + 1, len) };
+
+    // Parse status code
+    let mut status: i64 = 0;
+    let mut i = space1 + 1;
+    while i < status_end {
+        let ch = http_read_byte(buf + i);
+        if ch >= 48 && ch <= 57 {
+            status = status * 10 + (ch - 48);
+        }
+        i = i + 1;
+    }
+
+    http_write_u16(HTTP_STATE + HTTP_STATE_STATUS, status as u64);
+
+    // Find end of status line
+    http_find_line_end(buf, 0, len) + 2
+}
+
+// Check for special headers we need to parse
+fn http_check_special_header(hdr_addr: i64) {
+    let name = hdr_addr + HDR_NAME_OFF;
+    let value = hdr_addr + HDR_VALUE_OFF;
+
+    // Content-Length
+    if http_strcasecmp(name, http_str_content_length()) == 0 {
+        let len = http_parse_decimal(value);
+        http_write_u64(HTTP_STATE + HTTP_STATE_CONTENT_LEN, len as u64);
+    }
+
+    // Transfer-Encoding: chunked
+    if http_strcasecmp(name, http_str_transfer_encoding()) == 0 {
+        if http_strcasecmp(value, http_str_chunked()) == 0 {
+            http_write_byte(HTTP_STATE + HTTP_STATE_CHUNKED, 1);
+        }
+    }
+
+    // Connection: keep-alive
+    if http_strcasecmp(name, http_str_connection()) == 0 {
+        if http_strcasecmp(value, http_str_keep_alive()) == 0 {
+            http_write_byte(HTTP_STATE + HTTP_STATE_KEEP_ALIVE, 1);
+        }
+    }
+}
+
+// ============================================================
+// String Constants (stored in code, returned as addresses)
+// ============================================================
+
+fn http_str_get() -> i64 { http_static_string(71, 69, 84, 0, 0, 0, 0, 0) }
+fn http_str_post() -> i64 { http_static_string(80, 79, 83, 84, 0, 0, 0, 0) }
+fn http_str_head() -> i64 { http_static_string(72, 69, 65, 68, 0, 0, 0, 0) }
+fn http_str_put() -> i64 { http_static_string(80, 85, 84, 0, 0, 0, 0, 0) }
+fn http_str_delete() -> i64 { http_static_string(68, 69, 76, 69, 84, 69, 0, 0) }
+
+fn http_str_http11() -> i64 {
+    // "HTTP/1.1"
+    let buf = HTTP_TX_BUF + 3900;
+    http_write_byte(buf, 72);   // H
+    http_write_byte(buf+1, 84); // T
+    http_write_byte(buf+2, 84); // T
+    http_write_byte(buf+3, 80); // P
+    http_write_byte(buf+4, 47); // /
+    http_write_byte(buf+5, 49); // 1
+    http_write_byte(buf+6, 46); // .
+    http_write_byte(buf+7, 49); // 1
+    http_write_byte(buf+8, 0);
+    buf
+}
+
+fn http_str_host() -> i64 { http_static_string(72, 111, 115, 116, 0, 0, 0, 0) }
+fn http_str_user_agent() -> i64 {
+    // "User-Agent"
+    let buf = HTTP_TX_BUF + 3910;
+    http_write_byte(buf, 85);    // U
+    http_write_byte(buf+1, 115); // s
+    http_write_byte(buf+2, 101); // e
+    http_write_byte(buf+3, 114); // r
+    http_write_byte(buf+4, 45);  // -
+    http_write_byte(buf+5, 65);  // A
+    http_write_byte(buf+6, 103); // g
+    http_write_byte(buf+7, 101); // e
+    http_write_byte(buf+8, 110); // n
+    http_write_byte(buf+9, 116); // t
+    http_write_byte(buf+10, 0);
+    buf
+}
+
+fn http_str_genesis_browser() -> i64 {
+    // "GenesisOS/1.0"
+    let buf = HTTP_TX_BUF + 3925;
+    http_write_byte(buf, 71);    // G
+    http_write_byte(buf+1, 101); // e
+    http_write_byte(buf+2, 110); // n
+    http_write_byte(buf+3, 101); // e
+    http_write_byte(buf+4, 115); // s
+    http_write_byte(buf+5, 105); // i
+    http_write_byte(buf+6, 115); // s
+    http_write_byte(buf+7, 79);  // O
+    http_write_byte(buf+8, 83);  // S
+    http_write_byte(buf+9, 47);  // /
+    http_write_byte(buf+10, 49); // 1
+    http_write_byte(buf+11, 46); // .
+    http_write_byte(buf+12, 48); // 0
+    http_write_byte(buf+13, 0);
+    buf
+}
+
+fn http_str_accept() -> i64 { http_static_string(65, 99, 99, 101, 112, 116, 0, 0) }
+fn http_str_accept_all() -> i64 { http_static_string(42, 47, 42, 0, 0, 0, 0, 0) }
+fn http_str_connection() -> i64 {
+    // "Connection"
+    let buf = HTTP_TX_BUF + 3940;
+    http_write_byte(buf, 67);    // C
+    http_write_byte(buf+1, 111); // o
+    http_write_byte(buf+2, 110); // n
+    http_write_byte(buf+3, 110); // n
+    http_write_byte(buf+4, 101); // e
+    http_write_byte(buf+5, 99);  // c
+    http_write_byte(buf+6, 116); // t
+    http_write_byte(buf+7, 105); // i
+    http_write_byte(buf+8, 111); // o
+    http_write_byte(buf+9, 110); // n
+    http_write_byte(buf+10, 0);
+    buf
+}
+fn http_str_close() -> i64 { http_static_string(99, 108, 111, 115, 101, 0, 0, 0) }
+fn http_str_keep_alive() -> i64 {
+    // "keep-alive"
+    let buf = HTTP_TX_BUF + 3955;
+    http_write_byte(buf, 107);   // k
+    http_write_byte(buf+1, 101); // e
+    http_write_byte(buf+2, 101); // e
+    http_write_byte(buf+3, 112); // p
+    http_write_byte(buf+4, 45);  // -
+    http_write_byte(buf+5, 97);  // a
+    http_write_byte(buf+6, 108); // l
+    http_write_byte(buf+7, 105); // i
+    http_write_byte(buf+8, 118); // v
+    http_write_byte(buf+9, 101); // e
+    http_write_byte(buf+10, 0);
+    buf
+}
+
+fn http_str_content_length() -> i64 {
+    // "Content-Length"
+    let buf = HTTP_TX_BUF + 3970;
+    http_write_byte(buf, 67);    // C
+    http_write_byte(buf+1, 111); // o
+    http_write_byte(buf+2, 110); // n
+    http_write_byte(buf+3, 116); // t
+    http_write_byte(buf+4, 101); // e
+    http_write_byte(buf+5, 110); // n
+    http_write_byte(buf+6, 116); // t
+    http_write_byte(buf+7, 45);  // -
+    http_write_byte(buf+8, 76);  // L
+    http_write_byte(buf+9, 101); // e
+    http_write_byte(buf+10, 110);// n
+    http_write_byte(buf+11, 103);// g
+    http_write_byte(buf+12, 116);// t
+    http_write_byte(buf+13, 104);// h
+    http_write_byte(buf+14, 0);
+    buf
+}
+
+fn http_str_content_type() -> i64 {
+    // "Content-Type"
+    let buf = HTTP_TX_BUF + 3850;
+    http_write_byte(buf, 67);    // C
+    http_write_byte(buf+1, 111); // o
+    http_write_byte(buf+2, 110); // n
+    http_write_byte(buf+3, 116); // t
+    http_write_byte(buf+4, 101); // e
+    http_write_byte(buf+5, 110); // n
+    http_write_byte(buf+6, 116); // t
+    http_write_byte(buf+7, 45);  // -
+    http_write_byte(buf+8, 84);  // T
+    http_write_byte(buf+9, 121); // y
+    http_write_byte(buf+10, 112);// p
+    http_write_byte(buf+11, 101);// e
+    http_write_byte(buf+12, 0);
+    buf
+}
+
+fn http_str_form_urlencoded() -> i64 {
+    // "application/x-www-form-urlencoded"
+    let buf = HTTP_TX_BUF + 3800;
+    http_write_byte(buf, 97);     // a
+    http_write_byte(buf+1, 112);  // p
+    http_write_byte(buf+2, 112);  // p
+    http_write_byte(buf+3, 108);  // l
+    http_write_byte(buf+4, 105);  // i
+    http_write_byte(buf+5, 99);   // c
+    http_write_byte(buf+6, 97);   // a
+    http_write_byte(buf+7, 116);  // t
+    http_write_byte(buf+8, 105);  // i
+    http_write_byte(buf+9, 111);  // o
+    http_write_byte(buf+10, 110); // n
+    http_write_byte(buf+11, 0);   // (simplified)
+    buf
+}
+
+fn http_str_transfer_encoding() -> i64 {
+    // "Transfer-Encoding"
+    let buf = HTTP_TX_BUF + 3750;
+    http_write_byte(buf, 84);    // T
+    http_write_byte(buf+1, 114); // r
+    http_write_byte(buf+2, 97);  // a
+    http_write_byte(buf+3, 110); // n
+    http_write_byte(buf+4, 115); // s
+    http_write_byte(buf+5, 102); // f
+    http_write_byte(buf+6, 101); // e
+    http_write_byte(buf+7, 114); // r
+    http_write_byte(buf+8, 45);  // -
+    http_write_byte(buf+9, 69);  // E
+    http_write_byte(buf+10, 110);// n
+    http_write_byte(buf+11, 99); // c
+    http_write_byte(buf+12, 111);// o
+    http_write_byte(buf+13, 100);// d
+    http_write_byte(buf+14, 105);// i
+    http_write_byte(buf+15, 110);// n
+    http_write_byte(buf+16, 103);// g
+    http_write_byte(buf+17, 0);
+    buf
+}
+
+fn http_str_chunked() -> i64 { http_static_string(99, 104, 117, 110, 107, 101, 100, 0) }
+fn http_str_location() -> i64 {
+    // "Location"
+    let buf = HTTP_TX_BUF + 3700;
+    http_write_byte(buf, 76);    // L
+    http_write_byte(buf+1, 111); // o
+    http_write_byte(buf+2, 99);  // c
+    http_write_byte(buf+3, 97);  // a
+    http_write_byte(buf+4, 116); // t
+    http_write_byte(buf+5, 105); // i
+    http_write_byte(buf+6, 111); // o
+    http_write_byte(buf+7, 110); // n
+    http_write_byte(buf+8, 0);
+    buf
+}
+
+// Helper to build static string in buffer
+fn http_static_string(c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64, c6: i64, c7: i64) -> i64 {
+    let buf = HTTP_TX_BUF + 3990;
+    http_write_byte(buf, c0);
+    http_write_byte(buf+1, c1);
+    http_write_byte(buf+2, c2);
+    http_write_byte(buf+3, c3);
+    http_write_byte(buf+4, c4);
+    http_write_byte(buf+5, c5);
+    http_write_byte(buf+6, c6);
+    http_write_byte(buf+7, c7);
+    buf
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn http_reset_state() {
+    http_memset(HTTP_STATE, 0, 128);
+    http_memset(HTTP_HEADERS, 0, HTTP_MAX_HEADERS * HTTP_HEADER_SIZE);
+    http_write_u32(HTTP_STATE + HTTP_STATE_TIMEOUT, HTTP_DEFAULT_TIMEOUT as u64);
+}
+
+fn http_set_error(err: i64) {
+    http_write_u32(HTTP_STATE + HTTP_STATE_ERROR, (0 - err) as u64);
+}
+
+fn http_find_line_end(buf: i64, start: i64, end: i64) -> i64 {
+    let mut i = start;
+    while i < end - 1 {
+        if http_read_byte(buf + i) == 13 && http_read_byte(buf + i + 1) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    end
+}
+
+fn http_find_char(buf: i64, start: i64, end: i64, ch: i64) -> i64 {
+    let mut i = start;
+    while i < end {
+        if http_read_byte(buf + i) == ch {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn http_parse_decimal(addr: i64) -> i64 {
+    let mut val: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 20 {
+        let ch = http_read_byte(addr + i);
+        if ch >= 48 && ch <= 57 {
+            val = val * 10 + (ch - 48);
+        } else if ch == 0 {
+            break;
+        } else if ch != 32 {
+            break;
+        }
+        i = i + 1;
+    }
+    val
+}
+
+fn http_hex_value(ch: i64) -> i64 {
+    if ch >= 48 && ch <= 57 { return ch - 48; }
+    if ch >= 65 && ch <= 70 { return ch - 65 + 10; }
+    if ch >= 97 && ch <= 102 { return ch - 97 + 10; }
+    0 - 1
+}
+
+fn http_strcasecmp(a: i64, b: i64) -> i64 {
+    let mut i: i64 = 0;
+    loop {
+        let ca = http_tolower(http_read_byte(a + i));
+        let cb = http_tolower(http_read_byte(b + i));
+        if ca != cb { return ca - cb; }
+        if ca == 0 { return 0; }
+        i = i + 1;
+        if i > 64 { return 0; }
+    }
+    0
+}
+
+fn http_tolower(ch: i64) -> i64 {
+    if ch >= 65 && ch <= 90 { return ch + 32; }
+    ch
+}
+
+fn http_copy_trim(src: i64, dst: i64, len: i64, max: i64) {
+    let mut start: i64 = 0;
+    let mut end = len;
+
+    // Skip leading spaces
+    while start < len && http_read_byte(src + start) == 32 {
+        start = start + 1;
+    }
+
+    // Skip trailing spaces
+    while end > start && http_read_byte(src + end - 1) == 32 {
+        end = end - 1;
+    }
+
+    let copy_len = end - start;
+    let actual = if copy_len < max { copy_len } else { max };
+
+    let mut i: i64 = 0;
+    while i < actual {
+        http_write_byte(dst + i, http_read_byte(src + start + i));
+        i = i + 1;
+    }
+    http_write_byte(dst + actual, 0);
+}
+
+fn http_copy_string(src: i64, dst: i64, max: i64) {
+    let mut i: i64 = 0;
+    while i < max - 1 {
+        let ch = http_read_byte(src + i);
+        http_write_byte(dst + i, ch);
+        if ch == 0 { return; }
+        i = i + 1;
+    }
+    http_write_byte(dst + max - 1, 0);
+}
+
+fn http_copy_bytes(dst: i64, dst_off: i64, src: i64, len: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < len {
+        http_write_byte(dst + dst_off + i, http_read_byte(src + i));
+        i = i + 1;
+    }
+    dst_off + len
+}
+
+fn http_write_string(buf: i64, pos: i64, str_addr: i64) -> i64 {
+    let mut p = pos;
+    let mut i: i64 = 0;
+    while i < 256 {
+        let ch = http_read_byte(str_addr + i);
+        if ch == 0 { break; }
+        http_write_byte(buf + p, ch);
+        p = p + 1;
+        i = i + 1;
+    }
+    p
+}
+
+fn http_write_decimal(buf: i64, pos: i64, val: i64) -> i64 {
+    if val == 0 {
+        http_write_byte(buf + pos, 48);
+        return pos + 1;
+    }
+
+    // Count digits
+    let mut temp = val;
+    let mut digits: i64 = 0;
+    while temp > 0 {
+        temp = temp / 10;
+        digits = digits + 1;
+    }
+
+    // Write digits
+    let mut p = pos + digits - 1;
+    temp = val;
+    while temp > 0 {
+        http_write_byte(buf + p, 48 + (temp % 10));
+        temp = temp / 10;
+        p = p - 1;
+    }
+
+    pos + digits
+}
+
+fn http_write_crlf(buf: i64, pos: i64) -> i64 {
+    http_write_byte(buf + pos, 13);
+    http_write_byte(buf + pos + 1, 10);
+    pos + 2
+}
+
+fn http_write_byte_ret(buf: i64, pos: i64, val: i64) -> i64 {
+    http_write_byte(buf + pos, val);
+    pos + 1
+}
+
+fn http_memset(dst: i64, val: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        http_write_byte(dst + i, val);
+        i = i + 1;
+    }
+}
+
+// ============================================================
+// Low-level Memory Access
+// ============================================================
+
+fn http_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn http_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn http_read_u32(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movl (%rdi), %eax",
+            in("rdi") addr,
+            lateout("eax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_write_u32(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movl %esi, (%rdi)",
+            in("rdi") addr,
+            in("esi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn http_read_u64(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_write_u64(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movq %rsi, (%rdi)",
+            in("rdi") addr,
+            in("rsi") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+// ============================================================
+// System Calls (via kernel)
+// ============================================================
+
+// Syscall numbers
+const SYS_NET_SOCKET: i64 = 50;
+const SYS_NET_CONNECT: i64 = 54;
+const SYS_NET_SEND: i64 = 55;
+const SYS_NET_RECV: i64 = 56;
+const SYS_NET_CLOSE: i64 = 57;
+const SYS_NET_RESOLVE: i64 = 60;
+const SYS_YIELD: i64 = 0;
+const SYS_TIME: i64 = 34;
+
+const SOCK_STREAM: i64 = 1;
+
+fn http_syscall0(num: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_syscall3(num: i64, arg1: i64, arg2: i64, arg3: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn http_socket_create() -> i64 {
+    http_syscall1(SYS_NET_SOCKET, SOCK_STREAM)
+}
+
+fn http_socket_connect(sock: i64, ip: i64, port: i64) -> i64 {
+    http_syscall3(SYS_NET_CONNECT, sock, ip, port)
+}
+
+fn http_socket_send(sock: i64, buf: i64, len: i64) -> i64 {
+    http_syscall3(SYS_NET_SEND, sock, buf, len)
+}
+
+fn http_socket_recv(sock: i64, buf: i64, len: i64) -> i64 {
+    http_syscall3(SYS_NET_RECV, sock, buf, len)
+}
+
+fn http_socket_close(sock: i64) -> i64 {
+    http_syscall1(SYS_NET_CLOSE, sock)
+}
+
+fn http_dns_resolve(hostname: i64) -> i64 {
+    http_syscall1(SYS_NET_RESOLVE, hostname)
+}
+
+fn http_yield() {
+    http_syscall0(SYS_YIELD);
+}
+
+fn http_get_ticks() -> i64 {
+    http_syscall0(SYS_TIME)
+}

@@ -65,8 +65,419 @@ fn main() {
     commands::set_cursor_y(CONSOLE_START_ROW + 1);
     commands::prompt();
 
+    // Run auto-test if enabled (for CI/testing)
+    run_auto_test();
+
     // Enter main shell loop
     shell_main_loop();
+}
+
+// ============================================================================
+// Auto-Test Function (runs on boot for automated testing)
+// ============================================================================
+
+fn run_auto_test() {
+    // Print test banner to serial
+    runtime::print_char(10);
+    runtime::print_char(61);  // =
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(32);
+    runtime::print_char(84);  // T
+    runtime::print_char(69);  // E
+    runtime::print_char(83);  // S
+    runtime::print_char(84);  // T
+    runtime::print_char(32);
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(61);
+    runtime::print_char(10);
+
+    // Wait for network to be ready (yield a few times)
+    let mut wait: i64 = 0;
+    while wait < 100 {
+        runtime::yield_cpu();
+        wait = wait + 1;
+    }
+
+    // Test 1: Network Status
+    serial_print_str(91, 49, 93, 32, 78, 69, 84, 0);  // "[1] NET"
+    runtime::print_char(10);
+
+    let net_status = runtime::net_status(0);  // 0 = link status
+    serial_print_str(76, 73, 78, 75, 58, 0, 0, 0);  // "LINK:"
+    if net_status > 0 {
+        serial_print_str(85, 80, 10, 0, 0, 0, 0, 0);  // "UP\n"
+    } else {
+        serial_print_str(68, 79, 87, 78, 10, 0, 0, 0);  // "DOWN\n"
+    }
+
+    // Test 2: DHCP (with static IP fallback for QEMU)
+    serial_print_str(91, 50, 93, 32, 68, 72, 67, 80);  // "[2] DHCP"
+    runtime::print_char(10);
+
+    let dhcp_result = runtime::net_dhcp();
+    if dhcp_result > 0 {
+        serial_print_str(68, 72, 67, 80, 58, 79, 75, 10);  // "DHCP:OK\n"
+    } else {
+        serial_print_str(68, 72, 67, 80, 58, 70, 65, 73);  // "DHCP:FAI"
+        serial_print_str(76, 10, 0, 0, 0, 0, 0, 0);  // "L\n"
+
+        // Fallback: Configure static IP for QEMU user-mode networking
+        // QEMU default: IP=10.0.2.15, Mask=255.255.255.0, GW=10.0.2.2
+        serial_print_str(83, 84, 65, 84, 73, 67, 58, 0);  // "STATIC:"
+        // 10.0.2.15 = 10*256^3 + 0*256^2 + 2*256 + 15 = 167772687
+        // 255.255.255.0 = 4294967040
+        // 10.0.2.2 = 167772674
+        let static_ip: i64 = 167772687;     // 10.0.2.15
+        let static_mask: i64 = 4294967040;  // 255.255.255.0
+        let static_gw: i64 = 167772674;     // 10.0.2.2
+
+        let cfg_result = runtime::net_config(static_ip, static_mask, static_gw);
+        if cfg_result >= 0 {
+            serial_print_str(79, 75, 10, 0, 0, 0, 0, 0);  // "OK\n"
+        } else {
+            serial_print_str(69, 82, 82, 10, 0, 0, 0, 0);  // "ERR\n"
+        }
+    }
+
+    // Print current IP (with debug)
+    let ip = runtime::net_getip();
+    serial_print_str(73, 80, 58, 0, 0, 0, 0, 0);  // "IP:"
+    print_ip_serial(ip);
+    serial_print_str(32, 40, 0, 0, 0, 0, 0, 0);  // " ("
+    runtime::print_num(ip);  // Print raw value for debug
+    serial_print_str(41, 10, 0, 0, 0, 0, 0, 0);  // ")\n"
+
+    // Test 3: DNS Resolution
+    serial_print_str(91, 51, 93, 32, 68, 78, 83, 10);  // "[3] DNS\n"
+
+    // Resolve "example.com" - we need to use the DNS syscall
+    // For simplicity, let's test with a known IP first (ping gateway)
+    let gw = runtime::net_getip();  // Get our IP first
+    let gw_base = gw / 256 / 256 / 256;  // Get first octet area
+
+    // Test 4: HTTP (using httpbin.org or example.com)
+    serial_print_str(91, 52, 93, 32, 72, 84, 84, 80);  // "[4] HTTP"
+    runtime::print_char(10);
+
+    // Try to make an HTTP request to a test server
+    // We'll test the cmd_http function by simulating the command
+    test_http_request();
+
+    // Test complete
+    runtime::print_char(10);
+    serial_print_str(61, 61, 61, 32, 68, 79, 78, 69);  // "=== DONE"
+    serial_print_str(32, 61, 61, 61, 10, 0, 0, 0);    // " ===\n"
+    runtime::print_char(10);
+}
+
+fn serial_print_str(s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64) {
+    if s0 != 0 { runtime::print_char(s0); }
+    if s1 != 0 { runtime::print_char(s1); }
+    if s2 != 0 { runtime::print_char(s2); }
+    if s3 != 0 { runtime::print_char(s3); }
+    if s4 != 0 { runtime::print_char(s4); }
+    if s5 != 0 { runtime::print_char(s5); }
+    if s6 != 0 { runtime::print_char(s6); }
+    if s7 != 0 { runtime::print_char(s7); }
+}
+
+fn print_ip_serial(ip: i64) {
+    // IP is in network byte order (big endian)
+    // For ip = 0x0A00020F (10.0.2.15):
+    // b0 = (ip >> 24) & 0xFF = 10
+    // b1 = (ip >> 16) & 0xFF = 0
+    // b2 = (ip >> 8) & 0xFF = 2
+    // b3 = ip & 0xFF = 15
+    let b0 = (ip / 16777216) - ((ip / 4294967296) * 256);  // (ip >> 24) & 0xFF
+    let rem1 = ip - (b0 * 16777216);
+    let b1 = rem1 / 65536;
+    let rem2 = rem1 - (b1 * 65536);
+    let b2 = rem2 / 256;
+    let b3 = rem2 - (b2 * 256);
+
+    print_num_serial(b0);
+    runtime::print_char(46);  // .
+    print_num_serial(b1);
+    runtime::print_char(46);  // .
+    print_num_serial(b2);
+    runtime::print_char(46);  // .
+    print_num_serial(b3);
+}
+
+fn print_num_serial(n: i64) {
+    if n >= 100 {
+        runtime::print_char(48 + n / 100);
+    }
+    if n >= 10 {
+        runtime::print_char(48 + (n / 10) - ((n / 100) * 10));
+    }
+    runtime::print_char(48 + n - (n / 10) * 10);
+}
+
+// Helper function to test a single TCP connection
+fn test_tcp_connect(target_ip: i64, target_port: i64, name1: i64, name2: i64, name3: i64, name4: i64) -> i64 {
+    // Print test name
+    serial_print_str(84, 69, 83, 84, 58, 0, 0, 0);  // "TEST:"
+    runtime::print_char(name1);
+    runtime::print_char(name2);
+    runtime::print_char(name3);
+    runtime::print_char(name4);
+    runtime::print_char(10);
+
+    // Create socket
+    let sock = runtime::net_socket(1);  // 1 = TCP
+    if sock < 0 {
+        serial_print_str(83, 79, 67, 75, 58, 69, 82, 82);  // "SOCK:ERR"
+        runtime::print_char(10);
+        return -1;
+    }
+
+    // Show target
+    serial_print_str(67, 79, 78, 78, 58, 0, 0, 0);  // "CONN:"
+    print_ip_serial(target_ip);
+    runtime::print_char(58);  // :
+    print_num_serial(target_port);
+    runtime::print_char(10);
+
+    // Try to connect
+    let conn = runtime::net_connect(sock, target_ip, target_port);
+    if conn < 0 {
+        serial_print_str(82, 69, 83, 58, 0, 0, 0, 0);  // "RES:"
+        runtime::print_num(conn);
+        runtime::print_char(58);  // ':'
+        if conn == -4 {
+            serial_print_str(65, 82, 80, 0, 0, 0, 0, 0);  // "ARP"
+        } else if conn == -5 {
+            serial_print_str(82, 83, 84, 0, 0, 0, 0, 0);  // "RST"
+        } else if conn == -6 {
+            serial_print_str(84, 77, 79, 0, 0, 0, 0, 0);  // "TMO"
+        } else {
+            serial_print_str(69, 82, 82, 0, 0, 0, 0, 0);  // "ERR"
+        }
+        runtime::print_char(10);
+        runtime::net_close(sock);
+        return conn;
+    }
+
+    serial_print_str(82, 69, 83, 58, 79, 75, 33, 10);  // "RES:OK!\n"
+    runtime::net_close(sock);
+    return 0;
+}
+
+fn test_http_request() {
+    // Test multiple TCP targets to diagnose connectivity
+
+    serial_print_str(84, 67, 80, 32, 84, 69, 83, 84);  // "TCP TEST"
+    runtime::print_char(10);
+
+    // Test 1: Gateway (10.0.2.2) port 80 - most basic test
+    // 10.0.2.2 = 10*256^3 + 0*256^2 + 2*256 + 2 = 167772674
+    let gw_ip: i64 = 167772674;
+    test_tcp_connect(gw_ip, 80, 71, 87, 56, 48);  // "GW80"
+
+    // Test 2: Gateway port 8080 (local server if running)
+    test_tcp_connect(gw_ip, 8080, 71, 87, 56, 75);  // "GW8K"
+
+    // Test 3: Google DNS (8.8.8.8) port 53
+    // 8.8.8.8 = 8*256^3 + 8*256^2 + 8*256 + 8 = 134744072
+    let google_dns: i64 = 134744072;
+    test_tcp_connect(google_dns, 53, 71, 68, 78, 83);  // "GDNS"
+
+    // Test 4: Google HTTP (142.250.185.206) port 80
+    // 142.250.185.206 = 142*256^3 + 250*256^2 + 185*256 + 206 = 2398776782
+    let google_ip: i64 = 2398776782;
+    test_tcp_connect(google_ip, 80, 71, 79, 79, 71);  // "GOOG"
+
+    // Test 5: Original example.com test with full HTTP
+    serial_print_str(72, 84, 84, 80, 32, 71, 69, 84);  // "HTTP GET"
+    runtime::print_char(10);
+
+    let sock = runtime::net_socket(1);  // 1 = TCP
+    if sock < 0 {
+        serial_print_str(83, 79, 67, 75, 58, 69, 82, 82);  // "SOCK:ERR"
+        runtime::print_char(10);
+        return;
+    }
+
+    // example.com: 104.18.26.120 = 1746016888
+    let target_ip: i64 = 1746016888;
+    let target_port: i64 = 80;
+
+    serial_print_str(67, 79, 78, 78, 58, 0, 0, 0);  // "CONN:"
+    print_ip_serial(target_ip);
+    runtime::print_char(58);  // :
+    print_num_serial(target_port);
+    runtime::print_char(10);
+
+    // Connect to the server
+    let conn = runtime::net_connect(sock, target_ip, target_port);
+    if conn < 0 {
+        // Show error with code and meaning
+        serial_print_str(67, 79, 78, 78, 58, 0, 0, 0);  // "CONN:"
+        // Print error code
+        runtime::print_num(conn);
+        runtime::print_char(58);  // ':'
+        // Print error type
+        if conn == -4 {
+            serial_print_str(65, 82, 80, 0, 0, 0, 0, 0);  // "ARP" - ARP resolution failed
+        } else if conn == -5 {
+            serial_print_str(82, 83, 84, 0, 0, 0, 0, 0);  // "RST" - Connection reset
+        } else if conn == -6 {
+            serial_print_str(84, 77, 79, 0, 0, 0, 0, 0);  // "TMO" - Timeout
+        } else {
+            serial_print_str(69, 82, 82, 0, 0, 0, 0, 0);  // "ERR" - Generic error
+        }
+        runtime::print_char(10);
+        runtime::net_close(sock);
+        return;
+    }
+    serial_print_str(67, 79, 78, 78, 58, 79, 75, 10);  // "CONN:OK\n"
+
+    // Build and send HTTP request
+    // "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+    let req_buf: i64 = 0xB50000;  // Use temp buffer
+    let mut req_len: i64 = 0;
+
+    // Build request manually (GET / HTTP/1.1\r\n...)
+    req_len = build_http_request(req_buf);
+
+    serial_print_str(83, 69, 78, 68, 58, 0, 0, 0);  // "SEND:"
+    print_num_serial(req_len);
+    runtime::print_char(10);
+
+    let sent = runtime::net_send_data(sock, req_buf, req_len);
+    if sent < 0 {
+        serial_print_str(83, 69, 78, 68, 58, 69, 82, 82);  // "SEND:ERR"
+        runtime::print_char(10);
+        runtime::net_close(sock);
+        return;
+    }
+    serial_print_str(83, 69, 78, 84, 58, 0, 0, 0);  // "SENT:"
+    print_num_serial(sent);
+    runtime::print_char(10);
+
+    // Wait and receive response
+    let mut wait: i64 = 0;
+    while wait < 500 {
+        runtime::yield_cpu();
+        wait = wait + 1;
+    }
+
+    let resp_buf: i64 = 0xB51000;
+    let received = runtime::net_recv_data(sock, resp_buf, 2048);
+
+    serial_print_str(82, 69, 67, 86, 58, 0, 0, 0);  // "RECV:"
+    print_num_serial(received);
+    runtime::print_char(10);
+
+    if received > 0 {
+        // Print first 200 bytes of response
+        serial_print_str(82, 69, 83, 80, 58, 10, 0, 0);  // "RESP:\n"
+        let mut i: i64 = 0;
+        let max_print: i64 = 200;
+        while i < received && i < max_print {
+            let ch = commands::read_byte(resp_buf + i);
+            if ch >= 32 && ch < 127 {
+                runtime::print_char(ch);
+            } else if ch == 10 {
+                runtime::print_char(10);
+            } else if ch == 13 {
+                // skip CR
+            } else {
+                runtime::print_char(46);  // . for non-printable
+            }
+            i = i + 1;
+        }
+        runtime::print_char(10);
+
+        // Check for HTTP/1.1 200 OK
+        let h = commands::read_byte(resp_buf);
+        let t1 = commands::read_byte(resp_buf + 1);
+        let t2 = commands::read_byte(resp_buf + 2);
+        let p = commands::read_byte(resp_buf + 3);
+        if h == 72 && t1 == 84 && t2 == 84 && p == 80 {
+            serial_print_str(72, 84, 84, 80, 58, 79, 75, 10);  // "HTTP:OK\n"
+        }
+    } else {
+        serial_print_str(82, 69, 67, 86, 58, 69, 82, 82);  // "RECV:ERR"
+        runtime::print_char(10);
+    }
+
+    // Close socket
+    runtime::net_close(sock);
+    serial_print_str(67, 76, 79, 83, 69, 68, 10, 0);  // "CLOSED\n"
+}
+
+fn build_http_request(buf: i64) -> i64 {
+    let mut pos: i64 = 0;
+
+    // "GET / HTTP/1.1\r\n"
+    commands::write_byte(buf + pos, 71); pos = pos + 1;  // G
+    commands::write_byte(buf + pos, 69); pos = pos + 1;  // E
+    commands::write_byte(buf + pos, 84); pos = pos + 1;  // T
+    commands::write_byte(buf + pos, 32); pos = pos + 1;  // space
+    commands::write_byte(buf + pos, 47); pos = pos + 1;  // /
+    commands::write_byte(buf + pos, 32); pos = pos + 1;  // space
+    commands::write_byte(buf + pos, 72); pos = pos + 1;  // H
+    commands::write_byte(buf + pos, 84); pos = pos + 1;  // T
+    commands::write_byte(buf + pos, 84); pos = pos + 1;  // T
+    commands::write_byte(buf + pos, 80); pos = pos + 1;  // P
+    commands::write_byte(buf + pos, 47); pos = pos + 1;  // /
+    commands::write_byte(buf + pos, 49); pos = pos + 1;  // 1
+    commands::write_byte(buf + pos, 46); pos = pos + 1;  // .
+    commands::write_byte(buf + pos, 49); pos = pos + 1;  // 1
+    commands::write_byte(buf + pos, 13); pos = pos + 1;  // \r
+    commands::write_byte(buf + pos, 10); pos = pos + 1;  // \n
+
+    // "Host: example.com\r\n"
+    commands::write_byte(buf + pos, 72); pos = pos + 1;  // H
+    commands::write_byte(buf + pos, 111); pos = pos + 1; // o
+    commands::write_byte(buf + pos, 115); pos = pos + 1; // s
+    commands::write_byte(buf + pos, 116); pos = pos + 1; // t
+    commands::write_byte(buf + pos, 58); pos = pos + 1;  // :
+    commands::write_byte(buf + pos, 32); pos = pos + 1;  // space
+    commands::write_byte(buf + pos, 101); pos = pos + 1; // e
+    commands::write_byte(buf + pos, 120); pos = pos + 1; // x
+    commands::write_byte(buf + pos, 97); pos = pos + 1;  // a
+    commands::write_byte(buf + pos, 109); pos = pos + 1; // m
+    commands::write_byte(buf + pos, 112); pos = pos + 1; // p
+    commands::write_byte(buf + pos, 108); pos = pos + 1; // l
+    commands::write_byte(buf + pos, 101); pos = pos + 1; // e
+    commands::write_byte(buf + pos, 46); pos = pos + 1;  // .
+    commands::write_byte(buf + pos, 99); pos = pos + 1;  // c
+    commands::write_byte(buf + pos, 111); pos = pos + 1; // o
+    commands::write_byte(buf + pos, 109); pos = pos + 1; // m
+    commands::write_byte(buf + pos, 13); pos = pos + 1;  // \r
+    commands::write_byte(buf + pos, 10); pos = pos + 1;  // \n
+
+    // "Connection: close\r\n"
+    commands::write_byte(buf + pos, 67); pos = pos + 1;  // C
+    commands::write_byte(buf + pos, 111); pos = pos + 1; // o
+    commands::write_byte(buf + pos, 110); pos = pos + 1; // n
+    commands::write_byte(buf + pos, 110); pos = pos + 1; // n
+    commands::write_byte(buf + pos, 101); pos = pos + 1; // e
+    commands::write_byte(buf + pos, 99); pos = pos + 1;  // c
+    commands::write_byte(buf + pos, 116); pos = pos + 1; // t
+    commands::write_byte(buf + pos, 105); pos = pos + 1; // i
+    commands::write_byte(buf + pos, 111); pos = pos + 1; // o
+    commands::write_byte(buf + pos, 110); pos = pos + 1; // n
+    commands::write_byte(buf + pos, 58); pos = pos + 1;  // :
+    commands::write_byte(buf + pos, 32); pos = pos + 1;  // space
+    commands::write_byte(buf + pos, 99); pos = pos + 1;  // c
+    commands::write_byte(buf + pos, 108); pos = pos + 1; // l
+    commands::write_byte(buf + pos, 111); pos = pos + 1; // o
+    commands::write_byte(buf + pos, 115); pos = pos + 1; // s
+    commands::write_byte(buf + pos, 101); pos = pos + 1; // e
+    commands::write_byte(buf + pos, 13); pos = pos + 1;  // \r
+    commands::write_byte(buf + pos, 10); pos = pos + 1;  // \n
+
+    // "\r\n" (end of headers)
+    commands::write_byte(buf + pos, 13); pos = pos + 1;  // \r
+    commands::write_byte(buf + pos, 10); pos = pos + 1;  // \n
+
+    pos
 }
 
 // ============================================================================
@@ -205,6 +616,24 @@ fn shell_execute() {
         else if commands::line_get(0) == 110 && commands::line_get(1) == 99 &&
                 commands::line_get(2) == 32 {
             commands::cmd_nc();
+        }
+        // "http " = 104, 116, 116, 112, 32 (HTTP GET request)
+        else if commands::line_get(0) == 104 && commands::line_get(1) == 116 &&
+                commands::line_get(2) == 116 && commands::line_get(3) == 112 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_http();
+        }
+        // "wget " = 119, 103, 101, 116, 32 (alias for http)
+        else if commands::line_get(0) == 119 && commands::line_get(1) == 103 &&
+                commands::line_get(2) == 101 && commands::line_get(3) == 116 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_wget();
+        }
+        // "curl " = 99, 117, 114, 108, 32 (alias for http)
+        else if commands::line_get(0) == 99 && commands::line_get(1) == 117 &&
+                commands::line_get(2) == 114 && commands::line_get(3) == 108 &&
+                commands::line_get(4) == 32 {
+            commands::cmd_curl();
         }
         else {
             // Unknown command

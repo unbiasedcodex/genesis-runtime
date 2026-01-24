@@ -1,0 +1,581 @@
+// Genesis Runtime - URL Parser
+// RFC 3986 compliant URL parsing
+//
+// URL format: scheme://[user:pass@]host[:port]/path[?query][#fragment]
+//
+// Examples:
+//   http://example.com/path
+//   https://example.com:8080/api/v1?key=value
+//   http://user:pass@example.com/
+
+// ============================================================
+// URL Buffer Memory Layout
+// ============================================================
+
+// URL parsing buffers (1KB total)
+const URL_BUF_ADDR: i64 = 0xB43000;         // Raw URL string (256 bytes)
+const URL_SCHEME_ADDR: i64 = 0xB43100;      // Parsed scheme (16 bytes)
+const URL_HOST_ADDR: i64 = 0xB43110;        // Parsed host (128 bytes)
+const URL_PATH_ADDR: i64 = 0xB43190;        // Parsed path (256 bytes)
+const URL_QUERY_ADDR: i64 = 0xB43290;       // Parsed query (128 bytes)
+const URL_FRAGMENT_ADDR: i64 = 0xB43310;    // Parsed fragment (64 bytes)
+const URL_USER_ADDR: i64 = 0xB43350;        // Username (32 bytes)
+const URL_PASS_ADDR: i64 = 0xB43370;        // Password (32 bytes)
+
+// URL state (parsed values)
+const URL_STATE_ADDR: i64 = 0xB43390;
+const URL_STATE_VALID: i64 = 0;             // 1 if valid, 0 if not
+const URL_STATE_PORT: i64 = 4;              // Port number (2 bytes)
+const URL_STATE_HTTPS: i64 = 6;             // 1 if https, 0 if http
+const URL_STATE_HAS_AUTH: i64 = 7;          // 1 if has user/pass
+const URL_STATE_HOST_LEN: i64 = 8;          // Host string length
+const URL_STATE_PATH_LEN: i64 = 10;         // Path string length
+
+// Maximum lengths
+const URL_MAX_LEN: i64 = 256;
+const URL_HOST_MAX: i64 = 128;
+const URL_PATH_MAX: i64 = 256;
+
+// Default ports
+const HTTP_DEFAULT_PORT: i64 = 80;
+const HTTPS_DEFAULT_PORT: i64 = 443;
+
+// ============================================================
+// URL Parser Public API
+// ============================================================
+
+// Parse URL from string
+// url_addr: address of null-terminated URL string
+// Returns: 1 on success, 0 on failure
+pub fn url_parse(url_addr: i64) -> i64 {
+    // Clear state
+    url_clear_state();
+
+    // Copy URL to buffer and get length
+    let url_len = url_copy_input(url_addr);
+    if url_len == 0 || url_len > URL_MAX_LEN {
+        return 0;
+    }
+
+    let mut pos: i64 = 0;
+
+    // Parse scheme (http:// or https://)
+    pos = url_parse_scheme(pos, url_len);
+    if pos < 0 {
+        return 0;
+    }
+
+    // Parse authority (user:pass@host:port)
+    pos = url_parse_authority(pos, url_len);
+    if pos < 0 {
+        return 0;
+    }
+
+    // Parse path
+    pos = url_parse_path(pos, url_len);
+
+    // Parse query (optional)
+    pos = url_parse_query(pos, url_len);
+
+    // Parse fragment (optional)
+    url_parse_fragment(pos, url_len);
+
+    // Mark as valid
+    url_write_byte(URL_STATE_ADDR + URL_STATE_VALID, 1);
+
+    1
+}
+
+// Check if URL is valid
+pub fn url_is_valid() -> i64 {
+    url_read_byte(URL_STATE_ADDR + URL_STATE_VALID)
+}
+
+// Check if URL is HTTPS
+pub fn url_is_https() -> i64 {
+    url_read_byte(URL_STATE_ADDR + URL_STATE_HTTPS)
+}
+
+// Get port number
+pub fn url_get_port() -> i64 {
+    url_read_u16(URL_STATE_ADDR + URL_STATE_PORT) as i64
+}
+
+// Get host address (for reading string)
+pub fn url_get_host_addr() -> i64 {
+    URL_HOST_ADDR
+}
+
+// Get host length
+pub fn url_get_host_len() -> i64 {
+    url_read_u16(URL_STATE_ADDR + URL_STATE_HOST_LEN) as i64
+}
+
+// Get path address
+pub fn url_get_path_addr() -> i64 {
+    URL_PATH_ADDR
+}
+
+// Get path length
+pub fn url_get_path_len() -> i64 {
+    url_read_u16(URL_STATE_ADDR + URL_STATE_PATH_LEN) as i64
+}
+
+// Get query address
+pub fn url_get_query_addr() -> i64 {
+    URL_QUERY_ADDR
+}
+
+// Get fragment address
+pub fn url_get_fragment_addr() -> i64 {
+    URL_FRAGMENT_ADDR
+}
+
+// Check if has authentication
+pub fn url_has_auth() -> i64 {
+    url_read_byte(URL_STATE_ADDR + URL_STATE_HAS_AUTH)
+}
+
+// Get username address
+pub fn url_get_user_addr() -> i64 {
+    URL_USER_ADDR
+}
+
+// Get password address
+pub fn url_get_pass_addr() -> i64 {
+    URL_PASS_ADDR
+}
+
+// ============================================================
+// URL Parsing Implementation
+// ============================================================
+
+// Clear parsing state
+fn url_clear_state() {
+    url_memset(URL_STATE_ADDR, 0, 32);
+    url_memset(URL_SCHEME_ADDR, 0, 16);
+    url_memset(URL_HOST_ADDR, 0, URL_HOST_MAX);
+    url_memset(URL_PATH_ADDR, 0, URL_PATH_MAX);
+    url_memset(URL_QUERY_ADDR, 0, 128);
+    url_memset(URL_FRAGMENT_ADDR, 0, 64);
+    url_memset(URL_USER_ADDR, 0, 32);
+    url_memset(URL_PASS_ADDR, 0, 32);
+}
+
+// Copy URL input and return length
+fn url_copy_input(src: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < URL_MAX_LEN {
+        let ch = url_read_byte(src + i);
+        url_write_byte(URL_BUF_ADDR + i, ch);
+        if ch == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    url_write_byte(URL_BUF_ADDR + URL_MAX_LEN - 1, 0);
+    URL_MAX_LEN - 1
+}
+
+// Parse scheme (http:// or https://)
+// Returns position after "://", or -1 on error
+fn url_parse_scheme(start: i64, len: i64) -> i64 {
+    // Check for "http://" (7 chars) or "https://" (8 chars)
+    let c0 = url_read_byte(URL_BUF_ADDR + start);
+    let c1 = url_read_byte(URL_BUF_ADDR + start + 1);
+    let c2 = url_read_byte(URL_BUF_ADDR + start + 2);
+    let c3 = url_read_byte(URL_BUF_ADDR + start + 3);
+
+    // Check for 'h','t','t','p' (case insensitive)
+    if url_to_lower(c0) != 104 { return 0 - 1; }  // 'h'
+    if url_to_lower(c1) != 116 { return 0 - 1; }  // 't'
+    if url_to_lower(c2) != 116 { return 0 - 1; }  // 't'
+    if url_to_lower(c3) != 112 { return 0 - 1; }  // 'p'
+
+    let c4 = url_read_byte(URL_BUF_ADDR + start + 4);
+
+    if url_to_lower(c4) == 115 {
+        // 's' - HTTPS
+        let c5 = url_read_byte(URL_BUF_ADDR + start + 5);
+        let c6 = url_read_byte(URL_BUF_ADDR + start + 6);
+        let c7 = url_read_byte(URL_BUF_ADDR + start + 7);
+
+        if c5 != 58 || c6 != 47 || c7 != 47 {  // "://"
+            return 0 - 1;
+        }
+
+        // Store "https"
+        url_write_byte(URL_SCHEME_ADDR, 104);
+        url_write_byte(URL_SCHEME_ADDR + 1, 116);
+        url_write_byte(URL_SCHEME_ADDR + 2, 116);
+        url_write_byte(URL_SCHEME_ADDR + 3, 112);
+        url_write_byte(URL_SCHEME_ADDR + 4, 115);
+        url_write_byte(URL_SCHEME_ADDR + 5, 0);
+
+        url_write_byte(URL_STATE_ADDR + URL_STATE_HTTPS, 1);
+        url_write_u16(URL_STATE_ADDR + URL_STATE_PORT, HTTPS_DEFAULT_PORT as u64);
+
+        return start + 8;
+    } else if c4 == 58 {
+        // ':' - HTTP
+        let c5 = url_read_byte(URL_BUF_ADDR + start + 5);
+        let c6 = url_read_byte(URL_BUF_ADDR + start + 6);
+
+        if c5 != 47 || c6 != 47 {  // "//"
+            return 0 - 1;
+        }
+
+        // Store "http"
+        url_write_byte(URL_SCHEME_ADDR, 104);
+        url_write_byte(URL_SCHEME_ADDR + 1, 116);
+        url_write_byte(URL_SCHEME_ADDR + 2, 116);
+        url_write_byte(URL_SCHEME_ADDR + 3, 112);
+        url_write_byte(URL_SCHEME_ADDR + 4, 0);
+
+        url_write_byte(URL_STATE_ADDR + URL_STATE_HTTPS, 0);
+        url_write_u16(URL_STATE_ADDR + URL_STATE_PORT, HTTP_DEFAULT_PORT as u64);
+
+        return start + 7;
+    }
+
+    // No scheme - assume http and no "://"
+    // Try to parse from beginning
+    url_write_byte(URL_SCHEME_ADDR, 104);
+    url_write_byte(URL_SCHEME_ADDR + 1, 116);
+    url_write_byte(URL_SCHEME_ADDR + 2, 116);
+    url_write_byte(URL_SCHEME_ADDR + 3, 112);
+    url_write_byte(URL_SCHEME_ADDR + 4, 0);
+    url_write_byte(URL_STATE_ADDR + URL_STATE_HTTPS, 0);
+    url_write_u16(URL_STATE_ADDR + URL_STATE_PORT, HTTP_DEFAULT_PORT as u64);
+
+    start
+}
+
+// Parse authority: [user:pass@]host[:port]
+// Returns position after authority, or -1 on error
+fn url_parse_authority(start: i64, len: i64) -> i64 {
+    let mut pos = start;
+
+    // Find end of authority (first '/' or '?' or '#' or end)
+    let mut auth_end = pos;
+    while auth_end < len {
+        let ch = url_read_byte(URL_BUF_ADDR + auth_end);
+        if ch == 47 || ch == 63 || ch == 35 || ch == 0 {  // '/', '?', '#'
+            break;
+        }
+        auth_end = auth_end + 1;
+    }
+
+    // Look for '@' (userinfo separator)
+    let mut at_pos: i64 = 0 - 1;
+    let mut i = pos;
+    while i < auth_end {
+        if url_read_byte(URL_BUF_ADDR + i) == 64 {  // '@'
+            at_pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+
+    let mut host_start = pos;
+
+    // Parse userinfo if present
+    if at_pos >= 0 {
+        url_write_byte(URL_STATE_ADDR + URL_STATE_HAS_AUTH, 1);
+
+        // Find ':' in userinfo
+        let mut colon_pos: i64 = 0 - 1;
+        i = pos;
+        while i < at_pos {
+            if url_read_byte(URL_BUF_ADDR + i) == 58 {  // ':'
+                colon_pos = i;
+                break;
+            }
+            i = i + 1;
+        }
+
+        if colon_pos >= 0 {
+            // Copy username
+            url_copy_range(URL_BUF_ADDR + pos, URL_USER_ADDR, colon_pos - pos, 31);
+            // Copy password
+            url_copy_range(URL_BUF_ADDR + colon_pos + 1, URL_PASS_ADDR, at_pos - colon_pos - 1, 31);
+        } else {
+            // Just username
+            url_copy_range(URL_BUF_ADDR + pos, URL_USER_ADDR, at_pos - pos, 31);
+        }
+
+        host_start = at_pos + 1;
+    }
+
+    // Parse host[:port]
+    // Look for ':' (port separator) - but not inside IPv6 brackets
+    let mut colon_pos: i64 = 0 - 1;
+    let mut in_brackets: i64 = 0;
+    i = host_start;
+    while i < auth_end {
+        let ch = url_read_byte(URL_BUF_ADDR + i);
+        if ch == 91 {  // '['
+            in_brackets = 1;
+        } else if ch == 93 {  // ']'
+            in_brackets = 0;
+        } else if ch == 58 && in_brackets == 0 {  // ':'
+            colon_pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+
+    if colon_pos >= 0 {
+        // Has port
+        let host_len = colon_pos - host_start;
+        url_copy_range(URL_BUF_ADDR + host_start, URL_HOST_ADDR, host_len, URL_HOST_MAX - 1);
+        url_write_u16(URL_STATE_ADDR + URL_STATE_HOST_LEN, host_len as u64);
+
+        // Parse port number
+        let port = url_parse_port(colon_pos + 1, auth_end);
+        if port > 0 && port <= 65535 {
+            url_write_u16(URL_STATE_ADDR + URL_STATE_PORT, port as u64);
+        }
+    } else {
+        // No port, just host
+        let host_len = auth_end - host_start;
+        url_copy_range(URL_BUF_ADDR + host_start, URL_HOST_ADDR, host_len, URL_HOST_MAX - 1);
+        url_write_u16(URL_STATE_ADDR + URL_STATE_HOST_LEN, host_len as u64);
+    }
+
+    auth_end
+}
+
+// Parse port number
+fn url_parse_port(start: i64, end: i64) -> i64 {
+    let mut port: i64 = 0;
+    let mut pos = start;
+
+    while pos < end {
+        let ch = url_read_byte(URL_BUF_ADDR + pos);
+        if ch >= 48 && ch <= 57 {
+            port = port * 10 + (ch - 48);
+        } else {
+            break;
+        }
+        pos = pos + 1;
+    }
+
+    port
+}
+
+// Parse path
+fn url_parse_path(start: i64, len: i64) -> i64 {
+    let mut pos = start;
+
+    // If no path, default to "/"
+    if pos >= len || url_read_byte(URL_BUF_ADDR + pos) != 47 {
+        url_write_byte(URL_PATH_ADDR, 47);  // '/'
+        url_write_byte(URL_PATH_ADDR + 1, 0);
+        url_write_u16(URL_STATE_ADDR + URL_STATE_PATH_LEN, 1);
+        return pos;
+    }
+
+    // Find end of path (first '?' or '#' or end)
+    let mut path_end = pos;
+    while path_end < len {
+        let ch = url_read_byte(URL_BUF_ADDR + path_end);
+        if ch == 63 || ch == 35 || ch == 0 {  // '?', '#'
+            break;
+        }
+        path_end = path_end + 1;
+    }
+
+    let path_len = path_end - pos;
+    url_copy_range(URL_BUF_ADDR + pos, URL_PATH_ADDR, path_len, URL_PATH_MAX - 1);
+    url_write_u16(URL_STATE_ADDR + URL_STATE_PATH_LEN, path_len as u64);
+
+    path_end
+}
+
+// Parse query string
+fn url_parse_query(start: i64, len: i64) -> i64 {
+    if start >= len {
+        return start;
+    }
+
+    let ch = url_read_byte(URL_BUF_ADDR + start);
+    if ch != 63 {  // '?'
+        return start;
+    }
+
+    let mut pos = start + 1;
+
+    // Find end of query (first '#' or end)
+    let mut query_end = pos;
+    while query_end < len {
+        let c = url_read_byte(URL_BUF_ADDR + query_end);
+        if c == 35 || c == 0 {  // '#'
+            break;
+        }
+        query_end = query_end + 1;
+    }
+
+    let query_len = query_end - pos;
+    if query_len > 0 {
+        url_copy_range(URL_BUF_ADDR + pos, URL_QUERY_ADDR, query_len, 127);
+    }
+
+    query_end
+}
+
+// Parse fragment
+fn url_parse_fragment(start: i64, len: i64) {
+    if start >= len {
+        return;
+    }
+
+    let ch = url_read_byte(URL_BUF_ADDR + start);
+    if ch != 35 {  // '#'
+        return;
+    }
+
+    let mut pos = start + 1;
+    let mut frag_len: i64 = 0;
+
+    while pos < len && frag_len < 63 {
+        let c = url_read_byte(URL_BUF_ADDR + pos);
+        if c == 0 {
+            break;
+        }
+        url_write_byte(URL_FRAGMENT_ADDR + frag_len, c);
+        frag_len = frag_len + 1;
+        pos = pos + 1;
+    }
+    url_write_byte(URL_FRAGMENT_ADDR + frag_len, 0);
+}
+
+// ============================================================
+// URL Encoding/Decoding
+// ============================================================
+
+// URL-decode a string in place
+// Returns decoded length
+pub fn url_decode(buf: i64, len: i64) -> i64 {
+    let mut read_pos: i64 = 0;
+    let mut write_pos: i64 = 0;
+
+    while read_pos < len {
+        let ch = url_read_byte(buf + read_pos);
+
+        if ch == 37 && read_pos + 2 < len {  // '%'
+            // Hex-encoded character
+            let hi = url_hex_digit(url_read_byte(buf + read_pos + 1));
+            let lo = url_hex_digit(url_read_byte(buf + read_pos + 2));
+            if hi >= 0 && lo >= 0 {
+                url_write_byte(buf + write_pos, hi * 16 + lo);
+                read_pos = read_pos + 3;
+            } else {
+                url_write_byte(buf + write_pos, ch);
+                read_pos = read_pos + 1;
+            }
+        } else if ch == 43 {  // '+' -> space
+            url_write_byte(buf + write_pos, 32);
+            read_pos = read_pos + 1;
+        } else {
+            url_write_byte(buf + write_pos, ch);
+            read_pos = read_pos + 1;
+        }
+
+        write_pos = write_pos + 1;
+    }
+
+    url_write_byte(buf + write_pos, 0);
+    write_pos
+}
+
+// Get hex digit value (-1 if invalid)
+fn url_hex_digit(ch: i64) -> i64 {
+    if ch >= 48 && ch <= 57 {
+        return ch - 48;  // '0'-'9'
+    }
+    if ch >= 65 && ch <= 70 {
+        return ch - 65 + 10;  // 'A'-'F'
+    }
+    if ch >= 97 && ch <= 102 {
+        return ch - 97 + 10;  // 'a'-'f'
+    }
+    0 - 1
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn url_to_lower(ch: i64) -> i64 {
+    if ch >= 65 && ch <= 90 {
+        return ch + 32;
+    }
+    ch
+}
+
+fn url_copy_range(src: i64, dst: i64, len: i64, max_len: i64) {
+    let copy_len = if len < max_len { len } else { max_len };
+    let mut i: i64 = 0;
+    while i < copy_len {
+        url_write_byte(dst + i, url_read_byte(src + i));
+        i = i + 1;
+    }
+    url_write_byte(dst + copy_len, 0);
+}
+
+fn url_memset(dst: i64, val: i64, len: i64) {
+    let mut i: i64 = 0;
+    while i < len {
+        url_write_byte(dst + i, val);
+        i = i + 1;
+    }
+}
+
+fn url_read_byte(addr: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "movzbq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn url_write_byte(addr: i64, value: i64) {
+    unsafe {
+        asm!(
+            "movb %sil, (%rdi)",
+            in("rdi") addr,
+            in("sil") value,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+fn url_read_u16(addr: i64) -> u64 {
+    let mut result: u64 = 0;
+    unsafe {
+        asm!(
+            "movzwq (%rdi), %rax",
+            in("rdi") addr,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn url_write_u16(addr: i64, value: u64) {
+    unsafe {
+        asm!(
+            "movw %si, (%rdi)",
+            in("rdi") addr,
+            in("si") value,
+            options(nostack, att_syntax)
+        );
+    }
+}

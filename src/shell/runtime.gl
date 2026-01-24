@@ -595,10 +595,13 @@ pub fn net_arp_lookup(ip: i64) -> i64 {
 }
 
 // Create network socket
-// sock_type: SOCK_STREAM (TCP) or SOCK_DGRAM (UDP)
+// sock_type: 1=SOCK_STREAM (TCP), 2=SOCK_DGRAM (UDP)
 // Returns: socket ID, or negative error
 pub fn net_socket(sock_type: i64) -> i64 {
-    syscall1(SYS_NET_SOCKET, sock_type)
+    // Socket syscall expects: domain (AF_INET=2), sock_type, protocol (0=default)
+    let domain: i64 = 2;  // AF_INET
+    let protocol: i64 = 0;  // Default protocol
+    syscall3(SYS_NET_SOCKET, domain, sock_type, protocol)
 }
 
 // Bind socket to port
