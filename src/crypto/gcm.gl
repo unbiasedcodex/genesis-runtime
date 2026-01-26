@@ -1,0 +1,433 @@
+// AES-GCM (Galois/Counter Mode) Implementation
+// NIST SP 800-38D compliant authenticated encryption
+
+use super::aes::AesContext;
+
+// ============================================================
+// GCM Constants
+// ============================================================
+
+pub const GCM_TAG_SIZE: usize = 16;
+pub const GCM_NONCE_SIZE: usize = 12;
+
+// ============================================================
+// GCM Context
+// ============================================================
+
+#[repr(C)]
+pub struct GcmContext {
+    aes: AesContext,
+    h: [u8; 16],       // Hash key H = AES_K(0)
+    h_table: [[u8; 16]; 16],  // Precomputed H powers for faster GHASH
+}
+
+impl GcmContext {
+    pub fn new_128(key: &[u8; 16]) -> GcmContext {
+        let aes = AesContext::new_128(key);
+        let mut ctx = GcmContext {
+            aes: aes,
+            h: [0; 16],
+            h_table: [[0; 16]; 16],
+        };
+
+        // Compute H = AES_K(0)
+        let zero_block: [u8; 16] = [0; 16];
+        ctx.h = ctx.aes.encrypt_block(&zero_block);
+
+        // Precompute H table
+        ctx.precompute_h_table();
+
+        ctx
+    }
+
+    pub fn new_256(key: &[u8; 32]) -> GcmContext {
+        let aes = AesContext::new_256(key);
+        let mut ctx = GcmContext {
+            aes: aes,
+            h: [0; 16],
+            h_table: [[0; 16]; 16],
+        };
+
+        let zero_block: [u8; 16] = [0; 16];
+        ctx.h = ctx.aes.encrypt_block(&zero_block);
+        ctx.precompute_h_table();
+
+        ctx
+    }
+
+    fn precompute_h_table(&mut self) {
+        // H^1
+        self.h_table[0] = self.h;
+
+        // Compute H^i for i = 2..16
+        let mut i: usize = 1;
+        while i < 16 {
+            self.h_table[i] = gf128_mul(&self.h_table[i - 1], &self.h);
+            i = i + 1;
+        }
+    }
+
+    // Encrypt and authenticate
+    pub fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, [u8; 16]) {
+        // Generate initial counter block J0
+        let mut j0: [u8; 16] = [0; 16];
+        let mut i: usize = 0;
+        while i < 12 {
+            j0[i] = nonce[i];
+            i = i + 1;
+        }
+        j0[15] = 1;
+
+        // Generate keystream and encrypt
+        let mut ciphertext = Vec::new();
+        let mut counter = inc32(j0);
+
+        let blocks = (plaintext.len() + 15) / 16;
+        let mut block_num: usize = 0;
+
+        while block_num < blocks {
+            let keystream = self.aes.encrypt_block(&counter);
+            counter = inc32(counter);
+
+            let start = block_num * 16;
+            let end = if start + 16 > plaintext.len() { plaintext.len() } else { start + 16 };
+
+            let mut j: usize = 0;
+            while j < end - start {
+                ciphertext.push(plaintext[start + j] ^ keystream[j]);
+                j = j + 1;
+            }
+
+            block_num = block_num + 1;
+        }
+
+        // Compute authentication tag
+        let tag = self.compute_tag(&j0, aad, &ciphertext);
+
+        (ciphertext, tag)
+    }
+
+    // Decrypt and verify
+    pub fn decrypt(&self, nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8], tag: &[u8; 16]) -> Option<Vec<u8>> {
+        // Generate J0
+        let mut j0: [u8; 16] = [0; 16];
+        let mut i: usize = 0;
+        while i < 12 {
+            j0[i] = nonce[i];
+            i = i + 1;
+        }
+        j0[15] = 1;
+
+        // Verify tag first
+        let computed_tag = self.compute_tag(&j0, aad, ciphertext);
+        if !constant_time_compare(&computed_tag, tag) {
+            return None;  // Authentication failed
+        }
+
+        // Decrypt
+        let mut plaintext = Vec::new();
+        let mut counter = inc32(j0);
+
+        let blocks = (ciphertext.len() + 15) / 16;
+        let mut block_num: usize = 0;
+
+        while block_num < blocks {
+            let keystream = self.aes.encrypt_block(&counter);
+            counter = inc32(counter);
+
+            let start = block_num * 16;
+            let end = if start + 16 > ciphertext.len() { ciphertext.len() } else { start + 16 };
+
+            let mut j: usize = 0;
+            while j < end - start {
+                plaintext.push(ciphertext[start + j] ^ keystream[j]);
+                j = j + 1;
+            }
+
+            block_num = block_num + 1;
+        }
+
+        Some(plaintext)
+    }
+
+    // Compute GHASH and tag
+    fn compute_tag(&self, j0: &[u8; 16], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+        let mut s: [u8; 16] = [0; 16];
+
+        // Process AAD
+        let aad_blocks = (aad.len() + 15) / 16;
+        let mut i: usize = 0;
+        while i < aad_blocks {
+            let mut block: [u8; 16] = [0; 16];
+            let start = i * 16;
+            let end = if start + 16 > aad.len() { aad.len() } else { start + 16 };
+
+            let mut j: usize = 0;
+            while j < end - start {
+                block[j] = aad[start + j];
+                j = j + 1;
+            }
+
+            xor_block(&mut s, &block);
+            s = gf128_mul(&s, &self.h);
+
+            i = i + 1;
+        }
+
+        // Process ciphertext
+        let ct_blocks = (ciphertext.len() + 15) / 16;
+        i = 0;
+        while i < ct_blocks {
+            let mut block: [u8; 16] = [0; 16];
+            let start = i * 16;
+            let end = if start + 16 > ciphertext.len() { ciphertext.len() } else { start + 16 };
+
+            let mut j: usize = 0;
+            while j < end - start {
+                block[j] = ciphertext[start + j];
+                j = j + 1;
+            }
+
+            xor_block(&mut s, &block);
+            s = gf128_mul(&s, &self.h);
+
+            i = i + 1;
+        }
+
+        // Append length block: [len(A) || len(C)] in bits
+        let aad_bits = (aad.len() as u64) * 8;
+        let ct_bits = (ciphertext.len() as u64) * 8;
+
+        let mut len_block: [u8; 16] = [0; 16];
+        len_block[0] = (aad_bits >> 56) as u8;
+        len_block[1] = (aad_bits >> 48) as u8;
+        len_block[2] = (aad_bits >> 40) as u8;
+        len_block[3] = (aad_bits >> 32) as u8;
+        len_block[4] = (aad_bits >> 24) as u8;
+        len_block[5] = (aad_bits >> 16) as u8;
+        len_block[6] = (aad_bits >> 8) as u8;
+        len_block[7] = aad_bits as u8;
+        len_block[8] = (ct_bits >> 56) as u8;
+        len_block[9] = (ct_bits >> 48) as u8;
+        len_block[10] = (ct_bits >> 40) as u8;
+        len_block[11] = (ct_bits >> 32) as u8;
+        len_block[12] = (ct_bits >> 24) as u8;
+        len_block[13] = (ct_bits >> 16) as u8;
+        len_block[14] = (ct_bits >> 8) as u8;
+        len_block[15] = ct_bits as u8;
+
+        xor_block(&mut s, &len_block);
+        s = gf128_mul(&s, &self.h);
+
+        // T = GCTR(J0, S)
+        let enc_j0 = self.aes.encrypt_block(j0);
+        xor_block(&mut s, &enc_j0);
+
+        s
+    }
+}
+
+// ============================================================
+// GF(2^128) Multiplication
+// ============================================================
+
+// Multiply two elements in GF(2^128)
+// Using the irreducible polynomial x^128 + x^7 + x^2 + x + 1
+fn gf128_mul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
+    let mut z: [u8; 16] = [0; 16];
+    let mut v = *y;
+
+    let mut i: usize = 0;
+    while i < 16 {
+        let mut j: u8 = 0x80;
+        while j != 0 {
+            if (x[i] & j) != 0 {
+                xor_block(&mut z, &v);
+            }
+
+            // v = v >> 1 (with reduction)
+            let lsb = v[15] & 1;
+            shift_right(&mut v);
+            if lsb != 0 {
+                v[0] = v[0] ^ 0xe1;  // XOR with R (x^7 + x^2 + x + 1)
+            }
+
+            j = j >> 1;
+        }
+        i = i + 1;
+    }
+
+    z
+}
+
+fn xor_block(a: &mut [u8; 16], b: &[u8; 16]) {
+    let mut i: usize = 0;
+    while i < 16 {
+        a[i] = a[i] ^ b[i];
+        i = i + 1;
+    }
+}
+
+fn shift_right(block: &mut [u8; 16]) {
+    let mut carry: u8 = 0;
+    let mut i: usize = 0;
+    while i < 16 {
+        let new_carry = block[i] & 1;
+        block[i] = (block[i] >> 1) | (carry << 7);
+        carry = new_carry;
+        i = i + 1;
+    }
+}
+
+// Increment 32-bit counter (last 4 bytes)
+fn inc32(mut block: [u8; 16]) -> [u8; 16] {
+    let mut i: usize = 15;
+    loop {
+        block[i] = block[i].wrapping_add(1);
+        if block[i] != 0 || i <= 12 {
+            break;
+        }
+        i = i - 1;
+    }
+    block
+}
+
+// Constant-time comparison
+fn constant_time_compare(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    let mut result: u8 = 0;
+    let mut i: usize = 0;
+    while i < 16 {
+        result = result | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    result == 0
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+// Encrypt with AES-128-GCM
+pub fn aes_128_gcm_encrypt(
+    key: &[u8; 16],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8]
+) -> (Vec<u8>, [u8; 16]) {
+    let ctx = GcmContext::new_128(key);
+    ctx.encrypt(nonce, aad, plaintext)
+}
+
+// Decrypt with AES-128-GCM
+pub fn aes_128_gcm_decrypt(
+    key: &[u8; 16],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16]
+) -> Option<Vec<u8>> {
+    let ctx = GcmContext::new_128(key);
+    ctx.decrypt(nonce, aad, ciphertext, tag)
+}
+
+// Encrypt with AES-256-GCM
+pub fn aes_256_gcm_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8]
+) -> (Vec<u8>, [u8; 16]) {
+    let ctx = GcmContext::new_256(key);
+    ctx.encrypt(nonce, aad, plaintext)
+}
+
+// Decrypt with AES-256-GCM
+pub fn aes_256_gcm_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16]
+) -> Option<Vec<u8>> {
+    let ctx = GcmContext::new_256(key);
+    ctx.decrypt(nonce, aad, ciphertext, tag)
+}
+
+// Combined encrypt + append tag
+pub fn aes_gcm_seal(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8]
+) -> Vec<u8> {
+    let (ciphertext, tag) = if key.len() == 16 {
+        let mut k: [u8; 16] = [0; 16];
+        let mut i: usize = 0;
+        while i < 16 {
+            k[i] = key[i];
+            i = i + 1;
+        }
+        aes_128_gcm_encrypt(&k, nonce, aad, plaintext)
+    } else if key.len() == 32 {
+        let mut k: [u8; 32] = [0; 32];
+        let mut i: usize = 0;
+        while i < 32 {
+            k[i] = key[i];
+            i = i + 1;
+        }
+        aes_256_gcm_encrypt(&k, nonce, aad, plaintext)
+    } else {
+        return Vec::new();
+    };
+
+    // Append tag to ciphertext
+    let mut result = ciphertext;
+    let mut i: usize = 0;
+    while i < 16 {
+        result.push(tag[i]);
+        i = i + 1;
+    }
+    result
+}
+
+// Decrypt + verify tag
+pub fn aes_gcm_open(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext_with_tag: &[u8]
+) -> Option<Vec<u8>> {
+    if ciphertext_with_tag.len() < 16 {
+        return None;
+    }
+
+    let ct_len = ciphertext_with_tag.len() - 16;
+    let ciphertext = &ciphertext_with_tag[0..ct_len];
+
+    let mut tag: [u8; 16] = [0; 16];
+    let mut i: usize = 0;
+    while i < 16 {
+        tag[i] = ciphertext_with_tag[ct_len + i];
+        i = i + 1;
+    }
+
+    if key.len() == 16 {
+        let mut k: [u8; 16] = [0; 16];
+        i = 0;
+        while i < 16 {
+            k[i] = key[i];
+            i = i + 1;
+        }
+        aes_128_gcm_decrypt(&k, nonce, aad, ciphertext, &tag)
+    } else if key.len() == 32 {
+        let mut k: [u8; 32] = [0; 32];
+        i = 0;
+        while i < 32 {
+            k[i] = key[i];
+            i = i + 1;
+        }
+        aes_256_gcm_decrypt(&k, nonce, aad, ciphertext, &tag)
+    } else {
+        None
+    }
+}

@@ -1,0 +1,294 @@
+// HMAC Implementation
+// RFC 2104 compliant HMAC for SHA-256 and SHA-384
+
+use super::sha256::{Sha256, Sha512, sha256, sha384};
+
+// ============================================================
+// HMAC-SHA256
+// ============================================================
+
+const BLOCK_SIZE_256: usize = 64;
+const HASH_SIZE_256: usize = 32;
+
+#[repr(C)]
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer_key_pad: [u8; 64],
+}
+
+impl HmacSha256 {
+    pub fn new(key: &[u8]) -> HmacSha256 {
+        let mut hmac = HmacSha256 {
+            inner: Sha256::new(),
+            outer_key_pad: [0; 64],
+        };
+
+        // Process key
+        let mut key_block: [u8; 64] = [0; 64];
+
+        if key.len() > BLOCK_SIZE_256 {
+            // Hash key if too long
+            let key_hash = sha256(key);
+            let mut i: usize = 0;
+            while i < HASH_SIZE_256 {
+                key_block[i] = key_hash[i];
+                i = i + 1;
+            }
+        } else {
+            // Pad key with zeros
+            let mut i: usize = 0;
+            while i < key.len() {
+                key_block[i] = key[i];
+                i = i + 1;
+            }
+        }
+
+        // Create inner and outer padded keys
+        let mut inner_key_pad: [u8; 64] = [0; 64];
+        let mut i: usize = 0;
+        while i < BLOCK_SIZE_256 {
+            inner_key_pad[i] = key_block[i] ^ 0x36;
+            hmac.outer_key_pad[i] = key_block[i] ^ 0x5c;
+            i = i + 1;
+        }
+
+        // Start inner hash with inner key pad
+        hmac.inner.update(&inner_key_pad);
+
+        hmac
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub fn finalize(&mut self) -> [u8; 32] {
+        // Complete inner hash
+        let inner_hash = self.inner.finalize();
+
+        // Compute outer hash
+        let mut outer = Sha256::new();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+        outer.finalize()
+    }
+}
+
+// Convenience function
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hmac = HmacSha256::new(key);
+    hmac.update(data);
+    hmac.finalize()
+}
+
+// ============================================================
+// HMAC-SHA384
+// ============================================================
+
+const BLOCK_SIZE_384: usize = 128;
+const HASH_SIZE_384: usize = 48;
+
+#[repr(C)]
+pub struct HmacSha384 {
+    inner: Sha512,
+    outer_key_pad: [u8; 128],
+}
+
+impl HmacSha384 {
+    pub fn new(key: &[u8]) -> HmacSha384 {
+        let mut hmac = HmacSha384 {
+            inner: Sha512::new_384(),
+            outer_key_pad: [0; 128],
+        };
+
+        let mut key_block: [u8; 128] = [0; 128];
+
+        if key.len() > BLOCK_SIZE_384 {
+            let key_hash = sha384(key);
+            let mut i: usize = 0;
+            while i < HASH_SIZE_384 {
+                key_block[i] = key_hash[i];
+                i = i + 1;
+            }
+        } else {
+            let mut i: usize = 0;
+            while i < key.len() {
+                key_block[i] = key[i];
+                i = i + 1;
+            }
+        }
+
+        let mut inner_key_pad: [u8; 128] = [0; 128];
+        let mut i: usize = 0;
+        while i < BLOCK_SIZE_384 {
+            inner_key_pad[i] = key_block[i] ^ 0x36;
+            hmac.outer_key_pad[i] = key_block[i] ^ 0x5c;
+            i = i + 1;
+        }
+
+        hmac.inner.update(&inner_key_pad);
+        hmac
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    pub fn finalize(&mut self) -> [u8; 48] {
+        let inner_full = self.inner.finalize();
+        let mut inner_hash: [u8; 48] = [0; 48];
+        let mut i: usize = 0;
+        while i < 48 {
+            inner_hash[i] = inner_full[i];
+            i = i + 1;
+        }
+
+        let mut outer = Sha512::new_384();
+        outer.update(&self.outer_key_pad);
+        outer.update(&inner_hash);
+
+        let outer_full = outer.finalize();
+        let mut result: [u8; 48] = [0; 48];
+        i = 0;
+        while i < 48 {
+            result[i] = outer_full[i];
+            i = i + 1;
+        }
+        result
+    }
+}
+
+pub fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; 48] {
+    let mut hmac = HmacSha384::new(key);
+    hmac.update(data);
+    hmac.finalize()
+}
+
+// ============================================================
+// HKDF (HMAC-based Key Derivation Function)
+// RFC 5869
+// ============================================================
+
+// HKDF-Extract using SHA-256
+pub fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    let actual_salt = if salt.len() == 0 {
+        [0u8; 32]
+    } else {
+        let mut s: [u8; 32] = [0; 32];
+        let len = if salt.len() > 32 { 32 } else { salt.len() };
+        let mut i: usize = 0;
+        while i < len {
+            s[i] = salt[i];
+            i = i + 1;
+        }
+        s
+    };
+
+    hmac_sha256(&actual_salt, ikm)
+}
+
+// HKDF-Expand using SHA-256
+pub fn hkdf_expand_sha256(prk: &[u8; 32], info: &[u8], length: usize) -> Vec<u8> {
+    let hash_len = 32;
+    let n = (length + hash_len - 1) / hash_len;
+
+    if n > 255 {
+        return Vec::new();  // Too much output requested
+    }
+
+    let mut output = Vec::new();
+    let mut t: [u8; 32] = [0; 32];
+    let mut t_len: usize = 0;
+
+    let mut i: usize = 1;
+    while i <= n {
+        let mut hmac = HmacSha256::new(prk);
+
+        // T(i) = HMAC-Hash(PRK, T(i-1) | info | i)
+        if t_len > 0 {
+            let mut j: usize = 0;
+            while j < t_len {
+                hmac.update(&[t[j]]);
+                j = j + 1;
+            }
+        }
+        hmac.update(info);
+        hmac.update(&[i as u8]);
+
+        t = hmac.finalize();
+        t_len = 32;
+
+        // Append to output
+        let mut j: usize = 0;
+        while j < hash_len && output.len() < length {
+            output.push(t[j]);
+            j = j + 1;
+        }
+
+        i = i + 1;
+    }
+
+    output
+}
+
+// Full HKDF using SHA-256
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], length: usize) -> Vec<u8> {
+    let prk = hkdf_extract_sha256(salt, ikm);
+    hkdf_expand_sha256(&prk, info, length)
+}
+
+// ============================================================
+// PBKDF2 (Password-Based Key Derivation Function 2)
+// RFC 2898
+// ============================================================
+
+pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
+    let h_len = 32;
+    let l = (dk_len + h_len - 1) / h_len;
+
+    let mut dk = Vec::new();
+
+    let mut block: u32 = 1;
+    while block <= l as u32 {
+        // U_1 = PRF(Password, Salt || INT(i))
+        let mut salt_block = Vec::new();
+        let mut i: usize = 0;
+        while i < salt.len() {
+            salt_block.push(salt[i]);
+            i = i + 1;
+        }
+        salt_block.push((block >> 24) as u8);
+        salt_block.push((block >> 16) as u8);
+        salt_block.push((block >> 8) as u8);
+        salt_block.push(block as u8);
+
+        let mut u = hmac_sha256(password, &salt_block);
+        let mut result = u;
+
+        // U_2 ... U_c
+        let mut iter: u32 = 2;
+        while iter <= iterations {
+            u = hmac_sha256(password, &u);
+
+            // XOR with result
+            let mut j: usize = 0;
+            while j < h_len {
+                result[j] = result[j] ^ u[j];
+                j = j + 1;
+            }
+
+            iter = iter + 1;
+        }
+
+        // Append to derived key
+        let mut j: usize = 0;
+        while j < h_len && dk.len() < dk_len {
+            dk.push(result[j]);
+            j = j + 1;
+        }
+
+        block = block + 1;
+    }
+
+    dk
+}

@@ -1,0 +1,615 @@
+// Flexbox Layout Algorithm
+// CSS Flexible Box Layout Module Level 1
+
+use super::box_model::{LayoutBox, BoxType, BoxDimensions, Rect, ContainingBlock, LayoutContext};
+use super::super::css::{ComputedStyle, Dimension, FlexDirection, FlexWrap};
+use super::super::css::{JustifyContent, AlignItems, AlignContent, AlignSelf};
+
+// ============================================================
+// Flex Item
+// ============================================================
+
+#[derive(Clone, Debug)]
+struct FlexItem {
+    box_index: usize,
+    flex_grow: f64,
+    flex_shrink: f64,
+    flex_basis: f64,
+    min_size: f64,
+    max_size: f64,
+    hypothetical_main_size: f64,
+    target_main_size: f64,
+    cross_size: f64,
+    main_pos: f64,
+    cross_pos: f64,
+    frozen: bool,
+    align_self: AlignSelf,
+}
+
+#[derive(Clone, Debug)]
+struct FlexLine {
+    items: Vec<FlexItem>,
+    main_size: f64,
+    cross_size: f64,
+    cross_pos: f64,
+}
+
+// ============================================================
+// Flex Layout
+// ============================================================
+
+pub fn layout_flex(
+    layout_box: &mut LayoutBox,
+    containing: ContainingBlock,
+    ctx: &LayoutContext,
+) {
+    let style = &layout_box.style;
+    let d = &mut layout_box.dimensions;
+
+    // Calculate container dimensions
+    let width = match style.width {
+        Dimension::Length(w) => w,
+        Dimension::Percentage(p) => containing.width * p / 100.0,
+        _ => containing.width,
+    };
+
+    d.content.width = width;
+    d.content.x = containing.x;
+    d.content.y = containing.y;
+
+    // Get flex properties
+    let direction = style.flex_direction;
+    let wrap = style.flex_wrap;
+    let justify_content = style.justify_content;
+    let align_items = style.align_items;
+    let align_content = style.align_content;
+
+    // Determine main and cross axis sizes
+    let (main_size, cross_size) = match direction {
+        FlexDirection::Row | FlexDirection::RowReverse => (width, 0.0),
+        FlexDirection::Column | FlexDirection::ColumnReverse => (0.0, width),
+    };
+
+    // Step 1: Generate flex items
+    let mut items = generate_flex_items(layout_box, direction, main_size, ctx);
+
+    // Step 2: Determine main size of flex container
+    // (Already done above for now)
+
+    // Step 3: Determine hypothetical main size of each item
+    for item in &mut items {
+        determine_hypothetical_main_size(item, layout_box, direction, main_size);
+    }
+
+    // Step 4: Collect items into flex lines
+    let mut lines = collect_flex_lines(&mut items, main_size, wrap, direction);
+
+    // Step 5: Resolve flexible lengths
+    for line in &mut lines {
+        resolve_flexible_lengths(line, main_size, direction);
+    }
+
+    // Step 6: Determine cross size of each item
+    for line in &mut lines {
+        determine_cross_sizes(line, layout_box, direction, ctx);
+    }
+
+    // Step 7: Determine cross size of each line
+    for line in &mut lines {
+        determine_line_cross_size(line, align_items);
+    }
+
+    // Step 8: Handle align-content
+    let total_cross_size = lines.iter().map(|l| l.cross_size).sum::<f64>();
+    let available_cross = match direction {
+        FlexDirection::Row | FlexDirection::RowReverse => {
+            match style.height {
+                Dimension::Length(h) => h,
+                _ => total_cross_size,
+            }
+        },
+        FlexDirection::Column | FlexDirection::ColumnReverse => width,
+    };
+
+    distribute_cross_space(&mut lines, available_cross, align_content);
+
+    // Step 9: Align items within lines
+    for line in &mut lines {
+        align_items_in_line(line, align_items);
+    }
+
+    // Step 10: Main axis alignment (justify-content)
+    for line in &mut lines {
+        justify_items(line, main_size, justify_content, direction);
+    }
+
+    // Step 11: Position items in container
+    position_items(&mut lines, layout_box, direction);
+
+    // Set container height
+    let height = match style.height {
+        Dimension::Length(h) => h,
+        _ => total_cross_size,
+    };
+
+    match direction {
+        FlexDirection::Row | FlexDirection::RowReverse => {
+            d.content.height = height;
+        },
+        FlexDirection::Column | FlexDirection::ColumnReverse => {
+            d.content.height = lines.iter().map(|l| l.main_size).max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        }
+    }
+}
+
+// ============================================================
+// Step Implementations
+// ============================================================
+
+fn generate_flex_items(
+    layout_box: &LayoutBox,
+    direction: FlexDirection,
+    main_size: f64,
+    ctx: &LayoutContext,
+) -> Vec<FlexItem> {
+    let mut items = Vec::new();
+
+    for (i, child) in layout_box.children.iter().enumerate() {
+        if child.style.display == super::super::css::Display::None {
+            continue;
+        }
+
+        let style = &child.style;
+
+        let flex_basis = match style.flex_basis {
+            Dimension::Length(b) => b,
+            Dimension::Percentage(p) => main_size * p / 100.0,
+            Dimension::Auto => {
+                // Use main size if set, otherwise content size
+                match direction {
+                    FlexDirection::Row | FlexDirection::RowReverse => {
+                        match style.width {
+                            Dimension::Length(w) => w,
+                            Dimension::Percentage(p) => main_size * p / 100.0,
+                            _ => 0.0, // Will be calculated from content
+                        }
+                    },
+                    FlexDirection::Column | FlexDirection::ColumnReverse => {
+                        match style.height {
+                            Dimension::Length(h) => h,
+                            _ => 0.0,
+                        }
+                    }
+                }
+            },
+            _ => 0.0,
+        };
+
+        let min_size = match direction {
+            FlexDirection::Row | FlexDirection::RowReverse => {
+                match style.min_width {
+                    Dimension::Length(w) => w,
+                    _ => 0.0,
+                }
+            },
+            FlexDirection::Column | FlexDirection::ColumnReverse => {
+                match style.min_height {
+                    Dimension::Length(h) => h,
+                    _ => 0.0,
+                }
+            }
+        };
+
+        let max_size = match direction {
+            FlexDirection::Row | FlexDirection::RowReverse => {
+                match style.max_width {
+                    Dimension::Length(w) => w,
+                    _ => f64::INFINITY,
+                }
+            },
+            FlexDirection::Column | FlexDirection::ColumnReverse => {
+                match style.max_height {
+                    Dimension::Length(h) => h,
+                    _ => f64::INFINITY,
+                }
+            }
+        };
+
+        items.push(FlexItem {
+            box_index: i,
+            flex_grow: style.flex_grow,
+            flex_shrink: style.flex_shrink,
+            flex_basis,
+            min_size,
+            max_size,
+            hypothetical_main_size: 0.0,
+            target_main_size: 0.0,
+            cross_size: 0.0,
+            main_pos: 0.0,
+            cross_pos: 0.0,
+            frozen: false,
+            align_self: style.align_self,
+        });
+    }
+
+    items
+}
+
+fn determine_hypothetical_main_size(
+    item: &mut FlexItem,
+    layout_box: &LayoutBox,
+    direction: FlexDirection,
+    main_size: f64,
+) {
+    // Use flex basis, clamped to min/max
+    let size = item.flex_basis
+        .max(item.min_size)
+        .min(item.max_size);
+
+    item.hypothetical_main_size = size;
+    item.target_main_size = size;
+}
+
+fn collect_flex_lines(
+    items: &mut [FlexItem],
+    main_size: f64,
+    wrap: FlexWrap,
+    direction: FlexDirection,
+) -> Vec<FlexLine> {
+    let mut lines = Vec::new();
+    let mut current_line = FlexLine {
+        items: Vec::new(),
+        main_size: 0.0,
+        cross_size: 0.0,
+        cross_pos: 0.0,
+    };
+
+    for item in items {
+        let item_main = item.hypothetical_main_size;
+
+        // Check if wrapping is needed
+        let should_wrap = match wrap {
+            FlexWrap::Nowrap => false,
+            _ => {
+                !current_line.items.is_empty() &&
+                current_line.main_size + item_main > main_size
+            }
+        };
+
+        if should_wrap {
+            lines.push(std::mem::replace(&mut current_line, FlexLine {
+                items: Vec::new(),
+                main_size: 0.0,
+                cross_size: 0.0,
+                cross_pos: 0.0,
+            }));
+        }
+
+        current_line.main_size += item_main;
+        current_line.items.push(item.clone());
+    }
+
+    if !current_line.items.is_empty() {
+        lines.push(current_line);
+    }
+
+    // Reverse lines for wrap-reverse
+    if wrap == FlexWrap::WrapReverse {
+        lines.reverse();
+    }
+
+    lines
+}
+
+fn resolve_flexible_lengths(line: &mut FlexLine, main_size: f64, direction: FlexDirection) {
+    // Calculate free space
+    let mut free_space = main_size - line.main_size;
+
+    if free_space.abs() < 0.001 {
+        return;
+    }
+
+    // Growing or shrinking?
+    let growing = free_space > 0.0;
+
+    // Calculate total flex factor
+    let total_flex: f64 = line.items.iter()
+        .filter(|item| !item.frozen)
+        .map(|item| if growing { item.flex_grow } else { item.flex_shrink })
+        .sum();
+
+    if total_flex == 0.0 {
+        return;
+    }
+
+    // Distribute space
+    for item in &mut line.items {
+        if item.frozen {
+            continue;
+        }
+
+        let flex = if growing { item.flex_grow } else { item.flex_shrink };
+        if flex == 0.0 {
+            continue;
+        }
+
+        let ratio = flex / total_flex;
+        let adjustment = free_space * ratio;
+
+        item.target_main_size = (item.target_main_size + adjustment)
+            .max(item.min_size)
+            .min(item.max_size);
+
+        // Check for violations
+        if item.target_main_size <= item.min_size || item.target_main_size >= item.max_size {
+            item.frozen = true;
+        }
+    }
+
+    // Recalculate line main size
+    line.main_size = line.items.iter().map(|i| i.target_main_size).sum();
+}
+
+fn determine_cross_sizes(
+    line: &mut FlexLine,
+    layout_box: &LayoutBox,
+    direction: FlexDirection,
+    ctx: &LayoutContext,
+) {
+    for item in &mut line.items {
+        let child = &layout_box.children[item.box_index];
+        let style = &child.style;
+
+        // Determine cross size
+        item.cross_size = match direction {
+            FlexDirection::Row | FlexDirection::RowReverse => {
+                match style.height {
+                    Dimension::Length(h) => h,
+                    Dimension::Percentage(p) => {
+                        // Need containing height
+                        0.0
+                    },
+                    _ => {
+                        // Auto height - use content or min-height
+                        style.font_size * 1.5 // Placeholder
+                    }
+                }
+            },
+            FlexDirection::Column | FlexDirection::ColumnReverse => {
+                item.target_main_size // For column, cross size is width
+            }
+        };
+    }
+}
+
+fn determine_line_cross_size(line: &mut FlexLine, align_items: AlignItems) {
+    // Line cross size is max of all item cross sizes
+    line.cross_size = line.items.iter()
+        .map(|i| i.cross_size)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(0.0);
+
+    // Handle stretch
+    if align_items == AlignItems::Stretch {
+        for item in &mut line.items {
+            if item.align_self == AlignSelf::Auto || item.align_self == AlignSelf::Stretch {
+                item.cross_size = line.cross_size;
+            }
+        }
+    }
+}
+
+fn distribute_cross_space(
+    lines: &mut [FlexLine],
+    available_cross: f64,
+    align_content: AlignContent,
+) {
+    let total_cross: f64 = lines.iter().map(|l| l.cross_size).sum();
+    let free_space = available_cross - total_cross;
+
+    if free_space <= 0.0 || lines.is_empty() {
+        // Position lines at start
+        let mut pos = 0.0;
+        for line in lines {
+            line.cross_pos = pos;
+            pos += line.cross_size;
+        }
+        return;
+    }
+
+    match align_content {
+        AlignContent::FlexStart => {
+            let mut pos = 0.0;
+            for line in lines {
+                line.cross_pos = pos;
+                pos += line.cross_size;
+            }
+        },
+        AlignContent::FlexEnd => {
+            let mut pos = free_space;
+            for line in lines {
+                line.cross_pos = pos;
+                pos += line.cross_size;
+            }
+        },
+        AlignContent::Center => {
+            let mut pos = free_space / 2.0;
+            for line in lines {
+                line.cross_pos = pos;
+                pos += line.cross_size;
+            }
+        },
+        AlignContent::SpaceBetween => {
+            let gap = if lines.len() > 1 {
+                free_space / (lines.len() - 1) as f64
+            } else {
+                0.0
+            };
+            let mut pos = 0.0;
+            for line in lines {
+                line.cross_pos = pos;
+                pos += line.cross_size + gap;
+            }
+        },
+        AlignContent::SpaceAround => {
+            let gap = free_space / lines.len() as f64;
+            let mut pos = gap / 2.0;
+            for line in lines {
+                line.cross_pos = pos;
+                pos += line.cross_size + gap;
+            }
+        },
+        AlignContent::Stretch => {
+            let extra_per_line = free_space / lines.len() as f64;
+            let mut pos = 0.0;
+            for line in lines {
+                line.cross_pos = pos;
+                line.cross_size += extra_per_line;
+                pos += line.cross_size;
+            }
+        },
+    }
+}
+
+fn align_items_in_line(line: &mut FlexLine, align_items: AlignItems) {
+    for item in &mut line.items {
+        let effective_align = match item.align_self {
+            AlignSelf::Auto => align_items,
+            AlignSelf::FlexStart => AlignItems::FlexStart,
+            AlignSelf::FlexEnd => AlignItems::FlexEnd,
+            AlignSelf::Center => AlignItems::Center,
+            AlignSelf::Baseline => AlignItems::Baseline,
+            AlignSelf::Stretch => AlignItems::Stretch,
+        };
+
+        item.cross_pos = match effective_align {
+            AlignItems::FlexStart => 0.0,
+            AlignItems::FlexEnd => line.cross_size - item.cross_size,
+            AlignItems::Center => (line.cross_size - item.cross_size) / 2.0,
+            AlignItems::Baseline => 0.0, // Simplified
+            AlignItems::Stretch => {
+                item.cross_size = line.cross_size;
+                0.0
+            },
+        };
+    }
+}
+
+fn justify_items(
+    line: &mut FlexLine,
+    main_size: f64,
+    justify_content: JustifyContent,
+    direction: FlexDirection,
+) {
+    let total_item_size: f64 = line.items.iter().map(|i| i.target_main_size).sum();
+    let free_space = main_size - total_item_size;
+
+    if free_space <= 0.0 {
+        // No free space, position items at start
+        let mut pos = 0.0;
+        for item in &mut line.items {
+            item.main_pos = pos;
+            pos += item.target_main_size;
+        }
+
+        // Reverse for row-reverse/column-reverse
+        if matches!(direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse) {
+            for item in &mut line.items {
+                item.main_pos = main_size - item.main_pos - item.target_main_size;
+            }
+        }
+        return;
+    }
+
+    let num_items = line.items.len();
+
+    match justify_content {
+        JustifyContent::FlexStart => {
+            let mut pos = 0.0;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size;
+            }
+        },
+        JustifyContent::FlexEnd => {
+            let mut pos = free_space;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size;
+            }
+        },
+        JustifyContent::Center => {
+            let mut pos = free_space / 2.0;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size;
+            }
+        },
+        JustifyContent::SpaceBetween => {
+            let gap = if num_items > 1 {
+                free_space / (num_items - 1) as f64
+            } else {
+                0.0
+            };
+            let mut pos = 0.0;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size + gap;
+            }
+        },
+        JustifyContent::SpaceAround => {
+            let gap = free_space / num_items as f64;
+            let mut pos = gap / 2.0;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size + gap;
+            }
+        },
+        JustifyContent::SpaceEvenly => {
+            let gap = free_space / (num_items + 1) as f64;
+            let mut pos = gap;
+            for item in &mut line.items {
+                item.main_pos = pos;
+                pos += item.target_main_size + gap;
+            }
+        },
+    }
+
+    // Reverse for row-reverse/column-reverse
+    if matches!(direction, FlexDirection::RowReverse | FlexDirection::ColumnReverse) {
+        for item in &mut line.items {
+            item.main_pos = main_size - item.main_pos - item.target_main_size;
+        }
+    }
+}
+
+fn position_items(
+    lines: &mut [FlexLine],
+    layout_box: &mut LayoutBox,
+    direction: FlexDirection,
+) {
+    let container_x = layout_box.dimensions.content.x;
+    let container_y = layout_box.dimensions.content.y;
+
+    for line in lines {
+        for item in &line.items {
+            let child = &mut layout_box.children[item.box_index];
+
+            // Position based on direction
+            match direction {
+                FlexDirection::Row | FlexDirection::RowReverse => {
+                    child.dimensions.content.x = container_x + item.main_pos;
+                    child.dimensions.content.y = container_y + line.cross_pos + item.cross_pos;
+                    child.dimensions.content.width = item.target_main_size;
+                    child.dimensions.content.height = item.cross_size;
+                },
+                FlexDirection::Column | FlexDirection::ColumnReverse => {
+                    child.dimensions.content.x = container_x + line.cross_pos + item.cross_pos;
+                    child.dimensions.content.y = container_y + item.main_pos;
+                    child.dimensions.content.width = item.cross_size;
+                    child.dimensions.content.height = item.target_main_size;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,926 @@
+// JavaScript Lexer
+// ECMAScript 2015+ compatible tokenizer
+
+// ============================================================
+// Token Types
+// ============================================================
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Token {
+    // Literals
+    Number(f64),
+    String(String),
+    Boolean(bool),
+    Null,
+    Undefined,
+
+    // Identifiers and Keywords
+    Identifier(String),
+    Keyword(Keyword),
+
+    // Operators - Arithmetic
+    Plus,           // +
+    Minus,          // -
+    Star,           // *
+    Slash,          // /
+    Percent,        // %
+    StarStar,       // **
+
+    // Operators - Assignment
+    Equals,         // =
+    PlusEquals,     // +=
+    MinusEquals,    // -=
+    StarEquals,     // *=
+    SlashEquals,    // /=
+    PercentEquals,  // %=
+
+    // Operators - Comparison
+    EqualsEquals,       // ==
+    EqualsEqualsEquals, // ===
+    BangEquals,         // !=
+    BangEqualsEquals,   // !==
+    Less,               // <
+    LessEquals,         // <=
+    Greater,            // >
+    GreaterEquals,      // >=
+
+    // Operators - Logical
+    AmpAmp,         // &&
+    PipePipe,       // ||
+    Bang,           // !
+    QuestionQuestion, // ??
+
+    // Operators - Bitwise
+    Amp,            // &
+    Pipe,           // |
+    Caret,          // ^
+    Tilde,          // ~
+    LessLess,       // <<
+    GreaterGreater, // >>
+    GreaterGreaterGreater, // >>>
+
+    // Operators - Other
+    PlusPlus,       // ++
+    MinusMinus,     // --
+    Question,       // ?
+    Colon,          // :
+    Dot,            // .
+    DotDotDot,      // ...
+    Arrow,          // =>
+
+    // Punctuation
+    LeftParen,      // (
+    RightParen,     // )
+    LeftBrace,      // {
+    RightBrace,     // }
+    LeftBracket,    // [
+    RightBracket,   // ]
+    Comma,          // ,
+    Semicolon,      // ;
+
+    // Special
+    TemplateLiteral(String),
+    TemplateHead(String),
+    TemplateMiddle(String),
+    TemplateTail(String),
+    RegExp(String, String),  // pattern, flags
+
+    // End of file
+    EOF,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Keyword {
+    // Declarations
+    Var,
+    Let,
+    Const,
+    Function,
+    Class,
+
+    // Control flow
+    If,
+    Else,
+    Switch,
+    Case,
+    Default,
+    For,
+    While,
+    Do,
+    Break,
+    Continue,
+    Return,
+
+    // Exception handling
+    Try,
+    Catch,
+    Finally,
+    Throw,
+
+    // Operators
+    Typeof,
+    Instanceof,
+    In,
+    Delete,
+    Void,
+    New,
+
+    // Values
+    This,
+    Super,
+
+    // Async
+    Async,
+    Await,
+
+    // Modules
+    Import,
+    Export,
+    From,
+    As,
+
+    // Class
+    Extends,
+    Static,
+    Get,
+    Set,
+
+    // Other
+    With,
+    Debugger,
+    Yield,
+    Of,
+}
+
+impl Keyword {
+    pub fn from_str(s: &str) -> Option<Keyword> {
+        match s {
+            "var" => Some(Keyword::Var),
+            "let" => Some(Keyword::Let),
+            "const" => Some(Keyword::Const),
+            "function" => Some(Keyword::Function),
+            "class" => Some(Keyword::Class),
+            "if" => Some(Keyword::If),
+            "else" => Some(Keyword::Else),
+            "switch" => Some(Keyword::Switch),
+            "case" => Some(Keyword::Case),
+            "default" => Some(Keyword::Default),
+            "for" => Some(Keyword::For),
+            "while" => Some(Keyword::While),
+            "do" => Some(Keyword::Do),
+            "break" => Some(Keyword::Break),
+            "continue" => Some(Keyword::Continue),
+            "return" => Some(Keyword::Return),
+            "try" => Some(Keyword::Try),
+            "catch" => Some(Keyword::Catch),
+            "finally" => Some(Keyword::Finally),
+            "throw" => Some(Keyword::Throw),
+            "typeof" => Some(Keyword::Typeof),
+            "instanceof" => Some(Keyword::Instanceof),
+            "in" => Some(Keyword::In),
+            "delete" => Some(Keyword::Delete),
+            "void" => Some(Keyword::Void),
+            "new" => Some(Keyword::New),
+            "this" => Some(Keyword::This),
+            "super" => Some(Keyword::Super),
+            "async" => Some(Keyword::Async),
+            "await" => Some(Keyword::Await),
+            "import" => Some(Keyword::Import),
+            "export" => Some(Keyword::Export),
+            "from" => Some(Keyword::From),
+            "as" => Some(Keyword::As),
+            "extends" => Some(Keyword::Extends),
+            "static" => Some(Keyword::Static),
+            "get" => Some(Keyword::Get),
+            "set" => Some(Keyword::Set),
+            "with" => Some(Keyword::With),
+            "debugger" => Some(Keyword::Debugger),
+            "yield" => Some(Keyword::Yield),
+            "of" => Some(Keyword::Of),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================
+// Lexer
+// ============================================================
+
+pub struct Lexer {
+    input: Vec<char>,
+    pos: usize,
+    line: usize,
+    column: usize,
+}
+
+impl Lexer {
+    pub fn new(input: &str) -> Lexer {
+        Lexer {
+            input: input.chars().collect(),
+            pos: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    pub fn tokenize(&mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+
+        loop {
+            let token = self.next_token();
+            let is_eof = token == Token::EOF;
+            tokens.push(token);
+
+            if is_eof {
+                break;
+            }
+        }
+
+        tokens
+    }
+
+    pub fn next_token(&mut self) -> Token {
+        self.skip_whitespace_and_comments();
+
+        if self.is_eof() {
+            return Token::EOF;
+        }
+
+        let c = self.current();
+
+        // Numbers
+        if c.is_ascii_digit() || (c == '.' && self.peek().map_or(false, |p| p.is_ascii_digit())) {
+            return self.read_number();
+        }
+
+        // Identifiers and Keywords
+        if c.is_alphabetic() || c == '_' || c == '$' {
+            return self.read_identifier();
+        }
+
+        // Strings
+        if c == '"' || c == '\'' {
+            return self.read_string(c);
+        }
+
+        // Template literals
+        if c == '`' {
+            return self.read_template_literal();
+        }
+
+        // Operators and punctuation
+        self.read_operator()
+    }
+
+    // --------------------------------------------------------
+    // Character reading
+    // --------------------------------------------------------
+
+    fn current(&self) -> char {
+        self.input.get(self.pos).copied().unwrap_or('\0')
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.input.get(self.pos + 1).copied()
+    }
+
+    fn peek_n(&self, n: usize) -> Option<char> {
+        self.input.get(self.pos + n).copied()
+    }
+
+    fn advance(&mut self) {
+        if !self.is_eof() {
+            if self.current() == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    // --------------------------------------------------------
+    // Whitespace and comments
+    // --------------------------------------------------------
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            // Skip whitespace
+            while !self.is_eof() && self.current().is_whitespace() {
+                self.advance();
+            }
+
+            if self.is_eof() {
+                break;
+            }
+
+            // Skip single-line comment
+            if self.current() == '/' && self.peek() == Some('/') {
+                self.advance(); // /
+                self.advance(); // /
+                while !self.is_eof() && self.current() != '\n' {
+                    self.advance();
+                }
+                continue;
+            }
+
+            // Skip multi-line comment
+            if self.current() == '/' && self.peek() == Some('*') {
+                self.advance(); // /
+                self.advance(); // *
+                while !self.is_eof() {
+                    if self.current() == '*' && self.peek() == Some('/') {
+                        self.advance(); // *
+                        self.advance(); // /
+                        break;
+                    }
+                    self.advance();
+                }
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Number parsing
+    // --------------------------------------------------------
+
+    fn read_number(&mut self) -> Token {
+        let mut s = String::new();
+        let mut has_dot = false;
+        let mut has_exponent = false;
+
+        // Check for hex, octal, binary
+        if self.current() == '0' {
+            s.push(self.current());
+            self.advance();
+
+            if !self.is_eof() {
+                match self.current() {
+                    'x' | 'X' => {
+                        s.push(self.current());
+                        self.advance();
+                        while !self.is_eof() && self.current().is_ascii_hexdigit() {
+                            s.push(self.current());
+                            self.advance();
+                        }
+                        let value = i64::from_str_radix(&s[2..], 16).unwrap_or(0) as f64;
+                        return Token::Number(value);
+                    },
+                    'o' | 'O' => {
+                        s.push(self.current());
+                        self.advance();
+                        while !self.is_eof() && self.current() >= '0' && self.current() <= '7' {
+                            s.push(self.current());
+                            self.advance();
+                        }
+                        let value = i64::from_str_radix(&s[2..], 8).unwrap_or(0) as f64;
+                        return Token::Number(value);
+                    },
+                    'b' | 'B' => {
+                        s.push(self.current());
+                        self.advance();
+                        while !self.is_eof() && (self.current() == '0' || self.current() == '1') {
+                            s.push(self.current());
+                            self.advance();
+                        }
+                        let value = i64::from_str_radix(&s[2..], 2).unwrap_or(0) as f64;
+                        return Token::Number(value);
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        // Decimal number
+        while !self.is_eof() {
+            let c = self.current();
+
+            if c.is_ascii_digit() {
+                s.push(c);
+                self.advance();
+            } else if c == '.' && !has_dot && !has_exponent {
+                // Check it's not a property access
+                if self.peek().map_or(false, |p| p.is_ascii_digit()) {
+                    has_dot = true;
+                    s.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else if (c == 'e' || c == 'E') && !has_exponent {
+                has_exponent = true;
+                s.push(c);
+                self.advance();
+
+                // Optional sign
+                if !self.is_eof() && (self.current() == '+' || self.current() == '-') {
+                    s.push(self.current());
+                    self.advance();
+                }
+            } else if c == '_' {
+                // Numeric separator (ES2021)
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let value = s.parse::<f64>().unwrap_or(0.0);
+        Token::Number(value)
+    }
+
+    // --------------------------------------------------------
+    // Identifier parsing
+    // --------------------------------------------------------
+
+    fn read_identifier(&mut self) -> Token {
+        let mut s = String::new();
+
+        while !self.is_eof() {
+            let c = self.current();
+            if c.is_alphanumeric() || c == '_' || c == '$' {
+                s.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Check for keywords and reserved values
+        match s.as_str() {
+            "true" => Token::Boolean(true),
+            "false" => Token::Boolean(false),
+            "null" => Token::Null,
+            "undefined" => Token::Undefined,
+            _ => {
+                if let Some(kw) = Keyword::from_str(&s) {
+                    Token::Keyword(kw)
+                } else {
+                    Token::Identifier(s)
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // String parsing
+    // --------------------------------------------------------
+
+    fn read_string(&mut self, quote: char) -> Token {
+        let mut s = String::new();
+        self.advance(); // Opening quote
+
+        while !self.is_eof() && self.current() != quote {
+            if self.current() == '\\' {
+                self.advance();
+                if !self.is_eof() {
+                    s.push(self.read_escape_sequence());
+                }
+            } else {
+                s.push(self.current());
+                self.advance();
+            }
+        }
+
+        if !self.is_eof() {
+            self.advance(); // Closing quote
+        }
+
+        Token::String(s)
+    }
+
+    fn read_escape_sequence(&mut self) -> char {
+        let c = self.current();
+        self.advance();
+
+        match c {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            '`' => '`',
+            '0' => '\0',
+            'x' => {
+                // Hex escape \xNN
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    if !self.is_eof() && self.current().is_ascii_hexdigit() {
+                        hex.push(self.current());
+                        self.advance();
+                    }
+                }
+                u8::from_str_radix(&hex, 16)
+                    .map(|n| n as char)
+                    .unwrap_or('\0')
+            },
+            'u' => {
+                // Unicode escape
+                if self.current() == '{' {
+                    // \u{NNNN} format
+                    self.advance();
+                    let mut hex = String::new();
+                    while !self.is_eof() && self.current() != '}' {
+                        hex.push(self.current());
+                        self.advance();
+                    }
+                    if !self.is_eof() {
+                        self.advance(); // }
+                    }
+                    u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\0')
+                } else {
+                    // \uNNNN format
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if !self.is_eof() && self.current().is_ascii_hexdigit() {
+                            hex.push(self.current());
+                            self.advance();
+                        }
+                    }
+                    u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\0')
+                }
+            },
+            _ => c,
+        }
+    }
+
+    // --------------------------------------------------------
+    // Template literal parsing
+    // --------------------------------------------------------
+
+    fn read_template_literal(&mut self) -> Token {
+        let mut s = String::new();
+        self.advance(); // `
+
+        while !self.is_eof() {
+            let c = self.current();
+
+            if c == '`' {
+                self.advance();
+                return Token::TemplateLiteral(s);
+            } else if c == '\\' {
+                self.advance();
+                if !self.is_eof() {
+                    s.push(self.read_escape_sequence());
+                }
+            } else if c == '$' && self.peek() == Some('{') {
+                self.advance(); // $
+                self.advance(); // {
+                return Token::TemplateHead(s);
+            } else {
+                s.push(c);
+                self.advance();
+            }
+        }
+
+        Token::TemplateLiteral(s)
+    }
+
+    // Continue template after ${...}
+    pub fn continue_template(&mut self) -> Token {
+        let mut s = String::new();
+
+        while !self.is_eof() {
+            let c = self.current();
+
+            if c == '`' {
+                self.advance();
+                return Token::TemplateTail(s);
+            } else if c == '\\' {
+                self.advance();
+                if !self.is_eof() {
+                    s.push(self.read_escape_sequence());
+                }
+            } else if c == '$' && self.peek() == Some('{') {
+                self.advance(); // $
+                self.advance(); // {
+                return Token::TemplateMiddle(s);
+            } else {
+                s.push(c);
+                self.advance();
+            }
+        }
+
+        Token::TemplateTail(s)
+    }
+
+    // --------------------------------------------------------
+    // Operator parsing
+    // --------------------------------------------------------
+
+    fn read_operator(&mut self) -> Token {
+        let c = self.current();
+        self.advance();
+
+        match c {
+            '+' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '+' => { self.advance(); Token::PlusPlus },
+                        '=' => { self.advance(); Token::PlusEquals },
+                        _ => Token::Plus,
+                    }
+                } else {
+                    Token::Plus
+                }
+            },
+            '-' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '-' => { self.advance(); Token::MinusMinus },
+                        '=' => { self.advance(); Token::MinusEquals },
+                        _ => Token::Minus,
+                    }
+                } else {
+                    Token::Minus
+                }
+            },
+            '*' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '*' => { self.advance(); Token::StarStar },
+                        '=' => { self.advance(); Token::StarEquals },
+                        _ => Token::Star,
+                    }
+                } else {
+                    Token::Star
+                }
+            },
+            '/' => {
+                if !self.is_eof() && self.current() == '=' {
+                    self.advance();
+                    Token::SlashEquals
+                } else {
+                    Token::Slash
+                }
+            },
+            '%' => {
+                if !self.is_eof() && self.current() == '=' {
+                    self.advance();
+                    Token::PercentEquals
+                } else {
+                    Token::Percent
+                }
+            },
+            '=' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '=' => {
+                            self.advance();
+                            if !self.is_eof() && self.current() == '=' {
+                                self.advance();
+                                Token::EqualsEqualsEquals
+                            } else {
+                                Token::EqualsEquals
+                            }
+                        },
+                        '>' => { self.advance(); Token::Arrow },
+                        _ => Token::Equals,
+                    }
+                } else {
+                    Token::Equals
+                }
+            },
+            '!' => {
+                if !self.is_eof() && self.current() == '=' {
+                    self.advance();
+                    if !self.is_eof() && self.current() == '=' {
+                        self.advance();
+                        Token::BangEqualsEquals
+                    } else {
+                        Token::BangEquals
+                    }
+                } else {
+                    Token::Bang
+                }
+            },
+            '<' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '=' => { self.advance(); Token::LessEquals },
+                        '<' => { self.advance(); Token::LessLess },
+                        _ => Token::Less,
+                    }
+                } else {
+                    Token::Less
+                }
+            },
+            '>' => {
+                if !self.is_eof() {
+                    match self.current() {
+                        '=' => { self.advance(); Token::GreaterEquals },
+                        '>' => {
+                            self.advance();
+                            if !self.is_eof() && self.current() == '>' {
+                                self.advance();
+                                Token::GreaterGreaterGreater
+                            } else {
+                                Token::GreaterGreater
+                            }
+                        },
+                        _ => Token::Greater,
+                    }
+                } else {
+                    Token::Greater
+                }
+            },
+            '&' => {
+                if !self.is_eof() && self.current() == '&' {
+                    self.advance();
+                    Token::AmpAmp
+                } else {
+                    Token::Amp
+                }
+            },
+            '|' => {
+                if !self.is_eof() && self.current() == '|' {
+                    self.advance();
+                    Token::PipePipe
+                } else {
+                    Token::Pipe
+                }
+            },
+            '?' => {
+                if !self.is_eof() && self.current() == '?' {
+                    self.advance();
+                    Token::QuestionQuestion
+                } else {
+                    Token::Question
+                }
+            },
+            '^' => Token::Caret,
+            '~' => Token::Tilde,
+            ':' => Token::Colon,
+            ';' => Token::Semicolon,
+            ',' => Token::Comma,
+            '.' => {
+                if !self.is_eof() && self.current() == '.' {
+                    self.advance();
+                    if !self.is_eof() && self.current() == '.' {
+                        self.advance();
+                        Token::DotDotDot
+                    } else {
+                        // Unexpected, return single dot
+                        self.pos -= 1;
+                        Token::Dot
+                    }
+                } else {
+                    Token::Dot
+                }
+            },
+            '(' => Token::LeftParen,
+            ')' => Token::RightParen,
+            '{' => Token::LeftBrace,
+            '}' => Token::RightBrace,
+            '[' => Token::LeftBracket,
+            ']' => Token::RightBracket,
+            _ => Token::EOF, // Unknown character
+        }
+    }
+
+    // --------------------------------------------------------
+    // Regular expression parsing (called when context indicates regex)
+    // --------------------------------------------------------
+
+    pub fn read_regexp(&mut self) -> Token {
+        let mut pattern = String::new();
+        let mut flags = String::new();
+
+        // Already consumed opening /
+        while !self.is_eof() {
+            let c = self.current();
+
+            if c == '/' {
+                self.advance();
+                break;
+            } else if c == '\\' {
+                pattern.push(c);
+                self.advance();
+                if !self.is_eof() {
+                    pattern.push(self.current());
+                    self.advance();
+                }
+            } else if c == '[' {
+                // Character class - read until ]
+                pattern.push(c);
+                self.advance();
+                while !self.is_eof() && self.current() != ']' {
+                    if self.current() == '\\' {
+                        pattern.push(self.current());
+                        self.advance();
+                        if !self.is_eof() {
+                            pattern.push(self.current());
+                            self.advance();
+                        }
+                    } else {
+                        pattern.push(self.current());
+                        self.advance();
+                    }
+                }
+                if !self.is_eof() {
+                    pattern.push(self.current());
+                    self.advance();
+                }
+            } else {
+                pattern.push(c);
+                self.advance();
+            }
+        }
+
+        // Read flags
+        while !self.is_eof() {
+            let c = self.current();
+            if c.is_alphabetic() {
+                flags.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Token::RegExp(pattern, flags)
+    }
+
+    // --------------------------------------------------------
+    // Position info
+    // --------------------------------------------------------
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    pub fn column(&self) -> usize {
+        self.column
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_numbers() {
+        let mut lexer = Lexer::new("42 3.14 0xFF 0o77 0b1010 1e10");
+        assert_eq!(lexer.next_token(), Token::Number(42.0));
+        assert_eq!(lexer.next_token(), Token::Number(3.14));
+        assert_eq!(lexer.next_token(), Token::Number(255.0));
+        assert_eq!(lexer.next_token(), Token::Number(63.0));
+        assert_eq!(lexer.next_token(), Token::Number(10.0));
+        assert_eq!(lexer.next_token(), Token::Number(1e10));
+    }
+
+    #[test]
+    fn test_strings() {
+        let mut lexer = Lexer::new(r#""hello" 'world' "line\nbreak""#);
+        assert_eq!(lexer.next_token(), Token::String("hello".to_string()));
+        assert_eq!(lexer.next_token(), Token::String("world".to_string()));
+        assert_eq!(lexer.next_token(), Token::String("line\nbreak".to_string()));
+    }
+
+    #[test]
+    fn test_keywords() {
+        let mut lexer = Lexer::new("let const function if else");
+        assert_eq!(lexer.next_token(), Token::Keyword(Keyword::Let));
+        assert_eq!(lexer.next_token(), Token::Keyword(Keyword::Const));
+        assert_eq!(lexer.next_token(), Token::Keyword(Keyword::Function));
+        assert_eq!(lexer.next_token(), Token::Keyword(Keyword::If));
+        assert_eq!(lexer.next_token(), Token::Keyword(Keyword::Else));
+    }
+
+    #[test]
+    fn test_operators() {
+        let mut lexer = Lexer::new("+ - * / === !== && || =>");
+        assert_eq!(lexer.next_token(), Token::Plus);
+        assert_eq!(lexer.next_token(), Token::Minus);
+        assert_eq!(lexer.next_token(), Token::Star);
+        assert_eq!(lexer.next_token(), Token::Slash);
+        assert_eq!(lexer.next_token(), Token::EqualsEqualsEquals);
+        assert_eq!(lexer.next_token(), Token::BangEqualsEquals);
+        assert_eq!(lexer.next_token(), Token::AmpAmp);
+        assert_eq!(lexer.next_token(), Token::PipePipe);
+        assert_eq!(lexer.next_token(), Token::Arrow);
+    }
+}

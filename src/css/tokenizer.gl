@@ -1,0 +1,648 @@
+// CSS3 Tokenizer
+// W3C CSS Syntax Module Level 3 compliant
+
+// ============================================================
+// Token Types
+// ============================================================
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CssToken {
+    Ident(String),
+    Function(String),       // Function name (includes the '(')
+    AtKeyword(String),      // @keyword
+    Hash(String, HashType), // #identifier or #hex-color
+    String(String),
+    BadString,
+    Url(String),
+    BadUrl,
+    Delim(char),
+    Number(f64, NumericType),
+    Percentage(f64),
+    Dimension(f64, String), // Value and unit
+    Whitespace,
+    CDO,                    // <!--
+    CDC,                    // -->
+    Colon,
+    Semicolon,
+    Comma,
+    OpenBracket,            // [
+    CloseBracket,           // ]
+    OpenParen,              // (
+    CloseParen,             // )
+    OpenBrace,              // {
+    CloseBrace,             // }
+    EOF,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HashType {
+    Id,         // Valid identifier
+    Unrestricted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NumericType {
+    Integer,
+    Number,
+}
+
+impl CssToken {
+    pub fn is_whitespace(&self) -> bool {
+        matches!(self, CssToken::Whitespace)
+    }
+
+    pub fn is_ident(&self) -> bool {
+        matches!(self, CssToken::Ident(_))
+    }
+
+    pub fn as_ident(&self) -> Option<&str> {
+        match self {
+            CssToken::Ident(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            CssToken::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            CssToken::Number(n, _) => Some(*n),
+            CssToken::Percentage(n) => Some(*n),
+            CssToken::Dimension(n, _) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================
+// Tokenizer
+// ============================================================
+
+pub struct CssTokenizer {
+    input: Vec<char>,
+    pos: usize,
+    line: usize,
+    column: usize,
+}
+
+impl CssTokenizer {
+    pub fn new(input: &str) -> CssTokenizer {
+        CssTokenizer {
+            input: input.chars().collect(),
+            pos: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    // Peek at current character
+    fn peek(&self) -> Option<char> {
+        self.input.get(self.pos).copied()
+    }
+
+    // Peek at character at offset
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.input.get(self.pos + offset).copied()
+    }
+
+    // Consume current character
+    fn consume(&mut self) -> Option<char> {
+        if let Some(c) = self.input.get(self.pos).copied() {
+            self.pos += 1;
+            if c == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    // Reconsume (back up one character)
+    fn reconsume(&mut self) {
+        if self.pos > 0 {
+            self.pos -= 1;
+            // Note: line/column tracking not accurate after reconsume
+        }
+    }
+
+    // Check if at end of input
+    fn is_eof(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+
+    // Consume whitespace
+    fn consume_whitespace(&mut self) {
+        while let Some(c) = self.peek() {
+            if is_whitespace(c) {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Get next token
+    pub fn next_token(&mut self) -> CssToken {
+        self.consume_comments();
+
+        match self.peek() {
+            None => CssToken::EOF,
+            Some(c) => {
+                if is_whitespace(c) {
+                    self.consume_whitespace();
+                    return CssToken::Whitespace;
+                }
+
+                match c {
+                    '"' | '\'' => self.consume_string_token(c),
+                    '#' => {
+                        self.consume();
+                        if self.is_ident_char(self.peek()) ||
+                           self.would_start_escape(self.peek(), self.peek_at(1)) {
+                            let hash_type = if self.would_start_identifier() {
+                                HashType::Id
+                            } else {
+                                HashType::Unrestricted
+                            };
+                            let name = self.consume_name();
+                            CssToken::Hash(name, hash_type)
+                        } else {
+                            CssToken::Delim('#')
+                        }
+                    },
+                    '(' => { self.consume(); CssToken::OpenParen },
+                    ')' => { self.consume(); CssToken::CloseParen },
+                    '+' => {
+                        if self.would_start_number() {
+                            self.consume_numeric_token()
+                        } else {
+                            self.consume();
+                            CssToken::Delim('+')
+                        }
+                    },
+                    ',' => { self.consume(); CssToken::Comma },
+                    '-' => {
+                        if self.would_start_number() {
+                            self.consume_numeric_token()
+                        } else if self.peek_at(1) == Some('-') && self.peek_at(2) == Some('>') {
+                            self.consume();
+                            self.consume();
+                            self.consume();
+                            CssToken::CDC
+                        } else if self.would_start_identifier() {
+                            self.consume_ident_like_token()
+                        } else {
+                            self.consume();
+                            CssToken::Delim('-')
+                        }
+                    },
+                    '.' => {
+                        if self.would_start_number() {
+                            self.consume_numeric_token()
+                        } else {
+                            self.consume();
+                            CssToken::Delim('.')
+                        }
+                    },
+                    ':' => { self.consume(); CssToken::Colon },
+                    ';' => { self.consume(); CssToken::Semicolon },
+                    '<' => {
+                        if self.peek_at(1) == Some('!') &&
+                           self.peek_at(2) == Some('-') &&
+                           self.peek_at(3) == Some('-') {
+                            self.consume();
+                            self.consume();
+                            self.consume();
+                            self.consume();
+                            CssToken::CDO
+                        } else {
+                            self.consume();
+                            CssToken::Delim('<')
+                        }
+                    },
+                    '@' => {
+                        self.consume();
+                        if self.would_start_identifier() {
+                            let name = self.consume_name();
+                            CssToken::AtKeyword(name)
+                        } else {
+                            CssToken::Delim('@')
+                        }
+                    },
+                    '[' => { self.consume(); CssToken::OpenBracket },
+                    '\\' => {
+                        if self.would_start_escape(Some('\\'), self.peek_at(1)) {
+                            self.consume_ident_like_token()
+                        } else {
+                            self.consume();
+                            CssToken::Delim('\\')
+                        }
+                    },
+                    ']' => { self.consume(); CssToken::CloseBracket },
+                    '{' => { self.consume(); CssToken::OpenBrace },
+                    '}' => { self.consume(); CssToken::CloseBrace },
+                    '0'..='9' => self.consume_numeric_token(),
+                    _ => {
+                        if is_name_start_char(c) {
+                            self.consume_ident_like_token()
+                        } else {
+                            self.consume();
+                            CssToken::Delim(c)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Consume and discard comments
+    fn consume_comments(&mut self) {
+        while self.peek() == Some('/') && self.peek_at(1) == Some('*') {
+            self.consume(); // /
+            self.consume(); // *
+
+            loop {
+                match self.consume() {
+                    Some('*') if self.peek() == Some('/') => {
+                        self.consume();
+                        break;
+                    },
+                    None => break, // EOF in comment
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    // Consume a string token
+    fn consume_string_token(&mut self, quote: char) -> CssToken {
+        self.consume(); // Opening quote
+        let mut value = String::new();
+
+        loop {
+            match self.consume() {
+                None | Some('\n') => {
+                    // Parse error
+                    return CssToken::BadString;
+                },
+                Some(c) if c == quote => {
+                    return CssToken::String(value);
+                },
+                Some('\\') => {
+                    match self.peek() {
+                        None => continue, // EOF after backslash
+                        Some('\n') => {
+                            self.consume(); // Consume newline
+                        },
+                        _ => {
+                            value.push(self.consume_escaped_char());
+                        }
+                    }
+                },
+                Some(c) => value.push(c),
+            }
+        }
+    }
+
+    // Consume an escaped character
+    fn consume_escaped_char(&mut self) -> char {
+        match self.consume() {
+            None => '\u{FFFD}',
+            Some(c) if is_hex_digit(c) => {
+                let mut hex = String::new();
+                hex.push(c);
+
+                // Consume up to 5 more hex digits
+                for _ in 0..5 {
+                    if let Some(h) = self.peek() {
+                        if is_hex_digit(h) {
+                            hex.push(self.consume().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // Consume optional whitespace
+                if let Some(ws) = self.peek() {
+                    if is_whitespace(ws) {
+                        self.consume();
+                    }
+                }
+
+                // Convert hex to char
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                if code == 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) {
+                    '\u{FFFD}'
+                } else {
+                    char::from_u32(code).unwrap_or('\u{FFFD}')
+                }
+            },
+            Some(c) => c,
+        }
+    }
+
+    // Consume a numeric token
+    fn consume_numeric_token(&mut self) -> CssToken {
+        let (value, num_type) = self.consume_number();
+
+        if self.would_start_identifier() {
+            let unit = self.consume_name();
+            CssToken::Dimension(value, unit)
+        } else if self.peek() == Some('%') {
+            self.consume();
+            CssToken::Percentage(value)
+        } else {
+            CssToken::Number(value, num_type)
+        }
+    }
+
+    // Consume a number
+    fn consume_number(&mut self) -> (f64, NumericType) {
+        let mut repr = String::new();
+        let mut num_type = NumericType::Integer;
+
+        // Sign
+        if let Some(sign) = self.peek() {
+            if sign == '+' || sign == '-' {
+                repr.push(self.consume().unwrap());
+            }
+        }
+
+        // Integer part
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                repr.push(self.consume().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        // Decimal part
+        if self.peek() == Some('.') {
+            if let Some(next) = self.peek_at(1) {
+                if next.is_ascii_digit() {
+                    repr.push(self.consume().unwrap()); // .
+                    num_type = NumericType::Number;
+
+                    while let Some(c) = self.peek() {
+                        if c.is_ascii_digit() {
+                            repr.push(self.consume().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Exponent
+        if let Some(e) = self.peek() {
+            if e == 'e' || e == 'E' {
+                let next = self.peek_at(1);
+                let start_exp = match next {
+                    Some('+') | Some('-') => self.peek_at(2).map(|c| c.is_ascii_digit()).unwrap_or(false),
+                    Some(c) => c.is_ascii_digit(),
+                    None => false,
+                };
+
+                if start_exp {
+                    repr.push(self.consume().unwrap()); // e/E
+                    num_type = NumericType::Number;
+
+                    if let Some(sign) = self.peek() {
+                        if sign == '+' || sign == '-' {
+                            repr.push(self.consume().unwrap());
+                        }
+                    }
+
+                    while let Some(c) = self.peek() {
+                        if c.is_ascii_digit() {
+                            repr.push(self.consume().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let value = repr.parse::<f64>().unwrap_or(0.0);
+        (value, num_type)
+    }
+
+    // Consume an ident-like token
+    fn consume_ident_like_token(&mut self) -> CssToken {
+        let name = self.consume_name();
+
+        if name.to_ascii_lowercase() == "url" && self.peek() == Some('(') {
+            self.consume(); // (
+            self.consume_whitespace();
+
+            // Check for url() vs url("...") or url('...')
+            if let Some(c) = self.peek() {
+                if c == '"' || c == '\'' {
+                    // url() with quoted string
+                    return CssToken::Function(name);
+                }
+            }
+
+            // Unquoted url
+            return self.consume_url_token();
+        }
+
+        if self.peek() == Some('(') {
+            self.consume();
+            CssToken::Function(name)
+        } else {
+            CssToken::Ident(name)
+        }
+    }
+
+    // Consume a URL token
+    fn consume_url_token(&mut self) -> CssToken {
+        let mut value = String::new();
+        self.consume_whitespace();
+
+        loop {
+            match self.consume() {
+                None => return CssToken::Url(value),
+                Some(')') => return CssToken::Url(value),
+                Some(c) if is_whitespace(c) => {
+                    self.consume_whitespace();
+                    match self.peek() {
+                        None | Some(')') => {
+                            if self.peek() == Some(')') {
+                                self.consume();
+                            }
+                            return CssToken::Url(value);
+                        },
+                        _ => return self.consume_bad_url(),
+                    }
+                },
+                Some('"') | Some('\'') | Some('(') => {
+                    return self.consume_bad_url();
+                },
+                Some('\\') => {
+                    if self.would_start_escape(Some('\\'), self.peek()) {
+                        value.push(self.consume_escaped_char());
+                    } else {
+                        return self.consume_bad_url();
+                    }
+                },
+                Some(c) if is_non_printable(c) => {
+                    return self.consume_bad_url();
+                },
+                Some(c) => value.push(c),
+            }
+        }
+    }
+
+    // Consume remnants of a bad URL
+    fn consume_bad_url(&mut self) -> CssToken {
+        loop {
+            match self.consume() {
+                None | Some(')') => return CssToken::BadUrl,
+                Some('\\') => {
+                    if self.would_start_escape(Some('\\'), self.peek()) {
+                        self.consume_escaped_char();
+                    }
+                },
+                _ => continue,
+            }
+        }
+    }
+
+    // Consume a name
+    fn consume_name(&mut self) -> String {
+        let mut name = String::new();
+
+        loop {
+            match self.peek() {
+                Some(c) if is_name_char(c) => {
+                    name.push(self.consume().unwrap());
+                },
+                Some('\\') => {
+                    if self.would_start_escape(Some('\\'), self.peek_at(1)) {
+                        self.consume(); // Backslash
+                        name.push(self.consume_escaped_char());
+                    } else {
+                        break;
+                    }
+                },
+                _ => break,
+            }
+        }
+
+        name
+    }
+
+    // Check if current position would start a number
+    fn would_start_number(&self) -> bool {
+        match self.peek() {
+            Some('+') | Some('-') => {
+                match self.peek_at(1) {
+                    Some(c) if c.is_ascii_digit() => true,
+                    Some('.') => self.peek_at(2).map(|c| c.is_ascii_digit()).unwrap_or(false),
+                    _ => false,
+                }
+            },
+            Some('.') => self.peek_at(1).map(|c| c.is_ascii_digit()).unwrap_or(false),
+            Some(c) => c.is_ascii_digit(),
+            None => false,
+        }
+    }
+
+    // Check if current position would start an identifier
+    fn would_start_identifier(&self) -> bool {
+        match self.peek() {
+            Some('-') => {
+                match self.peek_at(1) {
+                    Some(c) if is_name_start_char(c) => true,
+                    Some('-') => true,
+                    Some('\\') => self.would_start_escape(Some('\\'), self.peek_at(2)),
+                    _ => false,
+                }
+            },
+            Some(c) if is_name_start_char(c) => true,
+            Some('\\') => self.would_start_escape(Some('\\'), self.peek_at(1)),
+            _ => false,
+        }
+    }
+
+    // Check if two characters would start an escape
+    fn would_start_escape(&self, first: Option<char>, second: Option<char>) -> bool {
+        match (first, second) {
+            (Some('\\'), Some('\n')) => false,
+            (Some('\\'), Some(_)) => true,
+            (Some('\\'), None) => false,
+            _ => false,
+        }
+    }
+
+    // Check if character is valid in identifier
+    fn is_ident_char(&self, c: Option<char>) -> bool {
+        c.map(|c| is_name_char(c)).unwrap_or(false)
+    }
+
+    // Tokenize all input
+    pub fn tokenize_all(&mut self) -> Vec<CssToken> {
+        let mut tokens = Vec::new();
+
+        loop {
+            let token = self.next_token();
+            let is_eof = matches!(token, CssToken::EOF);
+            tokens.push(token);
+            if is_eof {
+                break;
+            }
+        }
+
+        tokens
+    }
+}
+
+// ============================================================
+// Character Classification
+// ============================================================
+
+fn is_whitespace(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0C'
+}
+
+fn is_name_start_char(c: char) -> bool {
+    c.is_ascii_alphabetic() || c >= '\u{0080}' || c == '_'
+}
+
+fn is_name_char(c: char) -> bool {
+    is_name_start_char(c) || c.is_ascii_digit() || c == '-'
+}
+
+fn is_hex_digit(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
+fn is_non_printable(c: char) -> bool {
+    (c >= '\u{0000}' && c <= '\u{0008}') ||
+    c == '\u{000B}' ||
+    (c >= '\u{000E}' && c <= '\u{001F}') ||
+    c == '\u{007F}'
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+pub fn tokenize(css: &str) -> Vec<CssToken> {
+    let mut tokenizer = CssTokenizer::new(css);
+    tokenizer.tokenize_all()
+}

@@ -1,0 +1,1009 @@
+// Browser UI Components
+// UI widgets and rendering for the browser interface
+
+use super::tab::Tab;
+use super::super::layout::{Rect, PaintCommand, PaintOperation};
+use super::super::css::Color;
+
+// ============================================================
+// Theme
+// ============================================================
+
+pub struct BrowserTheme {
+    // Colors
+    pub background: Color,
+    pub toolbar_background: Color,
+    pub tab_background: Color,
+    pub tab_active_background: Color,
+    pub tab_hover_background: Color,
+    pub text_color: Color,
+    pub text_secondary: Color,
+    pub border_color: Color,
+    pub accent_color: Color,
+    pub error_color: Color,
+    pub loading_color: Color,
+
+    // Dimensions
+    pub toolbar_height: u32,
+    pub tab_bar_height: u32,
+    pub tab_width: u32,
+    pub button_size: u32,
+    pub padding: u32,
+    pub border_radius: u32,
+    pub font_size: f64,
+}
+
+impl BrowserTheme {
+    pub fn default_light() -> BrowserTheme {
+        BrowserTheme {
+            background: Color::new(255, 255, 255, 1.0),
+            toolbar_background: Color::new(248, 249, 250, 1.0),
+            tab_background: Color::new(222, 226, 230, 1.0),
+            tab_active_background: Color::new(255, 255, 255, 1.0),
+            tab_hover_background: Color::new(233, 236, 239, 1.0),
+            text_color: Color::new(33, 37, 41, 1.0),
+            text_secondary: Color::new(108, 117, 125, 1.0),
+            border_color: Color::new(206, 212, 218, 1.0),
+            accent_color: Color::new(0, 123, 255, 1.0),
+            error_color: Color::new(220, 53, 69, 1.0),
+            loading_color: Color::new(0, 123, 255, 1.0),
+            toolbar_height: 44,
+            tab_bar_height: 36,
+            tab_width: 200,
+            button_size: 32,
+            padding: 8,
+            border_radius: 4,
+            font_size: 14.0,
+        }
+    }
+
+    pub fn default_dark() -> BrowserTheme {
+        BrowserTheme {
+            background: Color::new(30, 30, 30, 1.0),
+            toolbar_background: Color::new(40, 40, 40, 1.0),
+            tab_background: Color::new(50, 50, 50, 1.0),
+            tab_active_background: Color::new(60, 60, 60, 1.0),
+            tab_hover_background: Color::new(55, 55, 55, 1.0),
+            text_color: Color::new(224, 224, 224, 1.0),
+            text_secondary: Color::new(160, 160, 160, 1.0),
+            border_color: Color::new(70, 70, 70, 1.0),
+            accent_color: Color::new(100, 181, 246, 1.0),
+            error_color: Color::new(244, 67, 54, 1.0),
+            loading_color: Color::new(100, 181, 246, 1.0),
+            toolbar_height: 44,
+            tab_bar_height: 36,
+            tab_width: 200,
+            button_size: 32,
+            padding: 8,
+            border_radius: 4,
+            font_size: 14.0,
+        }
+    }
+}
+
+// ============================================================
+// UI Rect Extension
+// ============================================================
+
+pub trait RectExt {
+    fn new_ui(x: i32, y: i32, width: u32, height: u32) -> Self;
+    fn contains_point(&self, x: i32, y: i32) -> bool;
+    fn inset(&self, amount: i32) -> Self;
+}
+
+impl RectExt for UIRect {
+    fn new_ui(x: i32, y: i32, width: u32, height: u32) -> Self {
+        UIRect { x, y, width, height }
+    }
+
+    fn contains_point(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.width as i32 &&
+        py >= self.y && py < self.y + self.height as i32
+    }
+
+    fn inset(&self, amount: i32) -> Self {
+        UIRect {
+            x: self.x + amount,
+            y: self.y + amount,
+            width: (self.width as i32 - amount * 2).max(0) as u32,
+            height: (self.height as i32 - amount * 2).max(0) as u32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UIRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+// ============================================================
+// UI Commands (for rendering)
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub enum UICommand {
+    FillRect {
+        rect: UIRect,
+        color: Color,
+    },
+    StrokeRect {
+        rect: UIRect,
+        color: Color,
+        width: u32,
+    },
+    RoundedRect {
+        rect: UIRect,
+        color: Color,
+        radius: u32,
+    },
+    Text {
+        text: String,
+        x: i32,
+        y: i32,
+        size: f64,
+        color: Color,
+    },
+    Icon {
+        icon: IconType,
+        x: i32,
+        y: i32,
+        size: u32,
+        color: Color,
+    },
+    Line {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        color: Color,
+        width: u32,
+    },
+    Clip {
+        rect: UIRect,
+    },
+    UnClip,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum IconType {
+    Back,
+    Forward,
+    Reload,
+    Stop,
+    Home,
+    Menu,
+    Close,
+    NewTab,
+    Settings,
+    Bookmark,
+    Download,
+    Lock,
+    LockOpen,
+    Search,
+    Error,
+    Loading,
+}
+
+// ============================================================
+// Tab Bar
+// ============================================================
+
+pub struct TabBar {
+    pub tabs: Vec<TabInfo>,
+    pub active_tab: usize,
+    pub bounds: UIRect,
+    pub scroll_offset: i32,
+    pub new_tab_button_bounds: UIRect,
+}
+
+pub struct TabInfo {
+    pub id: u64,
+    pub title: String,
+    pub favicon: Option<Vec<u8>>,
+    pub is_loading: bool,
+    pub bounds: UIRect,
+    pub close_button_bounds: UIRect,
+}
+
+impl TabBar {
+    pub fn new() -> TabBar {
+        TabBar {
+            tabs: Vec::new(),
+            active_tab: 0,
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            scroll_offset: 0,
+            new_tab_button_bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+        }
+    }
+
+    pub fn layout(&mut self, x: i32, y: i32, width: u32, height: u32, theme: &BrowserTheme) {
+        self.bounds = UIRect { x, y, width, height };
+
+        let tab_padding = theme.padding as i32;
+        let tab_width = theme.tab_width.min((width - 40) / self.tabs.len().max(1) as u32);
+        let tab_height = height - 4;
+
+        let mut tab_x = x + tab_padding - self.scroll_offset;
+
+        for tab in &mut self.tabs {
+            tab.bounds = UIRect {
+                x: tab_x,
+                y: y + 2,
+                width: tab_width,
+                height: tab_height,
+            };
+
+            // Close button in top-right of tab
+            tab.close_button_bounds = UIRect {
+                x: tab_x + tab_width as i32 - 24,
+                y: y + 6,
+                width: 18,
+                height: 18,
+            };
+
+            tab_x += tab_width as i32 + 2;
+        }
+
+        // New tab button
+        self.new_tab_button_bounds = UIRect {
+            x: tab_x + 4,
+            y: y + 6,
+            width: 24,
+            height: 24,
+        };
+    }
+
+    pub fn render(&self, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        // Tab bar background
+        commands.push(UICommand::FillRect {
+            rect: self.bounds,
+            color: theme.toolbar_background,
+        });
+
+        // Border bottom
+        commands.push(UICommand::Line {
+            x1: self.bounds.x,
+            y1: self.bounds.y + self.bounds.height as i32,
+            x2: self.bounds.x + self.bounds.width as i32,
+            y2: self.bounds.y + self.bounds.height as i32,
+            color: theme.border_color,
+            width: 1,
+        });
+
+        // Render tabs
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let is_active = i == self.active_tab;
+
+            let bg_color = if is_active {
+                theme.tab_active_background
+            } else {
+                theme.tab_background
+            };
+
+            // Tab background
+            commands.push(UICommand::RoundedRect {
+                rect: tab.bounds,
+                color: bg_color,
+                radius: theme.border_radius,
+            });
+
+            // Loading indicator or favicon
+            let icon_x = tab.bounds.x + 8;
+            let icon_y = tab.bounds.y + (tab.bounds.height as i32 - 16) / 2;
+
+            if tab.is_loading {
+                commands.push(UICommand::Icon {
+                    icon: IconType::Loading,
+                    x: icon_x,
+                    y: icon_y,
+                    size: 16,
+                    color: theme.loading_color,
+                });
+            }
+
+            // Tab title
+            let title = truncate_text(&tab.title, (tab.bounds.width - 50) as usize / 8);
+            commands.push(UICommand::Text {
+                text: title,
+                x: icon_x + 20,
+                y: tab.bounds.y + (tab.bounds.height as i32 + theme.font_size as i32) / 2 - 2,
+                size: theme.font_size,
+                color: theme.text_color,
+            });
+
+            // Close button
+            commands.push(UICommand::Icon {
+                icon: IconType::Close,
+                x: tab.close_button_bounds.x + 2,
+                y: tab.close_button_bounds.y + 2,
+                size: 14,
+                color: theme.text_secondary,
+            });
+        }
+
+        // New tab button
+        commands.push(UICommand::Icon {
+            icon: IconType::NewTab,
+            x: self.new_tab_button_bounds.x + 4,
+            y: self.new_tab_button_bounds.y + 4,
+            size: 16,
+            color: theme.text_secondary,
+        });
+
+        commands
+    }
+
+    pub fn hit_test(&self, x: i32, y: i32) -> TabBarHitResult {
+        // Check new tab button
+        if self.new_tab_button_bounds.contains_point(x, y) {
+            return TabBarHitResult::NewTab;
+        }
+
+        // Check tabs
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if tab.bounds.contains_point(x, y) {
+                if tab.close_button_bounds.contains_point(x, y) {
+                    return TabBarHitResult::CloseTab(i);
+                }
+                return TabBarHitResult::Tab(i);
+            }
+        }
+
+        TabBarHitResult::None
+    }
+}
+
+pub enum TabBarHitResult {
+    None,
+    Tab(usize),
+    CloseTab(usize),
+    NewTab,
+}
+
+// ============================================================
+// Toolbar
+// ============================================================
+
+pub struct Toolbar {
+    pub bounds: UIRect,
+    pub back_button: UIRect,
+    pub forward_button: UIRect,
+    pub reload_button: UIRect,
+    pub home_button: UIRect,
+    pub address_bar: AddressBar,
+    pub menu_button: UIRect,
+}
+
+impl Toolbar {
+    pub fn new() -> Toolbar {
+        Toolbar {
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            back_button: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            forward_button: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            reload_button: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            home_button: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            address_bar: AddressBar::new(),
+            menu_button: UIRect { x: 0, y: 0, width: 0, height: 0 },
+        }
+    }
+
+    pub fn layout(&mut self, x: i32, y: i32, width: u32, height: u32, theme: &BrowserTheme) {
+        self.bounds = UIRect { x, y, width, height };
+
+        let button_size = theme.button_size as i32;
+        let padding = theme.padding as i32;
+        let button_y = y + (height as i32 - button_size) / 2;
+
+        let mut current_x = x + padding;
+
+        // Back button
+        self.back_button = UIRect {
+            x: current_x,
+            y: button_y,
+            width: theme.button_size,
+            height: theme.button_size,
+        };
+        current_x += button_size + 4;
+
+        // Forward button
+        self.forward_button = UIRect {
+            x: current_x,
+            y: button_y,
+            width: theme.button_size,
+            height: theme.button_size,
+        };
+        current_x += button_size + 4;
+
+        // Reload button
+        self.reload_button = UIRect {
+            x: current_x,
+            y: button_y,
+            width: theme.button_size,
+            height: theme.button_size,
+        };
+        current_x += button_size + 4;
+
+        // Home button
+        self.home_button = UIRect {
+            x: current_x,
+            y: button_y,
+            width: theme.button_size,
+            height: theme.button_size,
+        };
+        current_x += button_size + padding;
+
+        // Menu button (right side)
+        self.menu_button = UIRect {
+            x: x + width as i32 - button_size - padding,
+            y: button_y,
+            width: theme.button_size,
+            height: theme.button_size,
+        };
+
+        // Address bar (fills remaining space)
+        let address_bar_width = (width as i32 - current_x - button_size - padding * 2) as u32;
+        self.address_bar.layout(
+            current_x,
+            button_y,
+            address_bar_width,
+            theme.button_size,
+            theme,
+        );
+    }
+
+    pub fn render(&self, can_go_back: bool, can_go_forward: bool, is_loading: bool, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        // Toolbar background
+        commands.push(UICommand::FillRect {
+            rect: self.bounds,
+            color: theme.toolbar_background,
+        });
+
+        // Border bottom
+        commands.push(UICommand::Line {
+            x1: self.bounds.x,
+            y1: self.bounds.y + self.bounds.height as i32,
+            x2: self.bounds.x + self.bounds.width as i32,
+            y2: self.bounds.y + self.bounds.height as i32,
+            color: theme.border_color,
+            width: 1,
+        });
+
+        // Navigation buttons
+        let back_color = if can_go_back { theme.text_color } else { theme.text_secondary };
+        commands.push(UICommand::Icon {
+            icon: IconType::Back,
+            x: self.back_button.x + 8,
+            y: self.back_button.y + 8,
+            size: 16,
+            color: back_color,
+        });
+
+        let forward_color = if can_go_forward { theme.text_color } else { theme.text_secondary };
+        commands.push(UICommand::Icon {
+            icon: IconType::Forward,
+            x: self.forward_button.x + 8,
+            y: self.forward_button.y + 8,
+            size: 16,
+            color: forward_color,
+        });
+
+        let reload_icon = if is_loading { IconType::Stop } else { IconType::Reload };
+        commands.push(UICommand::Icon {
+            icon: reload_icon,
+            x: self.reload_button.x + 8,
+            y: self.reload_button.y + 8,
+            size: 16,
+            color: theme.text_color,
+        });
+
+        commands.push(UICommand::Icon {
+            icon: IconType::Home,
+            x: self.home_button.x + 8,
+            y: self.home_button.y + 8,
+            size: 16,
+            color: theme.text_color,
+        });
+
+        // Address bar
+        commands.extend(self.address_bar.render(theme));
+
+        // Menu button
+        commands.push(UICommand::Icon {
+            icon: IconType::Menu,
+            x: self.menu_button.x + 8,
+            y: self.menu_button.y + 8,
+            size: 16,
+            color: theme.text_color,
+        });
+
+        commands
+    }
+
+    pub fn hit_test(&self, x: i32, y: i32) -> ToolbarHitResult {
+        if self.back_button.contains_point(x, y) {
+            return ToolbarHitResult::Back;
+        }
+        if self.forward_button.contains_point(x, y) {
+            return ToolbarHitResult::Forward;
+        }
+        if self.reload_button.contains_point(x, y) {
+            return ToolbarHitResult::Reload;
+        }
+        if self.home_button.contains_point(x, y) {
+            return ToolbarHitResult::Home;
+        }
+        if self.address_bar.bounds.contains_point(x, y) {
+            return ToolbarHitResult::AddressBar;
+        }
+        if self.menu_button.contains_point(x, y) {
+            return ToolbarHitResult::Menu;
+        }
+        ToolbarHitResult::None
+    }
+}
+
+pub enum ToolbarHitResult {
+    None,
+    Back,
+    Forward,
+    Reload,
+    Home,
+    AddressBar,
+    Menu,
+}
+
+// ============================================================
+// Address Bar
+// ============================================================
+
+pub struct AddressBar {
+    pub bounds: UIRect,
+    pub text: String,
+    pub cursor_position: usize,
+    pub selection_start: Option<usize>,
+    pub is_focused: bool,
+    pub is_secure: bool,
+}
+
+impl AddressBar {
+    pub fn new() -> AddressBar {
+        AddressBar {
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            text: String::new(),
+            cursor_position: 0,
+            selection_start: None,
+            is_focused: false,
+            is_secure: false,
+        }
+    }
+
+    pub fn layout(&mut self, x: i32, y: i32, width: u32, height: u32, _theme: &BrowserTheme) {
+        self.bounds = UIRect { x, y, width, height };
+    }
+
+    pub fn render(&self, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        // Background
+        let bg_color = if self.is_focused {
+            theme.background
+        } else {
+            Color::new(
+                ((theme.toolbar_background.r as u16 + theme.background.r as u16) / 2) as u8,
+                ((theme.toolbar_background.g as u16 + theme.background.g as u16) / 2) as u8,
+                ((theme.toolbar_background.b as u16 + theme.background.b as u16) / 2) as u8,
+                1.0,
+            )
+        };
+
+        commands.push(UICommand::RoundedRect {
+            rect: self.bounds,
+            color: bg_color,
+            radius: theme.border_radius,
+        });
+
+        // Border
+        commands.push(UICommand::StrokeRect {
+            rect: self.bounds,
+            color: if self.is_focused { theme.accent_color } else { theme.border_color },
+            width: 1,
+        });
+
+        // Security icon
+        let icon_x = self.bounds.x + 8;
+        let icon_y = self.bounds.y + (self.bounds.height as i32 - 16) / 2;
+
+        if !self.text.is_empty() {
+            let icon = if self.is_secure { IconType::Lock } else { IconType::LockOpen };
+            let icon_color = if self.is_secure { Color::new(40, 167, 69, 1.0) } else { theme.text_secondary };
+            commands.push(UICommand::Icon {
+                icon,
+                x: icon_x,
+                y: icon_y,
+                size: 16,
+                color: icon_color,
+            });
+        }
+
+        // Text
+        let text_x = icon_x + 24;
+        let text_y = self.bounds.y + (self.bounds.height as i32 + theme.font_size as i32) / 2 - 2;
+
+        let display_text = if self.text.is_empty() && !self.is_focused {
+            "Search or enter address".to_string()
+        } else {
+            self.text.clone()
+        };
+
+        let text_color = if self.text.is_empty() && !self.is_focused {
+            theme.text_secondary
+        } else {
+            theme.text_color
+        };
+
+        commands.push(UICommand::Text {
+            text: display_text,
+            x: text_x,
+            y: text_y,
+            size: theme.font_size,
+            color: text_color,
+        });
+
+        // Cursor (when focused)
+        if self.is_focused {
+            let cursor_x = text_x + (self.cursor_position as f64 * theme.font_size * 0.5) as i32;
+            commands.push(UICommand::Line {
+                x1: cursor_x,
+                y1: self.bounds.y + 6,
+                x2: cursor_x,
+                y2: self.bounds.y + self.bounds.height as i32 - 6,
+                color: theme.text_color,
+                width: 1,
+            });
+        }
+
+        commands
+    }
+
+    pub fn set_url(&mut self, url: &str) {
+        self.text = url.to_string();
+        self.cursor_position = url.len();
+        self.is_secure = url.starts_with("https://");
+    }
+
+    pub fn get_url(&self) -> &str {
+        &self.text
+    }
+
+    pub fn handle_key(&mut self, key: char) {
+        match key {
+            '\x08' => {
+                // Backspace
+                if self.cursor_position > 0 {
+                    self.cursor_position -= 1;
+                    self.text.remove(self.cursor_position);
+                }
+            },
+            '\x7f' => {
+                // Delete
+                if self.cursor_position < self.text.len() {
+                    self.text.remove(self.cursor_position);
+                }
+            },
+            _ if key >= ' ' => {
+                self.text.insert(self.cursor_position, key);
+                self.cursor_position += 1;
+            },
+            _ => {}
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        let new_pos = self.cursor_position as i32 + delta;
+        self.cursor_position = (new_pos.max(0) as usize).min(self.text.len());
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection_start = Some(0);
+        self.cursor_position = self.text.len();
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor_position = 0;
+        self.selection_start = None;
+    }
+}
+
+// ============================================================
+// Loading Bar
+// ============================================================
+
+pub struct LoadingBar {
+    pub bounds: UIRect,
+    pub progress: f32,
+    pub is_visible: bool,
+}
+
+impl LoadingBar {
+    pub fn new() -> LoadingBar {
+        LoadingBar {
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            progress: 0.0,
+            is_visible: false,
+        }
+    }
+
+    pub fn layout(&mut self, x: i32, y: i32, width: u32) {
+        self.bounds = UIRect { x, y, width, height: 3 };
+    }
+
+    pub fn render(&self, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        if self.is_visible {
+            // Background
+            commands.push(UICommand::FillRect {
+                rect: self.bounds,
+                color: theme.border_color,
+            });
+
+            // Progress
+            let progress_width = (self.bounds.width as f32 * self.progress) as u32;
+            commands.push(UICommand::FillRect {
+                rect: UIRect {
+                    x: self.bounds.x,
+                    y: self.bounds.y,
+                    width: progress_width,
+                    height: self.bounds.height,
+                },
+                color: theme.loading_color,
+            });
+        }
+
+        commands
+    }
+}
+
+// ============================================================
+// Status Bar
+// ============================================================
+
+pub struct StatusBar {
+    pub bounds: UIRect,
+    pub text: String,
+    pub is_visible: bool,
+}
+
+impl StatusBar {
+    pub fn new() -> StatusBar {
+        StatusBar {
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            text: String::new(),
+            is_visible: false,
+        }
+    }
+
+    pub fn layout(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        self.bounds = UIRect { x, y, width, height };
+    }
+
+    pub fn render(&self, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        if self.is_visible && !self.text.is_empty() {
+            // Background
+            commands.push(UICommand::FillRect {
+                rect: self.bounds,
+                color: theme.toolbar_background,
+            });
+
+            // Border
+            commands.push(UICommand::Line {
+                x1: self.bounds.x,
+                y1: self.bounds.y,
+                x2: self.bounds.x + self.bounds.width as i32,
+                y2: self.bounds.y,
+                color: theme.border_color,
+                width: 1,
+            });
+
+            // Text
+            let truncated = truncate_text(&self.text, (self.bounds.width / 8) as usize);
+            commands.push(UICommand::Text {
+                text: truncated,
+                x: self.bounds.x + theme.padding as i32,
+                y: self.bounds.y + (self.bounds.height as i32 + theme.font_size as i32) / 2 - 2,
+                size: theme.font_size * 0.9,
+                color: theme.text_secondary,
+            });
+        }
+
+        commands
+    }
+
+    pub fn show(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.is_visible = true;
+    }
+
+    pub fn hide(&mut self) {
+        self.is_visible = false;
+    }
+}
+
+// ============================================================
+// Context Menu
+// ============================================================
+
+pub struct ContextMenu {
+    pub bounds: UIRect,
+    pub items: Vec<MenuItem>,
+    pub is_visible: bool,
+    pub selected_index: Option<usize>,
+}
+
+pub struct MenuItem {
+    pub label: String,
+    pub shortcut: Option<String>,
+    pub enabled: bool,
+    pub separator: bool,
+    pub bounds: UIRect,
+}
+
+impl ContextMenu {
+    pub fn new() -> ContextMenu {
+        ContextMenu {
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            items: Vec::new(),
+            is_visible: false,
+            selected_index: None,
+        }
+    }
+
+    pub fn show(&mut self, x: i32, y: i32, items: Vec<MenuItem>, theme: &BrowserTheme) {
+        self.items = items;
+        self.is_visible = true;
+        self.selected_index = None;
+
+        let item_height = 28;
+        let padding = theme.padding as i32;
+        let max_width = self.items.iter()
+            .map(|i| i.label.len() + i.shortcut.as_ref().map(|s| s.len() + 4).unwrap_or(0))
+            .max()
+            .unwrap_or(10) as u32 * 8 + padding as u32 * 4;
+
+        let height = (self.items.len() as u32 * item_height as u32) + padding as u32 * 2;
+
+        self.bounds = UIRect {
+            x,
+            y,
+            width: max_width.max(150),
+            height,
+        };
+
+        // Layout items
+        let mut item_y = y + padding;
+        for item in &mut self.items {
+            item.bounds = UIRect {
+                x: x + padding,
+                y: item_y,
+                width: self.bounds.width - padding as u32 * 2,
+                height: item_height as u32,
+            };
+            item_y += item_height;
+        }
+    }
+
+    pub fn hide(&mut self) {
+        self.is_visible = false;
+    }
+
+    pub fn render(&self, theme: &BrowserTheme) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        if !self.is_visible {
+            return commands;
+        }
+
+        // Background
+        commands.push(UICommand::RoundedRect {
+            rect: self.bounds,
+            color: theme.toolbar_background,
+            radius: theme.border_radius,
+        });
+
+        // Border
+        commands.push(UICommand::StrokeRect {
+            rect: self.bounds,
+            color: theme.border_color,
+            width: 1,
+        });
+
+        // Items
+        for (i, item) in self.items.iter().enumerate() {
+            if item.separator {
+                commands.push(UICommand::Line {
+                    x1: item.bounds.x,
+                    y1: item.bounds.y + item.bounds.height as i32 / 2,
+                    x2: item.bounds.x + item.bounds.width as i32,
+                    y2: item.bounds.y + item.bounds.height as i32 / 2,
+                    color: theme.border_color,
+                    width: 1,
+                });
+                continue;
+            }
+
+            // Highlight selected
+            if self.selected_index == Some(i) {
+                commands.push(UICommand::FillRect {
+                    rect: item.bounds,
+                    color: theme.accent_color,
+                });
+            }
+
+            let text_color = if item.enabled {
+                if self.selected_index == Some(i) { theme.background } else { theme.text_color }
+            } else {
+                theme.text_secondary
+            };
+
+            // Label
+            commands.push(UICommand::Text {
+                text: item.label.clone(),
+                x: item.bounds.x + 8,
+                y: item.bounds.y + (item.bounds.height as i32 + theme.font_size as i32) / 2 - 2,
+                size: theme.font_size,
+                color: text_color,
+            });
+
+            // Shortcut
+            if let Some(ref shortcut) = item.shortcut {
+                commands.push(UICommand::Text {
+                    text: shortcut.clone(),
+                    x: item.bounds.x + item.bounds.width as i32 - shortcut.len() as i32 * 8 - 8,
+                    y: item.bounds.y + (item.bounds.height as i32 + theme.font_size as i32) / 2 - 2,
+                    size: theme.font_size * 0.9,
+                    color: if self.selected_index == Some(i) { theme.background } else { theme.text_secondary },
+                });
+            }
+        }
+
+        commands
+    }
+
+    pub fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.is_visible || !self.bounds.contains_point(x, y) {
+            return None;
+        }
+
+        for (i, item) in self.items.iter().enumerate() {
+            if item.bounds.contains_point(x, y) && !item.separator && item.enabled {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        text.to_string()
+    } else if max_chars > 3 {
+        format!("{}...", &text[..max_chars - 3])
+    } else {
+        text[..max_chars].to_string()
+    }
+}

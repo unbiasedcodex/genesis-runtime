@@ -1,0 +1,1772 @@
+// HTML5 Tree Builder
+// WHATWG HTML5 Parsing Specification compliant DOM tree construction
+
+use super::tokenizer::{HtmlToken, Tokenizer, TokenizerState, Attribute};
+use super::tokenizer::{is_void_element, is_raw_text_element, is_escapable_raw_text_element};
+
+// ============================================================
+// DOM Node Types
+// ============================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum NodeType {
+    Document,
+    DocumentType,
+    Element,
+    Text,
+    Comment,
+}
+
+// ============================================================
+// DOM Node
+// ============================================================
+
+pub struct Node {
+    pub node_type: NodeType,
+    pub parent: Option<usize>,    // Index into document's node list
+    pub children: Vec<usize>,
+    pub data: NodeData,
+}
+
+#[derive(Clone)]
+pub enum NodeData {
+    Document,
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
+    Element {
+        tag_name: String,
+        attributes: Vec<Attribute>,
+        namespace: Namespace,
+    },
+    Text {
+        content: String,
+    },
+    Comment {
+        content: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Namespace {
+    Html,
+    Svg,
+    MathML,
+}
+
+impl Node {
+    pub fn document() -> Node {
+        Node {
+            node_type: NodeType::Document,
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Document,
+        }
+    }
+
+    pub fn doctype(name: &str, public_id: &str, system_id: &str) -> Node {
+        Node {
+            node_type: NodeType::DocumentType,
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::DocumentType {
+                name: String::from(name),
+                public_id: String::from(public_id),
+                system_id: String::from(system_id),
+            },
+        }
+    }
+
+    pub fn element(tag_name: &str, attributes: Vec<Attribute>) -> Node {
+        Node {
+            node_type: NodeType::Element,
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Element {
+                tag_name: String::from(tag_name),
+                attributes: attributes,
+                namespace: Namespace::Html,
+            },
+        }
+    }
+
+    pub fn text(content: &str) -> Node {
+        Node {
+            node_type: NodeType::Text,
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Text {
+                content: String::from(content),
+            },
+        }
+    }
+
+    pub fn comment(content: &str) -> Node {
+        Node {
+            node_type: NodeType::Comment,
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Comment {
+                content: String::from(content),
+            },
+        }
+    }
+
+    pub fn tag_name(&self) -> Option<&str> {
+        match &self.data {
+            NodeData::Element { tag_name, .. } => Some(tag_name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn get_attribute(&self, name: &str) -> Option<&str> {
+        match &self.data {
+            NodeData::Element { attributes, .. } => {
+                for attr in attributes {
+                    if attr.name == name {
+                        return Some(attr.value.as_str());
+                    }
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    pub fn set_attribute(&mut self, name: &str, value: &str) {
+        match &mut self.data {
+            NodeData::Element { attributes, .. } => {
+                for attr in attributes.iter_mut() {
+                    if attr.name == name {
+                        attr.value = String::from(value);
+                        return;
+                    }
+                }
+                attributes.push(Attribute::new(String::from(name), String::from(value)));
+            },
+            _ => {}
+        }
+    }
+
+    pub fn text_content(&self) -> Option<&str> {
+        match &self.data {
+            NodeData::Text { content } => Some(content.as_str()),
+            NodeData::Comment { content } => Some(content.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn append_text(&mut self, text: &str) {
+        match &mut self.data {
+            NodeData::Text { content } => {
+                content.push_str(text);
+            },
+            _ => {}
+        }
+    }
+}
+
+// ============================================================
+// Document (Node Storage)
+// ============================================================
+
+pub struct Document {
+    pub nodes: Vec<Node>,
+    pub document_element: Option<usize>,  // <html> element
+    pub head: Option<usize>,
+    pub body: Option<usize>,
+    pub quirks_mode: QuirksMode,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum QuirksMode {
+    NoQuirks,
+    Quirks,
+    LimitedQuirks,
+}
+
+impl Document {
+    pub fn new() -> Document {
+        let mut doc = Document {
+            nodes: Vec::new(),
+            document_element: None,
+            head: None,
+            body: None,
+            quirks_mode: QuirksMode::NoQuirks,
+        };
+        // Add document node at index 0
+        doc.nodes.push(Node::document());
+        doc
+    }
+
+    // Create a new node and return its index
+    pub fn create_node(&mut self, node: Node) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(node);
+        idx
+    }
+
+    // Get node by index
+    pub fn get_node(&self, idx: usize) -> Option<&Node> {
+        self.nodes.get(idx)
+    }
+
+    // Get mutable node by index
+    pub fn get_node_mut(&mut self, idx: usize) -> Option<&mut Node> {
+        self.nodes.get_mut(idx)
+    }
+
+    // Append child to parent
+    pub fn append_child(&mut self, parent_idx: usize, child_idx: usize) {
+        if let Some(parent) = self.nodes.get_mut(parent_idx) {
+            parent.children.push(child_idx);
+        }
+        if let Some(child) = self.nodes.get_mut(child_idx) {
+            child.parent = Some(parent_idx);
+        }
+    }
+
+    // Insert child before another child
+    pub fn insert_before(&mut self, parent_idx: usize, child_idx: usize, before_idx: usize) {
+        if let Some(parent) = self.nodes.get_mut(parent_idx) {
+            let mut insert_pos = parent.children.len();
+            for i in 0..parent.children.len() {
+                if parent.children[i] == before_idx {
+                    insert_pos = i;
+                    break;
+                }
+            }
+            parent.children.insert(insert_pos, child_idx);
+        }
+        if let Some(child) = self.nodes.get_mut(child_idx) {
+            child.parent = Some(parent_idx);
+        }
+    }
+
+    // Remove child from parent
+    pub fn remove_child(&mut self, parent_idx: usize, child_idx: usize) {
+        if let Some(parent) = self.nodes.get_mut(parent_idx) {
+            parent.children.retain(|&x| x != child_idx);
+        }
+        if let Some(child) = self.nodes.get_mut(child_idx) {
+            child.parent = None;
+        }
+    }
+
+    // Get element by ID
+    pub fn get_element_by_id(&self, id: &str) -> Option<usize> {
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.node_type == NodeType::Element {
+                if let Some(node_id) = node.get_attribute("id") {
+                    if node_id == id {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get elements by tag name
+    pub fn get_elements_by_tag_name(&self, tag_name: &str) -> Vec<usize> {
+        let mut result = Vec::new();
+        let tag_lower = tag_name.to_ascii_lowercase();
+
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if let Some(name) = node.tag_name() {
+                if name == tag_lower {
+                    result.push(idx);
+                }
+            }
+        }
+        result
+    }
+
+    // Get elements by class name
+    pub fn get_elements_by_class_name(&self, class_name: &str) -> Vec<usize> {
+        let mut result = Vec::new();
+
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.node_type == NodeType::Element {
+                if let Some(classes) = node.get_attribute("class") {
+                    for class in classes.split_whitespace() {
+                        if class == class_name {
+                            result.push(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    // Query selector (simplified - only supports tag, #id, .class)
+    pub fn query_selector(&self, selector: &str) -> Option<usize> {
+        let selector = selector.trim();
+
+        if selector.starts_with('#') {
+            return self.get_element_by_id(&selector[1..]);
+        } else if selector.starts_with('.') {
+            let elements = self.get_elements_by_class_name(&selector[1..]);
+            return elements.first().copied();
+        } else {
+            let elements = self.get_elements_by_tag_name(selector);
+            return elements.first().copied();
+        }
+    }
+
+    // Get inner text of a node
+    pub fn get_inner_text(&self, node_idx: usize) -> String {
+        let mut result = String::new();
+        self.collect_text(node_idx, &mut result);
+        result
+    }
+
+    fn collect_text(&self, node_idx: usize, result: &mut String) {
+        if let Some(node) = self.get_node(node_idx) {
+            match &node.data {
+                NodeData::Text { content } => {
+                    result.push_str(content);
+                },
+                NodeData::Element { .. } => {
+                    for &child_idx in &node.children {
+                        self.collect_text(child_idx, result);
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+// ============================================================
+// Tree Builder Insertion Modes
+// ============================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum InsertionMode {
+    Initial,
+    BeforeHtml,
+    BeforeHead,
+    InHead,
+    InHeadNoscript,
+    AfterHead,
+    InBody,
+    Text,
+    InTable,
+    InTableText,
+    InCaption,
+    InColumnGroup,
+    InTableBody,
+    InRow,
+    InCell,
+    InSelect,
+    InSelectInTable,
+    InTemplate,
+    AfterBody,
+    InFrameset,
+    AfterFrameset,
+    AfterAfterBody,
+    AfterAfterFrameset,
+}
+
+// ============================================================
+// Tree Builder
+// ============================================================
+
+pub struct TreeBuilder {
+    document: Document,
+    tokenizer: Tokenizer,
+    insertion_mode: InsertionMode,
+    original_insertion_mode: InsertionMode,
+    template_insertion_modes: Vec<InsertionMode>,
+    open_elements: Vec<usize>,      // Stack of open elements (indices)
+    active_formatting_elements: Vec<FormattingElement>,
+    head_element: Option<usize>,
+    form_element: Option<usize>,
+    scripting_enabled: bool,
+    frameset_ok: bool,
+    foster_parenting: bool,
+    pending_table_characters: Vec<char>,
+}
+
+#[derive(Clone)]
+pub enum FormattingElement {
+    Element(usize),
+    Marker,
+}
+
+impl TreeBuilder {
+    pub fn new(html: &str) -> TreeBuilder {
+        TreeBuilder {
+            document: Document::new(),
+            tokenizer: Tokenizer::new(html),
+            insertion_mode: InsertionMode::Initial,
+            original_insertion_mode: InsertionMode::Initial,
+            template_insertion_modes: Vec::new(),
+            open_elements: Vec::new(),
+            active_formatting_elements: Vec::new(),
+            head_element: None,
+            form_element: None,
+            scripting_enabled: false,  // JavaScript not enabled by default
+            frameset_ok: true,
+            foster_parenting: false,
+            pending_table_characters: Vec::new(),
+        }
+    }
+
+    // Parse HTML and return document
+    pub fn parse(mut self) -> Document {
+        loop {
+            let token = self.tokenizer.next_token();
+            let is_eof = matches!(token, HtmlToken::EOF);
+
+            self.process_token(token);
+
+            if is_eof {
+                break;
+            }
+        }
+
+        self.document
+    }
+
+    // Process a single token
+    fn process_token(&mut self, token: HtmlToken) {
+        // Handle based on current insertion mode
+        match self.insertion_mode {
+            InsertionMode::Initial => self.handle_initial(token),
+            InsertionMode::BeforeHtml => self.handle_before_html(token),
+            InsertionMode::BeforeHead => self.handle_before_head(token),
+            InsertionMode::InHead => self.handle_in_head(token),
+            InsertionMode::AfterHead => self.handle_after_head(token),
+            InsertionMode::InBody => self.handle_in_body(token),
+            InsertionMode::Text => self.handle_text(token),
+            InsertionMode::AfterBody => self.handle_after_body(token),
+            InsertionMode::AfterAfterBody => self.handle_after_after_body(token),
+            _ => self.handle_in_body(token),  // Default to InBody for unsupported modes
+        }
+    }
+
+    // ============================================================
+    // Insertion Mode Handlers
+    // ============================================================
+
+    fn handle_initial(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                // Ignore whitespace
+            },
+            HtmlToken::Comment { data } => {
+                let node = Node::comment(&data);
+                let idx = self.document.create_node(node);
+                self.document.append_child(0, idx);  // Append to document
+            },
+            HtmlToken::DOCTYPE { name, public_id, system_id, force_quirks } => {
+                let name_str = name.unwrap_or_default();
+                let public_str = public_id.unwrap_or_default();
+                let system_str = system_id.unwrap_or_default();
+
+                let node = Node::doctype(&name_str, &public_str, &system_str);
+                let idx = self.document.create_node(node);
+                self.document.append_child(0, idx);
+
+                // Set quirks mode
+                if force_quirks || name_str.to_ascii_lowercase() != "html" {
+                    self.document.quirks_mode = QuirksMode::Quirks;
+                }
+
+                self.insertion_mode = InsertionMode::BeforeHtml;
+            },
+            _ => {
+                // Parse error, switch to quirks mode
+                self.document.quirks_mode = QuirksMode::Quirks;
+                self.insertion_mode = InsertionMode::BeforeHtml;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_before_html(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::Comment { data } => {
+                let node = Node::comment(&data);
+                let idx = self.document.create_node(node);
+                self.document.append_child(0, idx);
+            },
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                // Ignore
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "html" => {
+                self.create_element_for_token(&token, 0);
+                self.insertion_mode = InsertionMode::BeforeHead;
+            },
+            HtmlToken::EndTag { ref name } if name == "head" || name == "body" ||
+                                               name == "html" || name == "br" => {
+                // Act as if start tag "html" was seen
+                let html_node = Node::element("html", Vec::new());
+                let idx = self.document.create_node(html_node);
+                self.document.append_child(0, idx);
+                self.document.document_element = Some(idx);
+                self.open_elements.push(idx);
+                self.insertion_mode = InsertionMode::BeforeHead;
+                self.process_token(token);
+            },
+            HtmlToken::EndTag { .. } => {
+                // Parse error, ignore
+            },
+            _ => {
+                // Create html element
+                let html_node = Node::element("html", Vec::new());
+                let idx = self.document.create_node(html_node);
+                self.document.append_child(0, idx);
+                self.document.document_element = Some(idx);
+                self.open_elements.push(idx);
+                self.insertion_mode = InsertionMode::BeforeHead;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_before_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                // Ignore
+            },
+            HtmlToken::Comment { data } => {
+                self.insert_comment(&data);
+            },
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "html" => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "head" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.head_element = self.open_elements.last().copied();
+                self.document.head = self.head_element;
+                self.insertion_mode = InsertionMode::InHead;
+            },
+            HtmlToken::EndTag { ref name } if name == "head" || name == "body" ||
+                                               name == "html" || name == "br" => {
+                // Act as if start tag "head" was seen
+                let head_node = Node::element("head", Vec::new());
+                let parent = *self.open_elements.last().unwrap();
+                let idx = self.document.create_node(head_node);
+                self.document.append_child(parent, idx);
+                self.open_elements.push(idx);
+                self.head_element = Some(idx);
+                self.document.head = Some(idx);
+                self.insertion_mode = InsertionMode::InHead;
+                self.process_token(token);
+            },
+            HtmlToken::EndTag { .. } => {
+                // Parse error, ignore
+            },
+            _ => {
+                // Insert head element
+                let head_node = Node::element("head", Vec::new());
+                let parent = *self.open_elements.last().unwrap();
+                let idx = self.document.create_node(head_node);
+                self.document.append_child(parent, idx);
+                self.open_elements.push(idx);
+                self.head_element = Some(idx);
+                self.document.head = Some(idx);
+                self.insertion_mode = InsertionMode::InHead;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_in_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                self.insert_character(data);
+            },
+            HtmlToken::Comment { data } => {
+                self.insert_comment(&data);
+            },
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "html" => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "base" || name == "basefont" ||
+                name == "bgsound" || name == "link" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "meta" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "title" => {
+                self.parse_generic_rcdata_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "noscript" && !self.scripting_enabled => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.insertion_mode = InsertionMode::InHeadNoscript;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "noframes" || name == "style" => {
+                self.parse_generic_rawtext_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "noscript" && self.scripting_enabled => {
+                self.parse_generic_rawtext_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "script" => {
+                self.parse_script_element(&token);
+            },
+            HtmlToken::EndTag { ref name } if name == "head" => {
+                self.open_elements.pop();
+                self.insertion_mode = InsertionMode::AfterHead;
+            },
+            HtmlToken::EndTag { ref name } if name == "body" || name == "html" || name == "br" => {
+                self.open_elements.pop();
+                self.insertion_mode = InsertionMode::AfterHead;
+                self.process_token(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "template" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.active_formatting_elements.push(FormattingElement::Marker);
+                self.frameset_ok = false;
+                self.insertion_mode = InsertionMode::InTemplate;
+                self.template_insertion_modes.push(InsertionMode::InTemplate);
+            },
+            HtmlToken::EndTag { ref name } if name == "template" => {
+                if !self.has_element_in_scope("template") {
+                    // Parse error, ignore
+                } else {
+                    self.generate_implied_end_tags();
+                    self.pop_until("template");
+                    self.clear_active_formatting_to_marker();
+                    self.template_insertion_modes.pop();
+                    self.reset_insertion_mode();
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "head" => {
+                // Parse error, ignore
+            },
+            HtmlToken::EndTag { .. } => {
+                // Parse error, ignore
+            },
+            _ => {
+                self.open_elements.pop();
+                self.insertion_mode = InsertionMode::AfterHead;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_after_head(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                self.insert_character(data);
+            },
+            HtmlToken::Comment { data } => {
+                self.insert_comment(&data);
+            },
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "html" => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "body" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.document.body = self.open_elements.last().copied();
+                self.frameset_ok = false;
+                self.insertion_mode = InsertionMode::InBody;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "frameset" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.insertion_mode = InsertionMode::InFrameset;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "base" || name == "basefont" ||
+                name == "bgsound" || name == "link" || name == "meta" || name == "noframes" ||
+                name == "script" || name == "style" || name == "template" || name == "title" => {
+                // Parse error
+                if let Some(head_idx) = self.head_element {
+                    self.open_elements.push(head_idx);
+                    self.handle_in_head(token);
+                    // Remove head from stack
+                    if let Some(pos) = self.open_elements.iter().position(|&x| x == head_idx) {
+                        self.open_elements.remove(pos);
+                    }
+                }
+            },
+            HtmlToken::EndTag { ref name } if name == "template" => {
+                self.handle_in_head(token);
+            },
+            HtmlToken::EndTag { ref name } if name == "body" || name == "html" || name == "br" => {
+                // Insert body element
+                let body_node = Node::element("body", Vec::new());
+                let parent = *self.open_elements.last().unwrap();
+                let idx = self.document.create_node(body_node);
+                self.document.append_child(parent, idx);
+                self.open_elements.push(idx);
+                self.document.body = Some(idx);
+                self.insertion_mode = InsertionMode::InBody;
+                self.process_token(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "head" => {
+                // Parse error, ignore
+            },
+            HtmlToken::EndTag { .. } => {
+                // Parse error, ignore
+            },
+            _ => {
+                // Insert body element
+                let body_node = Node::element("body", Vec::new());
+                let parent = *self.open_elements.last().unwrap();
+                let idx = self.document.create_node(body_node);
+                self.document.append_child(parent, idx);
+                self.open_elements.push(idx);
+                self.document.body = Some(idx);
+                self.insertion_mode = InsertionMode::InBody;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_in_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data: '\0' } => {
+                // Parse error, ignore
+            },
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                self.reconstruct_active_formatting();
+                self.insert_character(data);
+            },
+            HtmlToken::Character { data } => {
+                self.reconstruct_active_formatting();
+                self.insert_character(data);
+                self.frameset_ok = false;
+            },
+            HtmlToken::Comment { data } => {
+                self.insert_comment(&data);
+            },
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { ref name, ref attributes, .. } if name == "html" => {
+                // Parse error
+                // Add attributes to html element if not already present
+                if let Some(&html_idx) = self.open_elements.first() {
+                    if let Some(html_node) = self.document.get_node_mut(html_idx) {
+                        for attr in attributes {
+                            if html_node.get_attribute(&attr.name).is_none() {
+                                html_node.set_attribute(&attr.name, &attr.value);
+                            }
+                        }
+                    }
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "base" || name == "basefont" ||
+                name == "bgsound" || name == "link" || name == "meta" || name == "noframes" ||
+                name == "script" || name == "style" || name == "template" || name == "title" => {
+                self.handle_in_head(token);
+            },
+            HtmlToken::EndTag { ref name } if name == "template" => {
+                self.handle_in_head(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "body" => {
+                // Parse error
+                if self.open_elements.len() < 2 {
+                    return;
+                }
+                self.frameset_ok = false;
+                // Add attributes to body
+                if let Some(&body_idx) = self.open_elements.get(1) {
+                    if let HtmlToken::StartTag { attributes, .. } = token {
+                        if let Some(body_node) = self.document.get_node_mut(body_idx) {
+                            for attr in attributes {
+                                if body_node.get_attribute(&attr.name).is_none() {
+                                    body_node.set_attribute(&attr.name, &attr.value);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "frameset" => {
+                // Parse error
+                if !self.frameset_ok {
+                    return;
+                }
+                // Remove body element and everything after
+                if self.open_elements.len() >= 2 {
+                    let body_idx = self.open_elements[1];
+                    self.open_elements.truncate(1);
+                    // Remove body from document
+                    if let Some(&html_idx) = self.open_elements.first() {
+                        self.document.remove_child(html_idx, body_idx);
+                    }
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.insertion_mode = InsertionMode::InFrameset;
+            },
+            HtmlToken::EOF => {
+                if !self.template_insertion_modes.is_empty() {
+                    self.handle_in_template(token);
+                }
+                // Stop parsing
+            },
+            HtmlToken::EndTag { ref name } if name == "body" => {
+                if !self.has_element_in_scope("body") {
+                    // Parse error, ignore
+                    return;
+                }
+                self.insertion_mode = InsertionMode::AfterBody;
+            },
+            HtmlToken::EndTag { ref name } if name == "html" => {
+                if !self.has_element_in_scope("body") {
+                    // Parse error, ignore
+                    return;
+                }
+                self.insertion_mode = InsertionMode::AfterBody;
+                self.process_token(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if is_address_div_etc(name) => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if is_heading(name) => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                // If current node is heading, pop it
+                if let Some(&current_idx) = self.open_elements.last() {
+                    if let Some(node) = self.document.get_node(current_idx) {
+                        if let Some(tag) = node.tag_name() {
+                            if is_heading(tag) {
+                                self.open_elements.pop();
+                            }
+                        }
+                    }
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "pre" || name == "listing" => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                // Skip next newline if present
+                self.frameset_ok = false;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "form" => {
+                if self.form_element.is_some() && !self.has_element_in_scope("template") {
+                    // Parse error, ignore
+                    return;
+                }
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                if !self.has_element_in_scope("template") {
+                    self.form_element = self.open_elements.last().copied();
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "li" => {
+                self.frameset_ok = false;
+                // Close li elements
+                self.close_li_element();
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "dd" || name == "dt" => {
+                self.frameset_ok = false;
+                self.close_dd_dt_element();
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "plaintext" => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.tokenizer.set_state(TokenizerState::PLAINTEXT);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "button" => {
+                if self.has_element_in_scope("button") {
+                    // Parse error
+                    self.generate_implied_end_tags();
+                    self.pop_until("button");
+                }
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.frameset_ok = false;
+            },
+            HtmlToken::EndTag { ref name } if is_address_div_etc(name) => {
+                if !self.has_element_in_scope(name) {
+                    // Parse error, ignore
+                    return;
+                }
+                self.generate_implied_end_tags();
+                self.pop_until(name);
+            },
+            HtmlToken::EndTag { ref name } if name == "form" => {
+                if !self.has_element_in_scope("template") {
+                    let form_idx = self.form_element;
+                    self.form_element = None;
+                    if form_idx.is_none() || !self.has_element_in_scope("form") {
+                        // Parse error, ignore
+                        return;
+                    }
+                    self.generate_implied_end_tags();
+                    if let Some(idx) = form_idx {
+                        if let Some(pos) = self.open_elements.iter().position(|&x| x == idx) {
+                            self.open_elements.remove(pos);
+                        }
+                    }
+                } else {
+                    if !self.has_element_in_scope("form") {
+                        // Parse error, ignore
+                        return;
+                    }
+                    self.generate_implied_end_tags();
+                    self.pop_until("form");
+                }
+            },
+            HtmlToken::EndTag { ref name } if name == "p" => {
+                if !self.has_element_in_button_scope("p") {
+                    // Parse error, insert p element
+                    let p_node = Node::element("p", Vec::new());
+                    let parent = *self.open_elements.last().unwrap();
+                    let idx = self.document.create_node(p_node);
+                    self.document.append_child(parent, idx);
+                    self.open_elements.push(idx);
+                }
+                self.close_p_element();
+            },
+            HtmlToken::EndTag { ref name } if name == "li" => {
+                if !self.has_element_in_list_scope("li") {
+                    // Parse error, ignore
+                    return;
+                }
+                self.generate_implied_end_tags_except("li");
+                self.pop_until("li");
+            },
+            HtmlToken::EndTag { ref name } if name == "dd" || name == "dt" => {
+                if !self.has_element_in_scope(name) {
+                    // Parse error, ignore
+                    return;
+                }
+                self.generate_implied_end_tags_except(name);
+                self.pop_until(name);
+            },
+            HtmlToken::EndTag { ref name } if is_heading(name) => {
+                if !self.has_heading_in_scope() {
+                    // Parse error, ignore
+                    return;
+                }
+                self.generate_implied_end_tags();
+                // Pop until heading
+                while let Some(idx) = self.open_elements.pop() {
+                    if let Some(node) = self.document.get_node(idx) {
+                        if let Some(tag) = node.tag_name() {
+                            if is_heading(tag) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "a" => {
+                // Check for existing <a> in formatting elements
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                let idx = *self.open_elements.last().unwrap();
+                self.active_formatting_elements.push(FormattingElement::Element(idx));
+            },
+            HtmlToken::StartTag { ref name, .. } if is_formatting_element(name) => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                let idx = *self.open_elements.last().unwrap();
+                self.active_formatting_elements.push(FormattingElement::Element(idx));
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "nobr" => {
+                self.reconstruct_active_formatting();
+                if self.has_element_in_scope("nobr") {
+                    // Adoption agency
+                    self.run_adoption_agency("nobr");
+                    self.reconstruct_active_formatting();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                let idx = *self.open_elements.last().unwrap();
+                self.active_formatting_elements.push(FormattingElement::Element(idx));
+            },
+            HtmlToken::EndTag { ref name } if is_formatting_element(name) || name == "a" => {
+                self.run_adoption_agency(name);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "applet" || name == "marquee" ||
+                                                     name == "object" => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.active_formatting_elements.push(FormattingElement::Marker);
+                self.frameset_ok = false;
+            },
+            HtmlToken::EndTag { ref name } if name == "applet" || name == "marquee" ||
+                                               name == "object" => {
+                if !self.has_element_in_scope(name) {
+                    // Parse error, ignore
+                    return;
+                }
+                self.generate_implied_end_tags();
+                self.pop_until(name);
+                self.clear_active_formatting_to_marker();
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "table" => {
+                if self.document.quirks_mode != QuirksMode::Quirks &&
+                   self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.frameset_ok = false;
+                self.insertion_mode = InsertionMode::InTable;
+            },
+            HtmlToken::EndTag { ref name } if name == "br" => {
+                // Parse error, treat as start tag
+                self.reconstruct_active_formatting();
+                let br_node = Node::element("br", Vec::new());
+                let parent = *self.open_elements.last().unwrap();
+                let idx = self.document.create_node(br_node);
+                self.document.append_child(parent, idx);
+                self.frameset_ok = false;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "area" || name == "br" ||
+                name == "embed" || name == "img" || name == "keygen" || name == "wbr" => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+                self.frameset_ok = false;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "input" => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+                // Check type attribute for frameset_ok
+                if let HtmlToken::StartTag { attributes, .. } = token {
+                    let mut is_hidden = false;
+                    for attr in &attributes {
+                        if attr.name == "type" && attr.value.to_ascii_lowercase() == "hidden" {
+                            is_hidden = true;
+                            break;
+                        }
+                    }
+                    if !is_hidden {
+                        self.frameset_ok = false;
+                    }
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "param" || name == "source" ||
+                                                     name == "track" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "hr" => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.open_elements.pop();  // Self-closing
+                self.frameset_ok = false;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "image" => {
+                // Parse error, change to img
+                let mut new_token = token.clone();
+                if let HtmlToken::StartTag { ref mut name, .. } = new_token {
+                    *name = String::from("img");
+                }
+                self.process_token(new_token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "textarea" => {
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                // Skip next newline
+                self.tokenizer.set_state(TokenizerState::RCDATA);
+                self.original_insertion_mode = self.insertion_mode;
+                self.frameset_ok = false;
+                self.insertion_mode = InsertionMode::Text;
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "xmp" => {
+                if self.has_element_in_button_scope("p") {
+                    self.close_p_element();
+                }
+                self.reconstruct_active_formatting();
+                self.frameset_ok = false;
+                self.parse_generic_rawtext_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "iframe" => {
+                self.frameset_ok = false;
+                self.parse_generic_rawtext_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "noembed" => {
+                self.parse_generic_rawtext_element(&token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "select" => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                self.frameset_ok = false;
+                match self.insertion_mode {
+                    InsertionMode::InTable | InsertionMode::InCaption |
+                    InsertionMode::InTableBody | InsertionMode::InRow |
+                    InsertionMode::InCell => {
+                        self.insertion_mode = InsertionMode::InSelectInTable;
+                    },
+                    _ => {
+                        self.insertion_mode = InsertionMode::InSelect;
+                    }
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "optgroup" || name == "option" => {
+                if let Some(&current_idx) = self.open_elements.last() {
+                    if let Some(node) = self.document.get_node(current_idx) {
+                        if node.tag_name() == Some("option") {
+                            self.open_elements.pop();
+                        }
+                    }
+                }
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "rb" || name == "rtc" => {
+                if self.has_element_in_scope("ruby") {
+                    self.generate_implied_end_tags();
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "rp" || name == "rt" => {
+                if self.has_element_in_scope("ruby") {
+                    self.generate_implied_end_tags_except("rtc");
+                }
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::StartTag { ref name, self_closing, .. } if name == "math" => {
+                self.reconstruct_active_formatting();
+                // Foreign content handling simplified
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                if self_closing {
+                    self.open_elements.pop();
+                }
+            },
+            HtmlToken::StartTag { ref name, self_closing, .. } if name == "svg" => {
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+                if self_closing {
+                    self.open_elements.pop();
+                }
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "caption" || name == "col" ||
+                name == "colgroup" || name == "frame" || name == "head" ||
+                name == "tbody" || name == "td" || name == "tfoot" || name == "th" ||
+                name == "thead" || name == "tr" => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { .. } => {
+                // Any other start tag
+                self.reconstruct_active_formatting();
+                self.create_element_for_token(&token, *self.open_elements.last().unwrap());
+            },
+            HtmlToken::EndTag { ref name } => {
+                // Any other end tag
+                self.handle_any_other_end_tag(name);
+            },
+        }
+    }
+
+    fn handle_text(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } => {
+                self.insert_character(data);
+            },
+            HtmlToken::EOF => {
+                // Parse error
+                self.open_elements.pop();
+                self.insertion_mode = self.original_insertion_mode;
+                self.process_token(token);
+            },
+            HtmlToken::EndTag { ref name } if name == "script" => {
+                // For now, just pop script element
+                self.open_elements.pop();
+                self.insertion_mode = self.original_insertion_mode;
+            },
+            HtmlToken::EndTag { .. } => {
+                self.open_elements.pop();
+                self.insertion_mode = self.original_insertion_mode;
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_in_template(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { .. } | HtmlToken::Comment { .. } | HtmlToken::DOCTYPE { .. } => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "base" || name == "basefont" ||
+                name == "bgsound" || name == "link" || name == "meta" || name == "noframes" ||
+                name == "script" || name == "style" || name == "template" || name == "title" => {
+                self.handle_in_head(token);
+            },
+            HtmlToken::EndTag { ref name } if name == "template" => {
+                self.handle_in_head(token);
+            },
+            HtmlToken::EOF => {
+                if !self.has_element_in_scope("template") {
+                    // Stop parsing
+                } else {
+                    self.generate_implied_end_tags();
+                    self.pop_until("template");
+                    self.clear_active_formatting_to_marker();
+                    self.template_insertion_modes.pop();
+                    self.reset_insertion_mode();
+                    self.process_token(token);
+                }
+            },
+            _ => {
+                self.handle_in_body(token);
+            }
+        }
+    }
+
+    fn handle_after_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Character { data } if is_whitespace(data) => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::Comment { data } => {
+                // Insert as child of html element
+                let node = Node::comment(&data);
+                let idx = self.document.create_node(node);
+                if let Some(&html_idx) = self.open_elements.first() {
+                    self.document.append_child(html_idx, idx);
+                }
+            },
+            HtmlToken::DOCTYPE { .. } => {
+                // Parse error, ignore
+            },
+            HtmlToken::StartTag { ref name, .. } if name == "html" => {
+                self.handle_in_body(token);
+            },
+            HtmlToken::EndTag { ref name } if name == "html" => {
+                self.insertion_mode = InsertionMode::AfterAfterBody;
+            },
+            HtmlToken::EOF => {
+                // Stop parsing
+            },
+            _ => {
+                // Parse error
+                self.insertion_mode = InsertionMode::InBody;
+                self.process_token(token);
+            }
+        }
+    }
+
+    fn handle_after_after_body(&mut self, token: HtmlToken) {
+        match token {
+            HtmlToken::Comment { data } => {
+                let node = Node::comment(&data);
+                let idx = self.document.create_node(node);
+                self.document.append_child(0, idx);  // Append to document
+            },
+            HtmlToken::DOCTYPE { .. } |
+            HtmlToken::Character { data: ' ' } |
+            HtmlToken::Character { data: '\t' } |
+            HtmlToken::Character { data: '\n' } |
+            HtmlToken::Character { data: '\x0C' } |
+            HtmlToken::StartTag { .. } => {
+                if let HtmlToken::StartTag { ref name, .. } = token {
+                    if name == "html" {
+                        self.handle_in_body(token);
+                        return;
+                    }
+                }
+                // Whitespace or other - handle in body
+                self.handle_in_body(token);
+            },
+            HtmlToken::EOF => {
+                // Stop parsing
+            },
+            _ => {
+                // Parse error
+                self.insertion_mode = InsertionMode::InBody;
+                self.process_token(token);
+            }
+        }
+    }
+
+    // ============================================================
+    // Helper Methods
+    // ============================================================
+
+    fn create_element_for_token(&mut self, token: &HtmlToken, parent_idx: usize) {
+        if let HtmlToken::StartTag { name, attributes, .. } = token {
+            let node = Node::element(name, attributes.clone());
+            let idx = self.document.create_node(node);
+            self.document.append_child(parent_idx, idx);
+            self.open_elements.push(idx);
+
+            // Track document structure
+            if name == "html" {
+                self.document.document_element = Some(idx);
+            } else if name == "head" {
+                self.document.head = Some(idx);
+            } else if name == "body" {
+                self.document.body = Some(idx);
+            }
+        }
+    }
+
+    fn insert_character(&mut self, c: char) {
+        let parent_idx = *self.open_elements.last().unwrap_or(&0);
+
+        // Check if last child is a text node
+        if let Some(parent) = self.document.get_node(parent_idx) {
+            if let Some(&last_child_idx) = parent.children.last() {
+                if let Some(last_child) = self.document.get_node_mut(last_child_idx) {
+                    if last_child.node_type == NodeType::Text {
+                        last_child.append_text(&c.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Create new text node
+        let text_node = Node::text(&c.to_string());
+        let idx = self.document.create_node(text_node);
+        self.document.append_child(parent_idx, idx);
+    }
+
+    fn insert_comment(&mut self, data: &str) {
+        let parent_idx = *self.open_elements.last().unwrap_or(&0);
+        let comment_node = Node::comment(data);
+        let idx = self.document.create_node(comment_node);
+        self.document.append_child(parent_idx, idx);
+    }
+
+    fn parse_generic_rcdata_element(&mut self, token: &HtmlToken) {
+        self.create_element_for_token(token, *self.open_elements.last().unwrap());
+        self.tokenizer.set_state(TokenizerState::RCDATA);
+        self.original_insertion_mode = self.insertion_mode;
+        self.insertion_mode = InsertionMode::Text;
+    }
+
+    fn parse_generic_rawtext_element(&mut self, token: &HtmlToken) {
+        self.create_element_for_token(token, *self.open_elements.last().unwrap());
+        self.tokenizer.set_state(TokenizerState::RAWTEXT);
+        self.original_insertion_mode = self.insertion_mode;
+        self.insertion_mode = InsertionMode::Text;
+    }
+
+    fn parse_script_element(&mut self, token: &HtmlToken) {
+        self.create_element_for_token(token, *self.open_elements.last().unwrap());
+        self.tokenizer.set_state(TokenizerState::ScriptData);
+        self.original_insertion_mode = self.insertion_mode;
+        self.insertion_mode = InsertionMode::Text;
+    }
+
+    fn has_element_in_scope(&self, tag: &str) -> bool {
+        self.has_element_in_specific_scope(tag, &["applet", "caption", "html", "table",
+            "td", "th", "marquee", "object", "template"])
+    }
+
+    fn has_element_in_list_scope(&self, tag: &str) -> bool {
+        self.has_element_in_specific_scope(tag, &["applet", "caption", "html", "table",
+            "td", "th", "marquee", "object", "template", "ol", "ul"])
+    }
+
+    fn has_element_in_button_scope(&self, tag: &str) -> bool {
+        self.has_element_in_specific_scope(tag, &["applet", "caption", "html", "table",
+            "td", "th", "marquee", "object", "template", "button"])
+    }
+
+    fn has_element_in_specific_scope(&self, tag: &str, scope_elements: &[&str]) -> bool {
+        for &idx in self.open_elements.iter().rev() {
+            if let Some(node) = self.document.get_node(idx) {
+                if let Some(node_tag) = node.tag_name() {
+                    if node_tag == tag {
+                        return true;
+                    }
+                    for &scope_tag in scope_elements {
+                        if node_tag == scope_tag {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn has_heading_in_scope(&self) -> bool {
+        for &idx in self.open_elements.iter().rev() {
+            if let Some(node) = self.document.get_node(idx) {
+                if let Some(tag) = node.tag_name() {
+                    if is_heading(tag) {
+                        return true;
+                    }
+                    if matches!(tag, "applet" | "caption" | "html" | "table" |
+                        "td" | "th" | "marquee" | "object" | "template") {
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn generate_implied_end_tags(&mut self) {
+        self.generate_implied_end_tags_except("");
+    }
+
+    fn generate_implied_end_tags_except(&mut self, except: &str) {
+        loop {
+            if let Some(&idx) = self.open_elements.last() {
+                if let Some(node) = self.document.get_node(idx) {
+                    if let Some(tag) = node.tag_name() {
+                        if tag != except && is_implied_end_tag(tag) {
+                            self.open_elements.pop();
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    fn pop_until(&mut self, tag: &str) {
+        while let Some(idx) = self.open_elements.pop() {
+            if let Some(node) = self.document.get_node(idx) {
+                if node.tag_name() == Some(tag) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn close_p_element(&mut self) {
+        self.generate_implied_end_tags_except("p");
+        self.pop_until("p");
+    }
+
+    fn close_li_element(&mut self) {
+        for i in (0..self.open_elements.len()).rev() {
+            let idx = self.open_elements[i];
+            if let Some(node) = self.document.get_node(idx) {
+                if let Some(tag) = node.tag_name() {
+                    if tag == "li" {
+                        self.generate_implied_end_tags_except("li");
+                        self.pop_until("li");
+                        return;
+                    }
+                    if is_special_element(tag) && tag != "address" && tag != "div" && tag != "p" {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn close_dd_dt_element(&mut self) {
+        for i in (0..self.open_elements.len()).rev() {
+            let idx = self.open_elements[i];
+            if let Some(node) = self.document.get_node(idx) {
+                if let Some(tag) = node.tag_name() {
+                    if tag == "dd" {
+                        self.generate_implied_end_tags_except("dd");
+                        self.pop_until("dd");
+                        return;
+                    }
+                    if tag == "dt" {
+                        self.generate_implied_end_tags_except("dt");
+                        self.pop_until("dt");
+                        return;
+                    }
+                    if is_special_element(tag) && tag != "address" && tag != "div" && tag != "p" {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn reconstruct_active_formatting(&mut self) {
+        if self.active_formatting_elements.is_empty() {
+            return;
+        }
+
+        // Find last marker or element not in stack
+        let mut entry_idx = self.active_formatting_elements.len() - 1;
+
+        loop {
+            match &self.active_formatting_elements[entry_idx] {
+                FormattingElement::Marker => return,
+                FormattingElement::Element(node_idx) => {
+                    if self.open_elements.contains(node_idx) {
+                        return;
+                    }
+                }
+            }
+
+            if entry_idx == 0 {
+                break;
+            }
+            entry_idx -= 1;
+        }
+
+        // Reconstruct entries
+        while entry_idx < self.active_formatting_elements.len() {
+            if let FormattingElement::Element(original_idx) = self.active_formatting_elements[entry_idx] {
+                if let Some(original) = self.document.get_node(original_idx) {
+                    if let NodeData::Element { tag_name, attributes, .. } = &original.data {
+                        let new_node = Node::element(tag_name, attributes.clone());
+                        let parent = *self.open_elements.last().unwrap();
+                        let new_idx = self.document.create_node(new_node);
+                        self.document.append_child(parent, new_idx);
+                        self.open_elements.push(new_idx);
+                        self.active_formatting_elements[entry_idx] = FormattingElement::Element(new_idx);
+                    }
+                }
+            }
+            entry_idx += 1;
+        }
+    }
+
+    fn clear_active_formatting_to_marker(&mut self) {
+        while let Some(entry) = self.active_formatting_elements.pop() {
+            if matches!(entry, FormattingElement::Marker) {
+                break;
+            }
+        }
+    }
+
+    fn run_adoption_agency(&mut self, subject: &str) {
+        // Simplified adoption agency algorithm
+        for _ in 0..8 {
+            // Find formatting element
+            let mut formatting_element_pos = None;
+            for i in (0..self.active_formatting_elements.len()).rev() {
+                if let FormattingElement::Element(idx) = self.active_formatting_elements[i] {
+                    if let Some(node) = self.document.get_node(idx) {
+                        if node.tag_name() == Some(subject) {
+                            formatting_element_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if matches!(self.active_formatting_elements[i], FormattingElement::Marker) {
+                    break;
+                }
+            }
+
+            let formatting_pos = match formatting_element_pos {
+                Some(p) => p,
+                None => {
+                    // No formatting element, handle as any other end tag
+                    self.handle_any_other_end_tag(subject);
+                    return;
+                }
+            };
+
+            let formatting_idx = match &self.active_formatting_elements[formatting_pos] {
+                FormattingElement::Element(idx) => *idx,
+                _ => return,
+            };
+
+            // Check if in stack
+            if !self.open_elements.contains(&formatting_idx) {
+                self.active_formatting_elements.remove(formatting_pos);
+                return;
+            }
+
+            // Check if in scope
+            if !self.has_element_in_scope(subject) {
+                return;
+            }
+
+            // Pop until formatting element
+            while let Some(popped) = self.open_elements.pop() {
+                if popped == formatting_idx {
+                    break;
+                }
+            }
+
+            // Remove from active formatting
+            self.active_formatting_elements.remove(formatting_pos);
+
+            return;
+        }
+    }
+
+    fn handle_any_other_end_tag(&mut self, tag: &str) {
+        for i in (0..self.open_elements.len()).rev() {
+            let idx = self.open_elements[i];
+            if let Some(node) = self.document.get_node(idx) {
+                if node.tag_name() == Some(tag) {
+                    self.generate_implied_end_tags_except(tag);
+                    // Pop until and including this element
+                    while self.open_elements.len() > i {
+                        self.open_elements.pop();
+                    }
+                    return;
+                }
+                if let Some(node_tag) = node.tag_name() {
+                    if is_special_element(node_tag) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn reset_insertion_mode(&mut self) {
+        let mut last = false;
+        let mut i = self.open_elements.len();
+
+        while i > 0 {
+            i -= 1;
+            let mut node_idx = self.open_elements[i];
+
+            if i == 0 {
+                last = true;
+            }
+
+            if let Some(node) = self.document.get_node(node_idx) {
+                let tag = node.tag_name().unwrap_or("");
+
+                match tag {
+                    "select" => {
+                        self.insertion_mode = InsertionMode::InSelect;
+                        return;
+                    },
+                    "td" | "th" if !last => {
+                        self.insertion_mode = InsertionMode::InCell;
+                        return;
+                    },
+                    "tr" => {
+                        self.insertion_mode = InsertionMode::InRow;
+                        return;
+                    },
+                    "tbody" | "thead" | "tfoot" => {
+                        self.insertion_mode = InsertionMode::InTableBody;
+                        return;
+                    },
+                    "caption" => {
+                        self.insertion_mode = InsertionMode::InCaption;
+                        return;
+                    },
+                    "colgroup" => {
+                        self.insertion_mode = InsertionMode::InColumnGroup;
+                        return;
+                    },
+                    "table" => {
+                        self.insertion_mode = InsertionMode::InTable;
+                        return;
+                    },
+                    "template" => {
+                        if let Some(&mode) = self.template_insertion_modes.last() {
+                            self.insertion_mode = mode;
+                        }
+                        return;
+                    },
+                    "head" if !last => {
+                        self.insertion_mode = InsertionMode::InHead;
+                        return;
+                    },
+                    "body" => {
+                        self.insertion_mode = InsertionMode::InBody;
+                        return;
+                    },
+                    "frameset" => {
+                        self.insertion_mode = InsertionMode::InFrameset;
+                        return;
+                    },
+                    "html" => {
+                        if self.head_element.is_none() {
+                            self.insertion_mode = InsertionMode::BeforeHead;
+                        } else {
+                            self.insertion_mode = InsertionMode::AfterHead;
+                        }
+                        return;
+                    },
+                    _ if last => {
+                        self.insertion_mode = InsertionMode::InBody;
+                        return;
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        self.insertion_mode = InsertionMode::InBody;
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn is_whitespace(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\x0C' || c == '\r'
+}
+
+fn is_heading(tag: &str) -> bool {
+    matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+fn is_address_div_etc(tag: &str) -> bool {
+    matches!(tag, "address" | "article" | "aside" | "blockquote" | "center" |
+        "details" | "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" |
+        "figure" | "footer" | "header" | "hgroup" | "main" | "menu" | "nav" |
+        "ol" | "p" | "section" | "summary" | "ul")
+}
+
+fn is_formatting_element(tag: &str) -> bool {
+    matches!(tag, "b" | "big" | "code" | "em" | "font" | "i" | "s" | "small" |
+        "strike" | "strong" | "tt" | "u")
+}
+
+fn is_special_element(tag: &str) -> bool {
+    matches!(tag, "address" | "applet" | "area" | "article" | "aside" | "base" |
+        "basefont" | "bgsound" | "blockquote" | "body" | "br" | "button" |
+        "caption" | "center" | "col" | "colgroup" | "dd" | "details" | "dir" |
+        "div" | "dl" | "dt" | "embed" | "fieldset" | "figcaption" | "figure" |
+        "footer" | "form" | "frame" | "frameset" | "h1" | "h2" | "h3" | "h4" |
+        "h5" | "h6" | "head" | "header" | "hgroup" | "hr" | "html" | "iframe" |
+        "img" | "input" | "keygen" | "li" | "link" | "listing" | "main" |
+        "marquee" | "menu" | "meta" | "nav" | "noembed" | "noframes" | "noscript" |
+        "object" | "ol" | "p" | "param" | "plaintext" | "pre" | "script" |
+        "section" | "select" | "source" | "style" | "summary" | "table" | "tbody" |
+        "td" | "template" | "textarea" | "tfoot" | "th" | "thead" | "title" |
+        "tr" | "track" | "ul" | "wbr" | "xmp")
+}
+
+fn is_implied_end_tag(tag: &str) -> bool {
+    matches!(tag, "dd" | "dt" | "li" | "optgroup" | "option" | "p" | "rb" |
+        "rp" | "rt" | "rtc")
+}
+
+// ============================================================
+// Public Parsing Function
+// ============================================================
+
+pub fn parse_html(html: &str) -> Document {
+    let builder = TreeBuilder::new(html);
+    builder.parse()
+}

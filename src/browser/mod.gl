@@ -1,0 +1,663 @@
+// Browser Module
+// Genesis Browser (Geb) - A full-featured web browser for Genesis OS
+
+pub mod tab;
+pub mod ui;
+pub mod main;
+
+// Re-export commonly used items
+pub use tab::{Tab, TabState, LoadingPhase, NavigationHistory, ResourceLoader};
+pub use ui::{
+    BrowserTheme, Color, UIRect, UICommand,
+    TabBar, TabBarItem, Toolbar, AddressBar,
+    LoadingBar, StatusBar, ContextMenu, MenuItem,
+    HitTestResult,
+};
+pub use main::{Browser, BrowserConfig, BrowserMode};
+
+use super::html::{Document, parse_html};
+use super::css::{Stylesheet, parse_css};
+use super::layout::{LayoutBox, layout_document};
+use super::js::{JsRuntime, JsValue, JsError};
+use super::net::{http_get, https_get};
+
+// ============================================================
+// Browser Entry Point
+// ============================================================
+
+/// Start the Genesis Browser
+pub fn start_browser() {
+    let mut browser = Browser::new(1024, 768);
+
+    // Navigate to default home page
+    browser.navigate("about:blank");
+
+    // Main event loop would be handled by the window manager
+    // This is a placeholder for the actual integration
+    println!("Genesis Browser (Geb) started");
+    println!("Window size: {}x{}", browser.config.width, browser.config.height);
+}
+
+/// Create a browser with custom configuration
+pub fn create_browser(config: BrowserConfig) -> Browser {
+    Browser::with_config(config)
+}
+
+// ============================================================
+// URL Handling
+// ============================================================
+
+/// Parse a URL into its components
+pub struct ParsedUrl {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub path: String,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+}
+
+impl ParsedUrl {
+    pub fn parse(url: &str) -> Option<ParsedUrl> {
+        let url = url.trim();
+
+        // Handle special URLs
+        if url.starts_with("about:") {
+            return Some(ParsedUrl {
+                scheme: "about".to_string(),
+                host: String::new(),
+                port: None,
+                path: url[6..].to_string(),
+                query: None,
+                fragment: None,
+            });
+        }
+
+        // Parse scheme
+        let (scheme, rest) = if let Some(idx) = url.find("://") {
+            (url[..idx].to_string(), &url[idx + 3..])
+        } else {
+            // Default to http
+            ("http".to_string(), url)
+        };
+
+        // Parse fragment
+        let (rest, fragment) = if let Some(idx) = rest.find('#') {
+            (&rest[..idx], Some(rest[idx + 1..].to_string()))
+        } else {
+            (rest, None)
+        };
+
+        // Parse query
+        let (rest, query) = if let Some(idx) = rest.find('?') {
+            (&rest[..idx], Some(rest[idx + 1..].to_string()))
+        } else {
+            (rest, None)
+        };
+
+        // Parse host and path
+        let (host_port, path) = if let Some(idx) = rest.find('/') {
+            (&rest[..idx], rest[idx..].to_string())
+        } else {
+            (rest, "/".to_string())
+        };
+
+        // Parse port from host
+        let (host, port) = if let Some(idx) = host_port.find(':') {
+            let port_str = &host_port[idx + 1..];
+            let port = port_str.parse::<u16>().ok();
+            (host_port[..idx].to_string(), port)
+        } else {
+            (host_port.to_string(), None)
+        };
+
+        Some(ParsedUrl {
+            scheme,
+            host,
+            port,
+            path,
+            query,
+            fragment,
+        })
+    }
+
+    /// Get the effective port (default based on scheme if not specified)
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or_else(|| {
+            match self.scheme.as_str() {
+                "https" => 443,
+                "http" => 80,
+                "ftp" => 21,
+                _ => 80,
+            }
+        })
+    }
+
+    /// Convert back to string
+    pub fn to_string(&self) -> String {
+        let mut result = format!("{}://", self.scheme);
+
+        if !self.host.is_empty() {
+            result.push_str(&self.host);
+            if let Some(port) = self.port {
+                result.push_str(&format!(":{}", port));
+            }
+        }
+
+        result.push_str(&self.path);
+
+        if let Some(ref query) = self.query {
+            result.push('?');
+            result.push_str(query);
+        }
+
+        if let Some(ref fragment) = self.fragment {
+            result.push('#');
+            result.push_str(fragment);
+        }
+
+        result
+    }
+
+    /// Resolve a relative URL against this base URL
+    pub fn resolve(&self, relative: &str) -> ParsedUrl {
+        let relative = relative.trim();
+
+        // Absolute URL
+        if relative.contains("://") {
+            return ParsedUrl::parse(relative).unwrap_or_else(|| self.clone());
+        }
+
+        // Protocol-relative
+        if relative.starts_with("//") {
+            return ParsedUrl::parse(&format!("{}:{}", self.scheme, relative))
+                .unwrap_or_else(|| self.clone());
+        }
+
+        // Absolute path
+        if relative.starts_with('/') {
+            let mut result = self.clone();
+
+            // Parse path, query, fragment from relative
+            let (path, rest) = if let Some(idx) = relative.find('?') {
+                (&relative[..idx], &relative[idx..])
+            } else if let Some(idx) = relative.find('#') {
+                (&relative[..idx], &relative[idx..])
+            } else {
+                (relative, "")
+            };
+
+            result.path = path.to_string();
+
+            if rest.starts_with('?') {
+                if let Some(idx) = rest.find('#') {
+                    result.query = Some(rest[1..idx].to_string());
+                    result.fragment = Some(rest[idx + 1..].to_string());
+                } else {
+                    result.query = Some(rest[1..].to_string());
+                    result.fragment = None;
+                }
+            } else if rest.starts_with('#') {
+                result.query = None;
+                result.fragment = Some(rest[1..].to_string());
+            } else {
+                result.query = None;
+                result.fragment = None;
+            }
+
+            return result;
+        }
+
+        // Fragment only
+        if relative.starts_with('#') {
+            let mut result = self.clone();
+            result.fragment = Some(relative[1..].to_string());
+            return result;
+        }
+
+        // Query only
+        if relative.starts_with('?') {
+            let mut result = self.clone();
+            if let Some(idx) = relative.find('#') {
+                result.query = Some(relative[1..idx].to_string());
+                result.fragment = Some(relative[idx + 1..].to_string());
+            } else {
+                result.query = Some(relative[1..].to_string());
+                result.fragment = None;
+            }
+            return result;
+        }
+
+        // Relative path
+        let mut result = self.clone();
+
+        // Get directory of current path
+        let base_dir = if let Some(idx) = self.path.rfind('/') {
+            &self.path[..idx + 1]
+        } else {
+            "/"
+        };
+
+        // Combine with relative path
+        let combined = format!("{}{}", base_dir, relative);
+
+        // Normalize path (handle . and ..)
+        result.path = normalize_path(&combined);
+        result.query = None;
+        result.fragment = None;
+
+        // Parse query and fragment from relative
+        if let Some(idx) = relative.find('?') {
+            let rest = &relative[idx..];
+            if let Some(frag_idx) = rest.find('#') {
+                result.query = Some(rest[1..frag_idx].to_string());
+                result.fragment = Some(rest[frag_idx + 1..].to_string());
+            } else {
+                result.query = Some(rest[1..].to_string());
+            }
+        } else if let Some(idx) = relative.find('#') {
+            result.fragment = Some(relative[idx + 1..].to_string());
+        }
+
+        result
+    }
+
+    fn clone(&self) -> ParsedUrl {
+        ParsedUrl {
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            path: self.path.clone(),
+            query: self.query.clone(),
+            fragment: self.fragment.clone(),
+        }
+    }
+}
+
+/// Normalize a URL path (resolve . and ..)
+fn normalize_path(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {
+                // Skip empty and current directory
+            }
+            ".." => {
+                // Go up one directory
+                segments.pop();
+            }
+            s => {
+                segments.push(s);
+            }
+        }
+    }
+
+    let mut result = String::from("/");
+    result.push_str(&segments.join("/"));
+
+    // Preserve trailing slash
+    if path.ends_with('/') && !result.ends_with('/') {
+        result.push('/');
+    }
+
+    result
+}
+
+// ============================================================
+// Special Pages
+// ============================================================
+
+/// Generate content for about: pages
+pub fn generate_about_page(page: &str) -> String {
+    match page {
+        "blank" => {
+            String::from("<!DOCTYPE html><html><head><title>New Tab</title></head><body></body></html>")
+        }
+        "newtab" | "home" => {
+            String::from(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>New Tab - Genesis Browser</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #f5f5f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        h1 {
+            color: #333;
+            font-size: 48px;
+            margin-bottom: 20px;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 18px;
+        }
+        .search-box {
+            margin-top: 40px;
+            display: flex;
+        }
+        input {
+            width: 400px;
+            padding: 12px 16px;
+            font-size: 16px;
+            border: 1px solid #ddd;
+            border-radius: 24px;
+            outline: none;
+        }
+        input:focus {
+            border-color: #4285f4;
+            box-shadow: 0 1px 6px rgba(66, 133, 244, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <h1>Geb</h1>
+    <p class="subtitle">Genesis Browser</p>
+    <div class="search-box">
+        <input type="text" placeholder="Search or enter URL" autofocus>
+    </div>
+</body>
+</html>"#)
+        }
+        "version" => {
+            String::from(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>About Genesis Browser</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; }
+        h1 { color: #333; }
+        table { border-collapse: collapse; margin-top: 20px; }
+        td { padding: 8px 16px; border-bottom: 1px solid #eee; }
+        td:first-child { font-weight: bold; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>Genesis Browser (Geb)</h1>
+    <table>
+        <tr><td>Version</td><td>1.0.0</td></tr>
+        <tr><td>Engine</td><td>Genesis Web Engine</td></tr>
+        <tr><td>JavaScript</td><td>Genesis JS (ES2015+)</td></tr>
+        <tr><td>Platform</td><td>Genesis OS</td></tr>
+        <tr><td>Build</td><td>Native Genesis Lang</td></tr>
+    </table>
+</body>
+</html>"#)
+        }
+        "settings" => {
+            String::from(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Settings - Genesis Browser</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; }
+        h1 { color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        h2 { color: #666; font-size: 18px; margin-top: 30px; }
+        .setting { display: flex; justify-content: space-between; padding: 15px 0; border-bottom: 1px solid #eee; }
+        .setting-label { font-weight: 500; }
+        .setting-desc { color: #888; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h1>Settings</h1>
+    <h2>Appearance</h2>
+    <div class="setting">
+        <div>
+            <div class="setting-label">Theme</div>
+            <div class="setting-desc">Choose light or dark mode</div>
+        </div>
+        <select>
+            <option>Light</option>
+            <option>Dark</option>
+            <option>System</option>
+        </select>
+    </div>
+    <h2>Privacy</h2>
+    <div class="setting">
+        <div>
+            <div class="setting-label">Clear browsing data</div>
+            <div class="setting-desc">Clear history, cookies, and cache</div>
+        </div>
+        <button>Clear</button>
+    </div>
+</body>
+</html>"#)
+        }
+        _ => {
+            format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Page Not Found</title>
+    <style>
+        body {{ font-family: sans-serif; padding: 40px; text-align: center; }}
+        h1 {{ color: #c00; }}
+    </style>
+</head>
+<body>
+    <h1>Page Not Found</h1>
+    <p>The page "about:{}" does not exist.</p>
+</body>
+</html>"#, page)
+        }
+    }
+}
+
+// ============================================================
+// Error Pages
+// ============================================================
+
+/// Generate an error page
+pub fn generate_error_page(error: &str, url: &str) -> String {
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Error</title>
+    <style>
+        body {{
+            font-family: sans-serif;
+            padding: 40px;
+            text-align: center;
+            background: #f5f5f5;
+        }}
+        .error-icon {{
+            font-size: 64px;
+            color: #c00;
+            margin-bottom: 20px;
+        }}
+        h1 {{
+            color: #333;
+            margin-bottom: 10px;
+        }}
+        .message {{
+            color: #666;
+            margin-bottom: 20px;
+        }}
+        .url {{
+            color: #888;
+            font-family: monospace;
+            background: #fff;
+            padding: 10px;
+            border-radius: 4px;
+            word-break: break-all;
+        }}
+        button {{
+            margin-top: 20px;
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }}
+    </style>
+</head>
+<body>
+    <div class="error-icon">!</div>
+    <h1>This page can't be reached</h1>
+    <p class="message">{}</p>
+    <p class="url">{}</p>
+    <button onclick="location.reload()">Reload</button>
+</body>
+</html>"#, error, url)
+}
+
+/// Generate a connection error page
+pub fn generate_connection_error(url: &str) -> String {
+    generate_error_page("Check your internet connection and try again.", url)
+}
+
+/// Generate a DNS error page
+pub fn generate_dns_error(host: &str) -> String {
+    generate_error_page(
+        &format!("Server DNS address could not be found: {}", host),
+        &format!("http://{}", host)
+    )
+}
+
+/// Generate a TLS error page
+pub fn generate_tls_error(url: &str, error: &str) -> String {
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Connection Not Secure</title>
+    <style>
+        body {{
+            font-family: sans-serif;
+            padding: 40px;
+            background: #f5f5f5;
+        }}
+        .warning {{
+            background: #fee;
+            border: 1px solid #fcc;
+            border-radius: 8px;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+        }}
+        h1 {{
+            color: #c00;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .details {{
+            margin-top: 20px;
+            padding: 10px;
+            background: #fff;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 14px;
+            color: #666;
+        }}
+    </style>
+</head>
+<body>
+    <div class="warning">
+        <h1>Your connection is not private</h1>
+        <p>Attackers might be trying to steal your information from <strong>{}</strong>.</p>
+        <div class="details">
+            Error: {}
+        </div>
+    </div>
+</body>
+</html>"#, url, error)
+}
+
+// ============================================================
+// Browser Integration
+// ============================================================
+
+/// Fetch a page and return its content
+pub fn fetch_page(url: &str) -> Result<String, String> {
+    let parsed = ParsedUrl::parse(url).ok_or("Invalid URL")?;
+
+    match parsed.scheme.as_str() {
+        "about" => {
+            Ok(generate_about_page(&parsed.path))
+        }
+        "http" => {
+            http_get(url).map_err(|e| format!("HTTP error: {:?}", e))
+        }
+        "https" => {
+            https_get(url).map_err(|e| format!("HTTPS error: {:?}", e))
+        }
+        "file" => {
+            // File protocol not yet implemented
+            Err("File protocol not supported".to_string())
+        }
+        _ => {
+            Err(format!("Unknown protocol: {}", parsed.scheme))
+        }
+    }
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_parsing() {
+        let url = ParsedUrl::parse("https://example.com:8080/path?query=1#frag").unwrap();
+        assert_eq!(url.scheme, "https");
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.port, Some(8080));
+        assert_eq!(url.path, "/path");
+        assert_eq!(url.query, Some("query=1".to_string()));
+        assert_eq!(url.fragment, Some("frag".to_string()));
+    }
+
+    #[test]
+    fn test_url_defaults() {
+        let url = ParsedUrl::parse("example.com/page").unwrap();
+        assert_eq!(url.scheme, "http");
+        assert_eq!(url.host, "example.com");
+        assert_eq!(url.port, None);
+        assert_eq!(url.effective_port(), 80);
+    }
+
+    #[test]
+    fn test_url_resolution() {
+        let base = ParsedUrl::parse("https://example.com/dir/page.html").unwrap();
+
+        // Absolute path
+        let resolved = base.resolve("/other/path");
+        assert_eq!(resolved.path, "/other/path");
+
+        // Relative path
+        let resolved = base.resolve("sibling.html");
+        assert_eq!(resolved.path, "/dir/sibling.html");
+
+        // Parent directory
+        let resolved = base.resolve("../parent.html");
+        assert_eq!(resolved.path, "/parent.html");
+
+        // Fragment only
+        let resolved = base.resolve("#section");
+        assert_eq!(resolved.path, "/dir/page.html");
+        assert_eq!(resolved.fragment, Some("section".to_string()));
+    }
+
+    #[test]
+    fn test_path_normalization() {
+        assert_eq!(normalize_path("/a/b/../c"), "/a/c");
+        assert_eq!(normalize_path("/a/./b/./c"), "/a/b/c");
+        assert_eq!(normalize_path("/a/b/../../c"), "/c");
+    }
+
+    #[test]
+    fn test_about_pages() {
+        let blank = generate_about_page("blank");
+        assert!(blank.contains("<!DOCTYPE html>"));
+
+        let version = generate_about_page("version");
+        assert!(version.contains("Genesis Browser"));
+    }
+}

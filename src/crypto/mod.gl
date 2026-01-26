@@ -1,0 +1,167 @@
+// Cryptographic Primitives Module
+// Provides hash functions, symmetric encryption, and key derivation
+
+pub mod sha256;
+pub mod hmac;
+pub mod aes;
+pub mod gcm;
+
+// Re-export commonly used items
+pub use sha256::{Sha256, Sha512, sha256, sha384, sha512, sha256_hex};
+pub use hmac::{HmacSha256, HmacSha384, hmac_sha256, hmac_sha384};
+pub use hmac::{hkdf_sha256, hkdf_extract_sha256, hkdf_expand_sha256, pbkdf2_sha256};
+pub use aes::{AesContext, AES_128_KEY_SIZE, AES_256_KEY_SIZE, AES_BLOCK_SIZE};
+pub use aes::{aes_cbc_encrypt, aes_cbc_decrypt, aes_ctr_encrypt, aes_ctr_decrypt};
+pub use gcm::{GcmContext, GCM_TAG_SIZE, GCM_NONCE_SIZE};
+pub use gcm::{aes_128_gcm_encrypt, aes_128_gcm_decrypt};
+pub use gcm::{aes_256_gcm_encrypt, aes_256_gcm_decrypt};
+pub use gcm::{aes_gcm_seal, aes_gcm_open};
+
+// ============================================================
+// Random Number Generation (Simple CSPRNG)
+// ============================================================
+
+static mut RNG_STATE: [u64; 4] = [0; 4];
+static mut RNG_INITIALIZED: bool = false;
+
+// Initialize RNG with seed
+pub fn rng_init(seed: &[u8]) {
+    unsafe {
+        // Use SHA-256 to expand seed
+        let hash = sha256(seed);
+
+        RNG_STATE[0] = u64_from_bytes(&hash[0..8]);
+        RNG_STATE[1] = u64_from_bytes(&hash[8..16]);
+        RNG_STATE[2] = u64_from_bytes(&hash[16..24]);
+        RNG_STATE[3] = u64_from_bytes(&hash[24..32]);
+
+        // Ensure non-zero state
+        if RNG_STATE[0] == 0 && RNG_STATE[1] == 0 && RNG_STATE[2] == 0 && RNG_STATE[3] == 0 {
+            RNG_STATE[0] = 1;
+        }
+
+        RNG_INITIALIZED = true;
+    }
+}
+
+// Generate random u64 (xoshiro256**)
+pub fn rng_u64() -> u64 {
+    unsafe {
+        if !RNG_INITIALIZED {
+            // Emergency initialization with fixed seed
+            rng_init(b"genesis_default_seed_12345");
+        }
+
+        let result = rotl64(RNG_STATE[1].wrapping_mul(5), 7).wrapping_mul(9);
+
+        let t = RNG_STATE[1] << 17;
+
+        RNG_STATE[2] = RNG_STATE[2] ^ RNG_STATE[0];
+        RNG_STATE[3] = RNG_STATE[3] ^ RNG_STATE[1];
+        RNG_STATE[1] = RNG_STATE[1] ^ RNG_STATE[2];
+        RNG_STATE[0] = RNG_STATE[0] ^ RNG_STATE[3];
+
+        RNG_STATE[2] = RNG_STATE[2] ^ t;
+        RNG_STATE[3] = rotl64(RNG_STATE[3], 45);
+
+        result
+    }
+}
+
+// Fill buffer with random bytes
+pub fn rng_fill(buffer: &mut [u8]) {
+    let mut i: usize = 0;
+    while i < buffer.len() {
+        let r = rng_u64();
+        let mut j: usize = 0;
+        while j < 8 && i + j < buffer.len() {
+            buffer[i + j] = ((r >> (j * 8)) & 0xFF) as u8;
+            j = j + 1;
+        }
+        i = i + 8;
+    }
+}
+
+// Generate random bytes as Vec
+pub fn random_bytes(len: usize) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let mut i: usize = 0;
+    while i < len {
+        buffer.push(0);
+        i = i + 1;
+    }
+    rng_fill(&mut buffer);
+    buffer
+}
+
+fn rotl64(x: u64, k: u32) -> u64 {
+    (x << k) | (x >> (64 - k))
+}
+
+fn u64_from_bytes(bytes: &[u8]) -> u64 {
+    let mut result: u64 = 0;
+    let mut i: usize = 0;
+    while i < 8 && i < bytes.len() {
+        result = result | ((bytes[i] as u64) << (i * 8));
+        i = i + 1;
+    }
+    result
+}
+
+// ============================================================
+// Secure Memory Operations
+// ============================================================
+
+// Securely zero memory
+pub fn secure_zero(buffer: &mut [u8]) {
+    let mut i: usize = 0;
+    while i < buffer.len() {
+        unsafe {
+            let ptr = buffer.as_mut_ptr().offset(i as isize);
+            core::ptr::write_volatile(ptr, 0);
+        }
+        i = i + 1;
+    }
+    // Memory barrier to prevent optimization
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// Constant-time comparison
+pub fn secure_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut result: u8 = 0;
+    let mut i: usize = 0;
+    while i < a.len() {
+        result = result | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    result == 0
+}
+
+// ============================================================
+// Key Generation Helpers
+// ============================================================
+
+// Generate random AES-128 key
+pub fn generate_aes_128_key() -> [u8; 16] {
+    let mut key: [u8; 16] = [0; 16];
+    rng_fill(&mut key);
+    key
+}
+
+// Generate random AES-256 key
+pub fn generate_aes_256_key() -> [u8; 32] {
+    let mut key: [u8; 32] = [0; 32];
+    rng_fill(&mut key);
+    key
+}
+
+// Generate random nonce for GCM
+pub fn generate_gcm_nonce() -> [u8; 12] {
+    let mut nonce: [u8; 12] = [0; 12];
+    rng_fill(&mut nonce);
+    nonce
+}

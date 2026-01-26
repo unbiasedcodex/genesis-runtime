@@ -1,0 +1,492 @@
+// Inline Layout Algorithm
+// CSS 2.1 Visual Formatting Model for inline-level boxes
+
+use super::box_model::{LayoutBox, BoxType, BoxDimensions, Rect, ContainingBlock, LayoutContext};
+use super::box_model::{LineBox, LineFragment, FragmentContent};
+use super::super::css::{ComputedStyle, Dimension, TextAlign, VerticalAlign, WhiteSpace};
+use super::super::css::{Color, LineHeight};
+
+// ============================================================
+// Inline Formatting Context
+// ============================================================
+
+pub struct InlineFormattingContext {
+    pub line_boxes: Vec<LineBox>,
+    pub current_line: LineBox,
+    pub containing: ContainingBlock,
+    pub max_width: f64,
+}
+
+impl InlineFormattingContext {
+    pub fn new(containing: ContainingBlock) -> InlineFormattingContext {
+        InlineFormattingContext {
+            line_boxes: Vec::new(),
+            current_line: LineBox::new(containing.x, containing.y),
+            containing,
+            max_width: containing.width,
+        }
+    }
+
+    // Start a new line
+    pub fn new_line(&mut self) {
+        if !self.current_line.is_empty() {
+            // Finalize current line
+            self.finalize_line();
+
+            // Start new line
+            let y = self.current_line.y + self.current_line.height;
+            let new_line = LineBox::new(self.containing.x, y);
+            self.line_boxes.push(std::mem::replace(&mut self.current_line, new_line));
+        }
+    }
+
+    // Add a fragment to current line
+    pub fn add_fragment(&mut self, fragment: LineFragment) {
+        // Check if fragment fits on current line
+        if self.current_line.width + fragment.width > self.max_width && !self.current_line.is_empty() {
+            self.new_line();
+        }
+
+        self.current_line.add_fragment(fragment);
+    }
+
+    // Finalize current line (apply text-align, vertical-align)
+    fn finalize_line(&mut self) {
+        // Nothing to do for now - alignment is handled during painting
+    }
+
+    // Get total height of all lines
+    pub fn total_height(&self) -> f64 {
+        let mut height = 0.0;
+        for line in &self.line_boxes {
+            height += line.height;
+        }
+        height += self.current_line.height;
+        height
+    }
+
+    // Finish inline formatting
+    pub fn finish(mut self) -> Vec<LineBox> {
+        if !self.current_line.is_empty() {
+            self.line_boxes.push(self.current_line);
+        }
+        self.line_boxes
+    }
+}
+
+// ============================================================
+// Inline Layout
+// ============================================================
+
+pub fn layout_inline_container(
+    layout_box: &mut LayoutBox,
+    containing: &ContainingBlock,
+    ctx: &LayoutContext,
+) {
+    let mut ifc = InlineFormattingContext::new(*containing);
+
+    // Process children
+    for child in &mut layout_box.children {
+        layout_inline_box(child, &mut ifc, ctx);
+    }
+
+    // Store line boxes
+    layout_box.line_boxes = ifc.finish();
+
+    // Calculate content height from line boxes
+    let mut height = 0.0;
+    for line in &layout_box.line_boxes {
+        height += line.height;
+    }
+    layout_box.dimensions.content.height = height;
+}
+
+pub fn layout_inline_box(
+    layout_box: &mut LayoutBox,
+    ifc: &mut InlineFormattingContext,
+    ctx: &LayoutContext,
+) {
+    match layout_box.box_type {
+        BoxType::Text => {
+            layout_text_box(layout_box, ifc, ctx);
+        },
+        BoxType::Inline => {
+            layout_inline_element(layout_box, ifc, ctx);
+        },
+        BoxType::InlineBlock => {
+            layout_inline_block(layout_box, ifc, ctx);
+        },
+        BoxType::Anonymous => {
+            // Layout children of anonymous box
+            for child in &mut layout_box.children {
+                layout_inline_box(child, ifc, ctx);
+            }
+        },
+        _ => {
+            // Treat as inline-block
+            layout_inline_block(layout_box, ifc, ctx);
+        }
+    }
+}
+
+fn layout_text_box(
+    layout_box: &mut LayoutBox,
+    ifc: &mut InlineFormattingContext,
+    ctx: &LayoutContext,
+) {
+    let text = match &layout_box.text {
+        Some(t) => t.clone(),
+        None => return,
+    };
+
+    let style = &layout_box.style;
+    let font_size = style.font_size;
+    let line_height = calculate_line_height(&style.line_height, font_size);
+    let color = style.color;
+
+    // Split text into words
+    let words = split_text(&text, style.white_space);
+
+    for word in words {
+        // Calculate word width (simplified - uses character count)
+        let word_width = measure_text(&word, font_size);
+
+        // Check if word fits on current line
+        if ifc.current_line.width + word_width > ifc.max_width && !ifc.current_line.is_empty() {
+            ifc.new_line();
+        }
+
+        // Create fragment for word
+        let fragment = LineFragment {
+            x: ifc.current_line.x + ifc.current_line.width,
+            y: ifc.current_line.y,
+            width: word_width,
+            height: line_height,
+            baseline: font_size * 0.8, // Approximate baseline
+            content: FragmentContent::Text {
+                text: word,
+                font_size,
+                color,
+            },
+        };
+
+        ifc.add_fragment(fragment);
+    }
+}
+
+fn layout_inline_element(
+    layout_box: &mut LayoutBox,
+    ifc: &mut InlineFormattingContext,
+    ctx: &LayoutContext,
+) {
+    let style = &layout_box.style;
+
+    // Inline elements contribute padding/border but not width/height
+    let padding_left = resolve_length(&style.padding_left, ifc.max_width);
+    let padding_right = resolve_length(&style.padding_right, ifc.max_width);
+    let border_left = style.border_left_width;
+    let border_right = style.border_right_width;
+
+    layout_box.dimensions.padding.left = padding_left;
+    layout_box.dimensions.padding.right = padding_right;
+    layout_box.dimensions.border.left = border_left;
+    layout_box.dimensions.border.right = border_right;
+
+    // Add left padding/border as fragment
+    if padding_left + border_left > 0.0 {
+        let fragment = LineFragment {
+            x: ifc.current_line.x + ifc.current_line.width,
+            y: ifc.current_line.y,
+            width: padding_left + border_left,
+            height: style.font_size,
+            baseline: style.font_size * 0.8,
+            content: FragmentContent::InlineBox { box_index: 0 },
+        };
+        ifc.add_fragment(fragment);
+    }
+
+    // Layout children
+    for child in &mut layout_box.children {
+        layout_inline_box(child, ifc, ctx);
+    }
+
+    // Add right padding/border
+    if padding_right + border_right > 0.0 {
+        let fragment = LineFragment {
+            x: ifc.current_line.x + ifc.current_line.width,
+            y: ifc.current_line.y,
+            width: padding_right + border_right,
+            height: style.font_size,
+            baseline: style.font_size * 0.8,
+            content: FragmentContent::InlineBox { box_index: 0 },
+        };
+        ifc.add_fragment(fragment);
+    }
+}
+
+fn layout_inline_block(
+    layout_box: &mut LayoutBox,
+    ifc: &mut InlineFormattingContext,
+    ctx: &LayoutContext,
+) {
+    let style = &layout_box.style;
+
+    // Calculate width
+    let width = match style.width {
+        Dimension::Length(w) => w,
+        Dimension::Percentage(p) => ifc.max_width * p / 100.0,
+        Dimension::Auto => {
+            // Shrink to fit
+            calculate_shrink_to_fit(layout_box, ifc.max_width, ctx)
+        },
+        _ => 0.0,
+    };
+
+    layout_box.dimensions.content.width = width;
+
+    // Set padding/border
+    layout_box.dimensions.padding.left = resolve_length(&style.padding_left, ifc.max_width);
+    layout_box.dimensions.padding.right = resolve_length(&style.padding_right, ifc.max_width);
+    layout_box.dimensions.padding.top = resolve_length(&style.padding_top, ifc.max_width);
+    layout_box.dimensions.padding.bottom = resolve_length(&style.padding_bottom, ifc.max_width);
+    layout_box.dimensions.border.left = style.border_left_width;
+    layout_box.dimensions.border.right = style.border_right_width;
+    layout_box.dimensions.border.top = style.border_top_width;
+    layout_box.dimensions.border.bottom = style.border_bottom_width;
+    layout_box.dimensions.margin.left = resolve_length(&style.margin_left, ifc.max_width);
+    layout_box.dimensions.margin.right = resolve_length(&style.margin_right, ifc.max_width);
+    layout_box.dimensions.margin.top = resolve_length(&style.margin_top, ifc.max_width);
+    layout_box.dimensions.margin.bottom = resolve_length(&style.margin_bottom, ifc.max_width);
+
+    // Layout as block internally
+    let internal_containing = ContainingBlock {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height: 0.0,
+    };
+
+    super::block::layout_block(layout_box, internal_containing, ctx);
+
+    // Calculate total inline box dimensions
+    let total_width = layout_box.dimensions.margin_box().width;
+    let total_height = layout_box.dimensions.margin_box().height;
+
+    // Check if fits on current line
+    if ifc.current_line.width + total_width > ifc.max_width && !ifc.current_line.is_empty() {
+        ifc.new_line();
+    }
+
+    // Position the box
+    layout_box.dimensions.content.x = ifc.current_line.x + ifc.current_line.width +
+                                      layout_box.dimensions.margin.left +
+                                      layout_box.dimensions.border.left +
+                                      layout_box.dimensions.padding.left;
+    layout_box.dimensions.content.y = ifc.current_line.y +
+                                      layout_box.dimensions.margin.top +
+                                      layout_box.dimensions.border.top +
+                                      layout_box.dimensions.padding.top;
+
+    // Create fragment
+    let fragment = LineFragment {
+        x: ifc.current_line.x + ifc.current_line.width,
+        y: ifc.current_line.y,
+        width: total_width,
+        height: total_height,
+        baseline: total_height - layout_box.dimensions.margin.bottom -
+                  layout_box.dimensions.border.bottom - layout_box.dimensions.padding.bottom,
+        content: FragmentContent::ReplacedContent {
+            width: total_width,
+            height: total_height,
+        },
+    };
+
+    ifc.add_fragment(fragment);
+}
+
+// ============================================================
+// Text Processing
+// ============================================================
+
+fn split_text(text: &str, white_space: WhiteSpace) -> Vec<String> {
+    match white_space {
+        WhiteSpace::Pre | WhiteSpace::PreWrap => {
+            // Preserve whitespace and newlines
+            let mut words = Vec::new();
+            let mut current = String::new();
+
+            for c in text.chars() {
+                if c == '\n' {
+                    if !current.is_empty() {
+                        words.push(current);
+                        current = String::new();
+                    }
+                    words.push(String::from("\n"));
+                } else {
+                    current.push(c);
+                }
+            }
+
+            if !current.is_empty() {
+                words.push(current);
+            }
+
+            words
+        },
+        WhiteSpace::Nowrap => {
+            // Collapse whitespace, no line breaks
+            vec![collapse_whitespace(text)]
+        },
+        _ => {
+            // Normal: collapse whitespace, break on spaces
+            let collapsed = collapse_whitespace(text);
+            let mut words = Vec::new();
+            let mut current = String::new();
+
+            for c in collapsed.chars() {
+                if c == ' ' {
+                    if !current.is_empty() {
+                        current.push(' '); // Include space in word
+                        words.push(current);
+                        current = String::new();
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+
+            if !current.is_empty() {
+                words.push(current);
+            }
+
+            words
+        }
+    }
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::new();
+    let mut last_was_space = false;
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(c);
+            last_was_space = false;
+        }
+    }
+
+    result
+}
+
+fn measure_text(text: &str, font_size: f64) -> f64 {
+    // Simplified text measurement
+    // In a full implementation, this would use font metrics
+    let char_width = font_size * 0.5; // Average character width
+    text.chars().count() as f64 * char_width
+}
+
+fn calculate_line_height(line_height: &LineHeight, font_size: f64) -> f64 {
+    match line_height {
+        LineHeight::Normal => font_size * 1.2,
+        LineHeight::Number(n) => font_size * n,
+        LineHeight::Length(l) => *l,
+        LineHeight::Percentage(p) => font_size * p / 100.0,
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn resolve_length(dim: &Dimension, containing: f64) -> f64 {
+    match dim {
+        Dimension::Length(v) => *v,
+        Dimension::Percentage(p) => containing * p / 100.0,
+        _ => 0.0,
+    }
+}
+
+fn calculate_shrink_to_fit(layout_box: &LayoutBox, available: f64, _ctx: &LayoutContext) -> f64 {
+    // Simplified shrink-to-fit
+    let mut preferred_width = 0.0;
+
+    if let Some(text) = &layout_box.text {
+        preferred_width = measure_text(text, layout_box.style.font_size);
+    }
+
+    for child in &layout_box.children {
+        let child_width = child.dimensions.margin_box().width;
+        preferred_width = preferred_width.max(child_width);
+    }
+
+    preferred_width.min(available)
+}
+
+// ============================================================
+// Line Box Alignment
+// ============================================================
+
+pub fn align_line_box(line: &mut LineBox, max_width: f64, text_align: TextAlign) {
+    let extra_space = max_width - line.width;
+
+    if extra_space <= 0.0 {
+        return;
+    }
+
+    match text_align {
+        TextAlign::Right | TextAlign::End => {
+            // Shift all fragments right
+            for fragment in &mut line.fragments {
+                fragment.x += extra_space;
+            }
+        },
+        TextAlign::Center => {
+            let offset = extra_space / 2.0;
+            for fragment in &mut line.fragments {
+                fragment.x += offset;
+            }
+        },
+        TextAlign::Justify => {
+            // Distribute space between words
+            let gap_count = line.fragments.len().saturating_sub(1);
+            if gap_count > 0 {
+                let gap = extra_space / gap_count as f64;
+                let mut offset = 0.0;
+                for fragment in &mut line.fragments {
+                    fragment.x += offset;
+                    offset += gap;
+                }
+            }
+        },
+        _ => {
+            // Left/Start - no change needed
+        }
+    }
+}
+
+pub fn align_vertical(line: &mut LineBox, baseline: f64, vertical_align: VerticalAlign) {
+    for fragment in &mut line.fragments {
+        match vertical_align {
+            VerticalAlign::Baseline => {
+                fragment.y = line.y + baseline - fragment.baseline;
+            },
+            VerticalAlign::Top => {
+                fragment.y = line.y;
+            },
+            VerticalAlign::Bottom => {
+                fragment.y = line.y + line.height - fragment.height;
+            },
+            VerticalAlign::Middle => {
+                fragment.y = line.y + (line.height - fragment.height) / 2.0;
+            },
+            _ => {
+                fragment.y = line.y + baseline - fragment.baseline;
+            }
+        }
+    }
+}

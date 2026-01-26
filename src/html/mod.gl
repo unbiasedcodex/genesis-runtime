@@ -1,0 +1,383 @@
+// HTML5 Parser Module
+// WHATWG HTML5 Parsing Specification compliant
+
+pub mod tokenizer;
+pub mod treebuilder;
+
+// Re-export commonly used items
+pub use tokenizer::{Tokenizer, HtmlToken, Attribute, TokenizerState};
+pub use tokenizer::{is_void_element, is_raw_text_element, is_escapable_raw_text_element};
+pub use treebuilder::{TreeBuilder, Document, Node, NodeType, NodeData, Namespace, QuirksMode};
+pub use treebuilder::{parse_html};
+
+// ============================================================
+// DOM Traversal Helpers
+// ============================================================
+
+impl Document {
+    // Get first child element of a node
+    pub fn first_element_child(&self, node_idx: usize) -> Option<usize> {
+        if let Some(node) = self.get_node(node_idx) {
+            for &child_idx in &node.children {
+                if let Some(child) = self.get_node(child_idx) {
+                    if child.node_type == NodeType::Element {
+                        return Some(child_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get last child element of a node
+    pub fn last_element_child(&self, node_idx: usize) -> Option<usize> {
+        if let Some(node) = self.get_node(node_idx) {
+            for &child_idx in node.children.iter().rev() {
+                if let Some(child) = self.get_node(child_idx) {
+                    if child.node_type == NodeType::Element {
+                        return Some(child_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get next sibling element
+    pub fn next_element_sibling(&self, node_idx: usize) -> Option<usize> {
+        if let Some(node) = self.get_node(node_idx) {
+            if let Some(parent_idx) = node.parent {
+                if let Some(parent) = self.get_node(parent_idx) {
+                    let mut found = false;
+                    for &sibling_idx in &parent.children {
+                        if found {
+                            if let Some(sibling) = self.get_node(sibling_idx) {
+                                if sibling.node_type == NodeType::Element {
+                                    return Some(sibling_idx);
+                                }
+                            }
+                        }
+                        if sibling_idx == node_idx {
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get previous sibling element
+    pub fn previous_element_sibling(&self, node_idx: usize) -> Option<usize> {
+        if let Some(node) = self.get_node(node_idx) {
+            if let Some(parent_idx) = node.parent {
+                if let Some(parent) = self.get_node(parent_idx) {
+                    let mut last_element: Option<usize> = None;
+                    for &sibling_idx in &parent.children {
+                        if sibling_idx == node_idx {
+                            return last_element;
+                        }
+                        if let Some(sibling) = self.get_node(sibling_idx) {
+                            if sibling.node_type == NodeType::Element {
+                                last_element = Some(sibling_idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get parent element
+    pub fn parent_element(&self, node_idx: usize) -> Option<usize> {
+        if let Some(node) = self.get_node(node_idx) {
+            if let Some(parent_idx) = node.parent {
+                if let Some(parent) = self.get_node(parent_idx) {
+                    if parent.node_type == NodeType::Element {
+                        return Some(parent_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Get all child elements
+    pub fn child_elements(&self, node_idx: usize) -> Vec<usize> {
+        let mut result = Vec::new();
+        if let Some(node) = self.get_node(node_idx) {
+            for &child_idx in &node.children {
+                if let Some(child) = self.get_node(child_idx) {
+                    if child.node_type == NodeType::Element {
+                        result.push(child_idx);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    // Count child elements
+    pub fn child_element_count(&self, node_idx: usize) -> usize {
+        self.child_elements(node_idx).len()
+    }
+
+    // Check if node has child elements
+    pub fn has_child_elements(&self, node_idx: usize) -> bool {
+        if let Some(node) = self.get_node(node_idx) {
+            for &child_idx in &node.children {
+                if let Some(child) = self.get_node(child_idx) {
+                    if child.node_type == NodeType::Element {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // Check if element matches selector
+    pub fn matches(&self, node_idx: usize, selector: &str) -> bool {
+        let selector = selector.trim();
+
+        if let Some(node) = self.get_node(node_idx) {
+            if node.node_type != NodeType::Element {
+                return false;
+            }
+
+            if selector.starts_with('#') {
+                // ID selector
+                let id = &selector[1..];
+                return node.get_attribute("id") == Some(id);
+            } else if selector.starts_with('.') {
+                // Class selector
+                let class_name = &selector[1..];
+                if let Some(classes) = node.get_attribute("class") {
+                    for class in classes.split_whitespace() {
+                        if class == class_name {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            } else {
+                // Tag selector
+                return node.tag_name() == Some(selector);
+            }
+        }
+
+        false
+    }
+
+    // Find closest ancestor matching selector
+    pub fn closest(&self, node_idx: usize, selector: &str) -> Option<usize> {
+        let mut current = Some(node_idx);
+
+        while let Some(idx) = current {
+            if self.matches(idx, selector) {
+                return Some(idx);
+            }
+            if let Some(node) = self.get_node(idx) {
+                current = node.parent;
+            } else {
+                current = None;
+            }
+        }
+
+        None
+    }
+
+    // Query selector all
+    pub fn query_selector_all(&self, selector: &str) -> Vec<usize> {
+        let mut result = Vec::new();
+        self.collect_matching(0, selector, &mut result);
+        result
+    }
+
+    fn collect_matching(&self, node_idx: usize, selector: &str, result: &mut Vec<usize>) {
+        if let Some(node) = self.get_node(node_idx) {
+            if node.node_type == NodeType::Element {
+                if self.matches(node_idx, selector) {
+                    result.push(node_idx);
+                }
+            }
+
+            for &child_idx in &node.children {
+                self.collect_matching(child_idx, selector, result);
+            }
+        }
+    }
+
+    // Get outer HTML
+    pub fn get_outer_html(&self, node_idx: usize) -> String {
+        let mut result = String::new();
+        self.serialize_node(node_idx, &mut result, true);
+        result
+    }
+
+    // Get inner HTML
+    pub fn get_inner_html(&self, node_idx: usize) -> String {
+        let mut result = String::new();
+        if let Some(node) = self.get_node(node_idx) {
+            for &child_idx in &node.children {
+                self.serialize_node(child_idx, &mut result, true);
+            }
+        }
+        result
+    }
+
+    fn serialize_node(&self, node_idx: usize, result: &mut String, include_self: bool) {
+        if let Some(node) = self.get_node(node_idx) {
+            match &node.data {
+                NodeData::Document => {
+                    for &child_idx in &node.children {
+                        self.serialize_node(child_idx, result, true);
+                    }
+                },
+                NodeData::DocumentType { name, .. } => {
+                    result.push_str("<!DOCTYPE ");
+                    result.push_str(name);
+                    result.push('>');
+                },
+                NodeData::Element { tag_name, attributes, .. } => {
+                    if include_self {
+                        result.push('<');
+                        result.push_str(tag_name);
+
+                        for attr in attributes {
+                            result.push(' ');
+                            result.push_str(&attr.name);
+                            result.push_str("=\"");
+                            result.push_str(&escape_attribute(&attr.value));
+                            result.push('"');
+                        }
+
+                        if is_void_element(tag_name) {
+                            result.push_str(" />");
+                            return;
+                        }
+
+                        result.push('>');
+                    }
+
+                    for &child_idx in &node.children {
+                        self.serialize_node(child_idx, result, true);
+                    }
+
+                    if include_self {
+                        result.push_str("</");
+                        result.push_str(tag_name);
+                        result.push('>');
+                    }
+                },
+                NodeData::Text { content } => {
+                    result.push_str(&escape_text(content));
+                },
+                NodeData::Comment { content } => {
+                    result.push_str("<!--");
+                    result.push_str(content);
+                    result.push_str("-->");
+                },
+            }
+        }
+    }
+}
+
+// ============================================================
+// HTML Escaping
+// ============================================================
+
+fn escape_text(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+fn escape_attribute(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '&' => result.push_str("&amp;"),
+            '"' => result.push_str("&quot;"),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+// Parse HTML fragment (for innerHTML)
+pub fn parse_fragment(html: &str, context: &str) -> Document {
+    // Wrap fragment in context element
+    let wrapped = format!("<{}>{}</{}>", context, html, context);
+    parse_html(&wrapped)
+}
+
+// Quick parse and get body content
+pub fn parse_body(html: &str) -> Document {
+    let full_html = format!("<!DOCTYPE html><html><body>{}</body></html>", html);
+    parse_html(&full_html)
+}
+
+// ============================================================
+// Tests (debug builds only)
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_basic_parsing() {
+        let html = "<html><head><title>Test</title></head><body><p>Hello</p></body></html>";
+        let doc = parse_html(html);
+
+        assert!(doc.document_element.is_some());
+        assert!(doc.head.is_some());
+        assert!(doc.body.is_some());
+    }
+
+    fn test_attributes() {
+        let html = r#"<div id="main" class="container">Content</div>"#;
+        let doc = parse_html(html);
+
+        let div = doc.query_selector("div");
+        assert!(div.is_some());
+
+        if let Some(idx) = div {
+            if let Some(node) = doc.get_node(idx) {
+                assert_eq!(node.get_attribute("id"), Some("main"));
+                assert_eq!(node.get_attribute("class"), Some("container"));
+            }
+        }
+    }
+
+    fn test_nested_elements() {
+        let html = "<div><span><a href='#'>Link</a></span></div>";
+        let doc = parse_html(html);
+
+        let links = doc.get_elements_by_tag_name("a");
+        assert_eq!(links.len(), 1);
+    }
+
+    fn test_text_content() {
+        let html = "<p>Hello <strong>World</strong>!</p>";
+        let doc = parse_html(html);
+
+        if let Some(body_idx) = doc.body {
+            let text = doc.get_inner_text(body_idx);
+            assert!(text.contains("Hello"));
+            assert!(text.contains("World"));
+        }
+    }
+}

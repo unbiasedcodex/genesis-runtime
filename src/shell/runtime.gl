@@ -130,6 +130,43 @@ fn syscall4(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
     result
 }
 
+// For framebuffer syscalls that use R8/R9 for args 4/5
+fn syscall5_fb(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, arg5: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r8") arg4,
+            in("r9") arg5,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// For framebuffer syscalls that use R8 for arg4
+fn syscall4_fb(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r8") arg4,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
 // ============================================================================
 // Process Management
 // ============================================================================
@@ -649,4 +686,53 @@ pub fn ip_byte(ip: i64, idx: i64) -> i64 {
     if idx == 1 { return (ip / 65536) % 256; }
     if idx == 2 { return (ip / 256) % 256; }
     ip % 256
+}
+
+// ============================================================================
+// Framebuffer Graphics Syscalls
+// ============================================================================
+
+pub const SYS_FB_INFO: i64 = 70;
+pub const SYS_FB_PIXEL: i64 = 71;
+pub const SYS_FB_RECT: i64 = 72;
+pub const SYS_FB_SWAP: i64 = 73;
+pub const SYS_FB_CLEAR: i64 = 74;
+pub const SYS_FB_BLIT: i64 = 75;
+pub const SYS_FB_MAP: i64 = 76;
+pub const SYS_FB_CHAR: i64 = 77;
+pub const SYS_FB_TEXT: i64 = 78;
+
+// Get framebuffer info (returns width << 32 | height, or packed info)
+pub fn fb_info(query: i64) -> i64 {
+    syscall1(SYS_FB_INFO, query)
+}
+
+// Draw a single pixel
+pub fn fb_pixel(x: i64, y: i64, color: i64) -> i64 {
+    syscall3(SYS_FB_PIXEL, x, y, color)
+}
+
+// Draw a filled rectangle (uses R8/R9 for args 4/5)
+pub fn fb_rect(x: i64, y: i64, w: i64, h: i64, color: i64) -> i64 {
+    syscall5_fb(SYS_FB_RECT, x, y, w, h, color)
+}
+
+// Swap buffers (display back buffer)
+pub fn fb_swap() -> i64 {
+    syscall0(SYS_FB_SWAP)
+}
+
+// Clear framebuffer with color
+pub fn fb_clear(color: i64) -> i64 {
+    syscall1(SYS_FB_CLEAR, color)
+}
+
+// Draw character at position (uses R8 for arg4)
+pub fn fb_char(x: i64, y: i64, ch: i64, color: i64) -> i64 {
+    syscall4_fb(SYS_FB_CHAR, x, y, ch, color)
+}
+
+// Draw text string at position (text_addr is pointer to null-terminated string)
+pub fn fb_text(x: i64, y: i64, text_addr: i64, color: i64) -> i64 {
+    syscall4_fb(SYS_FB_TEXT, x, y, text_addr, color)
 }

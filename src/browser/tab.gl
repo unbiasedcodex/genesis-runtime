@@ -1,0 +1,856 @@
+// Browser Tab
+// Manages a single browser tab with document, navigation, and rendering
+
+use super::super::html::{Document, parse_html};
+use super::super::css::{Stylesheet, parse_stylesheet};
+use super::super::layout::{LayoutBox, LayoutTreeBuilder, layout_document, build_paint_list, PaintCommand};
+use super::super::js::{JsRuntime, JsValue, ScriptContext};
+use super::super::net::{HttpClient, HttpResponse, Url};
+use super::super::tls::TlsStream;
+
+use std::rc::Rc;
+use std::cell::RefCell;
+
+// ============================================================
+// Tab State
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TabState {
+    Empty,
+    Loading,
+    Loaded,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LoadingPhase {
+    FetchingHtml,
+    ParsingHtml,
+    FetchingResources,
+    ParsingCss,
+    ExecutingScripts,
+    Layout,
+    Paint,
+    Complete,
+}
+
+// ============================================================
+// Navigation History
+// ============================================================
+
+pub struct NavigationEntry {
+    pub url: String,
+    pub title: String,
+    pub scroll_x: i32,
+    pub scroll_y: i32,
+}
+
+pub struct NavigationHistory {
+    entries: Vec<NavigationEntry>,
+    current_index: i32,
+}
+
+impl NavigationHistory {
+    pub fn new() -> NavigationHistory {
+        NavigationHistory {
+            entries: Vec::new(),
+            current_index: -1,
+        }
+    }
+
+    pub fn push(&mut self, url: String, title: String) {
+        // Remove forward history
+        if self.current_index < self.entries.len() as i32 - 1 {
+            self.entries.truncate((self.current_index + 1) as usize);
+        }
+
+        self.entries.push(NavigationEntry {
+            url,
+            title,
+            scroll_x: 0,
+            scroll_y: 0,
+        });
+        self.current_index = self.entries.len() as i32 - 1;
+    }
+
+    pub fn current(&self) -> Option<&NavigationEntry> {
+        if self.current_index >= 0 && (self.current_index as usize) < self.entries.len() {
+            Some(&self.entries[self.current_index as usize])
+        } else {
+            None
+        }
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut NavigationEntry> {
+        if self.current_index >= 0 && (self.current_index as usize) < self.entries.len() {
+            Some(&mut self.entries[self.current_index as usize])
+        } else {
+            None
+        }
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.current_index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.current_index < self.entries.len() as i32 - 1
+    }
+
+    pub fn go_back(&mut self) -> Option<&NavigationEntry> {
+        if self.can_go_back() {
+            self.current_index -= 1;
+            self.current()
+        } else {
+            None
+        }
+    }
+
+    pub fn go_forward(&mut self) -> Option<&NavigationEntry> {
+        if self.can_go_forward() {
+            self.current_index += 1;
+            self.current()
+        } else {
+            None
+        }
+    }
+
+    pub fn length(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+// ============================================================
+// Resource Loader
+// ============================================================
+
+pub struct ResourceLoader {
+    base_url: String,
+    cache: std::collections::HashMap<String, ResourceData>,
+}
+
+pub enum ResourceData {
+    Stylesheet(Stylesheet),
+    Image(Vec<u8>),
+    Script(String),
+    Font(Vec<u8>),
+}
+
+impl ResourceLoader {
+    pub fn new(base_url: &str) -> ResourceLoader {
+        ResourceLoader {
+            base_url: base_url.to_string(),
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn resolve_url(&self, href: &str) -> String {
+        if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_string()
+        } else if href.starts_with("//") {
+            format!("https:{}", href)
+        } else if href.starts_with('/') {
+            // Absolute path
+            if let Ok(url) = Url::parse(&self.base_url) {
+                format!("{}://{}{}", url.scheme, url.host, href)
+            } else {
+                href.to_string()
+            }
+        } else {
+            // Relative path
+            let base = self.base_url.trim_end_matches(|c| c != '/');
+            format!("{}/{}", base, href)
+        }
+    }
+
+    pub fn fetch(&mut self, url: &str) -> Result<Vec<u8>, LoadError> {
+        let resolved_url = self.resolve_url(url);
+
+        // Check cache first
+        if self.cache.contains_key(&resolved_url) {
+            // Already cached
+        }
+
+        // Fetch resource
+        fetch_url(&resolved_url)
+    }
+
+    pub fn fetch_stylesheet(&mut self, url: &str) -> Result<Stylesheet, LoadError> {
+        let data = self.fetch(url)?;
+        let css_text = String::from_utf8(data).map_err(|_| LoadError::InvalidData)?;
+        Ok(parse_stylesheet(&css_text))
+    }
+
+    pub fn fetch_script(&mut self, url: &str) -> Result<String, LoadError> {
+        let data = self.fetch(url)?;
+        String::from_utf8(data).map_err(|_| LoadError::InvalidData)
+    }
+}
+
+// ============================================================
+// Tab
+// ============================================================
+
+pub struct Tab {
+    pub id: u64,
+    pub state: TabState,
+    pub loading_phase: LoadingPhase,
+
+    // Content
+    pub url: String,
+    pub title: String,
+    pub document: Option<Document>,
+    pub stylesheets: Vec<Stylesheet>,
+    pub layout_root: Option<LayoutBox>,
+    pub paint_commands: Vec<PaintCommand>,
+
+    // JavaScript
+    pub js_runtime: Option<JsRuntime>,
+    pub scripts_to_execute: Vec<String>,
+
+    // Navigation
+    pub history: NavigationHistory,
+
+    // Viewport
+    pub scroll_x: i32,
+    pub scroll_y: i32,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+
+    // Resources
+    pub resource_loader: ResourceLoader,
+
+    // Error info
+    pub error_message: Option<String>,
+
+    // Flags
+    pub needs_layout: bool,
+    pub needs_paint: bool,
+    pub favicon_url: Option<String>,
+}
+
+impl Tab {
+    pub fn new(id: u64, viewport_width: u32, viewport_height: u32) -> Tab {
+        Tab {
+            id,
+            state: TabState::Empty,
+            loading_phase: LoadingPhase::Complete,
+            url: String::new(),
+            title: "New Tab".to_string(),
+            document: None,
+            stylesheets: Vec::new(),
+            layout_root: None,
+            paint_commands: Vec::new(),
+            js_runtime: None,
+            scripts_to_execute: Vec::new(),
+            history: NavigationHistory::new(),
+            scroll_x: 0,
+            scroll_y: 0,
+            viewport_width,
+            viewport_height,
+            resource_loader: ResourceLoader::new(""),
+            error_message: None,
+            needs_layout: false,
+            needs_paint: false,
+            favicon_url: None,
+        }
+    }
+
+    // --------------------------------------------------------
+    // Navigation
+    // --------------------------------------------------------
+
+    pub fn navigate(&mut self, url: &str) -> Result<(), LoadError> {
+        self.state = TabState::Loading;
+        self.loading_phase = LoadingPhase::FetchingHtml;
+        self.error_message = None;
+
+        // Reset scroll position
+        self.scroll_x = 0;
+        self.scroll_y = 0;
+
+        // Resolve URL
+        let resolved_url = if url.contains("://") {
+            url.to_string()
+        } else if url.starts_with("//") {
+            format!("https:{}", url)
+        } else {
+            format!("https://{}", url)
+        };
+
+        self.url = resolved_url.clone();
+        self.resource_loader = ResourceLoader::new(&resolved_url);
+
+        // Fetch HTML
+        let html_data = match fetch_url(&resolved_url) {
+            Ok(data) => data,
+            Err(e) => {
+                self.state = TabState::Error;
+                self.error_message = Some(format!("Failed to load: {:?}", e));
+                return Err(e);
+            }
+        };
+
+        let html_text = String::from_utf8(html_data).map_err(|_| LoadError::InvalidData)?;
+
+        // Parse HTML
+        self.loading_phase = LoadingPhase::ParsingHtml;
+        let document = parse_html(&html_text);
+
+        // Extract title
+        self.title = extract_title(&document).unwrap_or_else(|| "Untitled".to_string());
+
+        // Extract favicon
+        self.favicon_url = extract_favicon(&document);
+
+        // Store document
+        self.document = Some(document);
+
+        // Fetch and parse stylesheets
+        self.loading_phase = LoadingPhase::FetchingResources;
+        self.load_stylesheets()?;
+
+        // Fetch and queue scripts
+        self.load_scripts()?;
+
+        // Parse CSS
+        self.loading_phase = LoadingPhase::ParsingCss;
+        self.apply_default_stylesheet();
+
+        // Initialize JavaScript runtime
+        self.loading_phase = LoadingPhase::ExecutingScripts;
+        self.initialize_js_runtime();
+
+        // Execute inline scripts
+        self.execute_scripts()?;
+
+        // Perform layout
+        self.loading_phase = LoadingPhase::Layout;
+        self.perform_layout();
+
+        // Build paint commands
+        self.loading_phase = LoadingPhase::Paint;
+        self.build_paint_commands();
+
+        // Add to history
+        self.history.push(self.url.clone(), self.title.clone());
+
+        self.loading_phase = LoadingPhase::Complete;
+        self.state = TabState::Loaded;
+
+        Ok(())
+    }
+
+    pub fn reload(&mut self) -> Result<(), LoadError> {
+        let url = self.url.clone();
+        self.navigate(&url)
+    }
+
+    pub fn go_back(&mut self) -> Result<bool, LoadError> {
+        if let Some(entry) = self.history.go_back() {
+            let url = entry.url.clone();
+            self.scroll_x = entry.scroll_x;
+            self.scroll_y = entry.scroll_y;
+            self.navigate(&url)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn go_forward(&mut self) -> Result<bool, LoadError> {
+        if let Some(entry) = self.history.go_forward() {
+            let url = entry.url.clone();
+            self.scroll_x = entry.scroll_x;
+            self.scroll_y = entry.scroll_y;
+            self.navigate(&url)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.history.can_go_back()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.history.can_go_forward()
+    }
+
+    pub fn stop(&mut self) {
+        if self.state == TabState::Loading {
+            self.state = TabState::Loaded;
+            self.loading_phase = LoadingPhase::Complete;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Resource Loading
+    // --------------------------------------------------------
+
+    fn load_stylesheets(&mut self) -> Result<(), LoadError> {
+        if let Some(ref doc) = self.document {
+            // Find all <link rel="stylesheet"> and <style> tags
+            let stylesheet_urls = extract_stylesheet_urls(doc);
+            let inline_styles = extract_inline_styles(doc);
+
+            // Fetch external stylesheets
+            for url in stylesheet_urls {
+                match self.resource_loader.fetch_stylesheet(&url) {
+                    Ok(stylesheet) => self.stylesheets.push(stylesheet),
+                    Err(_) => {
+                        // Continue loading other stylesheets
+                    }
+                }
+            }
+
+            // Parse inline styles
+            for style in inline_styles {
+                let stylesheet = parse_stylesheet(&style);
+                self.stylesheets.push(stylesheet);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_scripts(&mut self) -> Result<(), LoadError> {
+        if let Some(ref doc) = self.document {
+            let script_urls = extract_script_urls(doc);
+            let inline_scripts = extract_inline_scripts(doc);
+
+            // Fetch external scripts
+            for url in script_urls {
+                match self.resource_loader.fetch_script(&url) {
+                    Ok(script) => self.scripts_to_execute.push(script),
+                    Err(_) => {
+                        // Continue loading other scripts
+                    }
+                }
+            }
+
+            // Queue inline scripts
+            self.scripts_to_execute.extend(inline_scripts);
+        }
+
+        Ok(())
+    }
+
+    fn apply_default_stylesheet(&mut self) {
+        // Default browser stylesheet (user agent styles)
+        let default_css = r#"
+            html, body { display: block; margin: 0; padding: 0; }
+            body { margin: 8px; }
+            head, script, style, link, meta, title { display: none; }
+            h1 { display: block; font-size: 2em; font-weight: bold; margin: 0.67em 0; }
+            h2 { display: block; font-size: 1.5em; font-weight: bold; margin: 0.83em 0; }
+            h3 { display: block; font-size: 1.17em; font-weight: bold; margin: 1em 0; }
+            h4 { display: block; font-size: 1em; font-weight: bold; margin: 1.33em 0; }
+            h5 { display: block; font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
+            h6 { display: block; font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
+            p { display: block; margin: 1em 0; }
+            div { display: block; }
+            span { display: inline; }
+            a { display: inline; color: #0000EE; text-decoration: underline; }
+            a:visited { color: #551A8B; }
+            img { display: inline-block; }
+            ul, ol { display: block; margin: 1em 0; padding-left: 40px; }
+            li { display: list-item; }
+            table { display: table; border-collapse: separate; border-spacing: 2px; }
+            tr { display: table-row; }
+            td, th { display: table-cell; padding: 1px; }
+            th { font-weight: bold; text-align: center; }
+            form { display: block; margin-top: 0; }
+            input, button, select, textarea { display: inline-block; }
+            pre { display: block; font-family: monospace; white-space: pre; margin: 1em 0; }
+            code { font-family: monospace; }
+            blockquote { display: block; margin: 1em 40px; }
+            hr { display: block; margin: 0.5em auto; border-style: inset; border-width: 1px; }
+            strong, b { font-weight: bold; }
+            em, i { font-style: italic; }
+            small { font-size: smaller; }
+            sub { vertical-align: sub; font-size: smaller; }
+            sup { vertical-align: super; font-size: smaller; }
+        "#;
+
+        let default_stylesheet = parse_stylesheet(default_css);
+        self.stylesheets.insert(0, default_stylesheet);
+    }
+
+    // --------------------------------------------------------
+    // JavaScript
+    // --------------------------------------------------------
+
+    fn initialize_js_runtime(&mut self) {
+        if let Some(doc) = self.document.take() {
+            let runtime = JsRuntime::with_document(doc.clone());
+            self.js_runtime = Some(runtime);
+            self.document = Some(doc);
+        }
+    }
+
+    fn execute_scripts(&mut self) -> Result<(), LoadError> {
+        let scripts = std::mem::take(&mut self.scripts_to_execute);
+
+        for script in scripts {
+            if let Some(ref mut runtime) = self.js_runtime {
+                match runtime.execute(&script) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        // Log error but continue execution
+                        eprintln!("JavaScript error: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn execute_js(&mut self, code: &str) -> Result<JsValue, String> {
+        if let Some(ref mut runtime) = self.js_runtime {
+            runtime.execute(code).map_err(|e| format!("{:?}", e))
+        } else {
+            Err("No JavaScript runtime".to_string())
+        }
+    }
+
+    pub fn process_js_timers(&mut self) -> Result<(), String> {
+        if let Some(ref mut runtime) = self.js_runtime {
+            runtime.process_timers().map_err(|e| format!("{:?}", e))
+        } else {
+            Ok(())
+        }
+    }
+
+    // --------------------------------------------------------
+    // Layout and Rendering
+    // --------------------------------------------------------
+
+    pub fn perform_layout(&mut self) {
+        if let Some(ref doc) = self.document {
+            let layout_root = layout_document(
+                doc,
+                &self.stylesheets,
+                self.viewport_width as f64,
+                self.viewport_height as f64,
+            );
+            self.layout_root = layout_root;
+            self.needs_layout = false;
+            self.needs_paint = true;
+        }
+    }
+
+    pub fn build_paint_commands(&mut self) {
+        if let Some(ref layout_root) = self.layout_root {
+            self.paint_commands = build_paint_list(layout_root);
+            self.needs_paint = false;
+        }
+    }
+
+    pub fn get_paint_commands(&self) -> &[PaintCommand] {
+        &self.paint_commands
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if self.viewport_width != width || self.viewport_height != height {
+            self.viewport_width = width;
+            self.viewport_height = height;
+            self.needs_layout = true;
+        }
+    }
+
+    // --------------------------------------------------------
+    // Scrolling
+    // --------------------------------------------------------
+
+    pub fn scroll(&mut self, delta_x: i32, delta_y: i32) {
+        self.scroll_x = (self.scroll_x + delta_x).max(0);
+        self.scroll_y = (self.scroll_y + delta_y).max(0);
+
+        // Clamp to content bounds
+        if let Some(ref layout_root) = self.layout_root {
+            let content_height = layout_root.dimensions.margin_box().height as i32;
+            let max_scroll_y = (content_height - self.viewport_height as i32).max(0);
+            self.scroll_y = self.scroll_y.min(max_scroll_y);
+
+            let content_width = layout_root.dimensions.margin_box().width as i32;
+            let max_scroll_x = (content_width - self.viewport_width as i32).max(0);
+            self.scroll_x = self.scroll_x.min(max_scroll_x);
+        }
+
+        // Save scroll position to history
+        if let Some(entry) = self.history.current_mut() {
+            entry.scroll_x = self.scroll_x;
+            entry.scroll_y = self.scroll_y;
+        }
+    }
+
+    pub fn scroll_to(&mut self, x: i32, y: i32) {
+        self.scroll_x = x.max(0);
+        self.scroll_y = y.max(0);
+    }
+
+    // --------------------------------------------------------
+    // Hit Testing
+    // --------------------------------------------------------
+
+    pub fn hit_test(&self, x: i32, y: i32) -> Option<HitTestResult> {
+        let doc_x = x + self.scroll_x;
+        let doc_y = y + self.scroll_y;
+
+        if let Some(ref layout_root) = self.layout_root {
+            if let Some(hit_box) = layout_root.hit_test(doc_x as f64, doc_y as f64) {
+                if let Some(node_idx) = hit_box.node_index {
+                    return Some(HitTestResult {
+                        node_index: node_idx,
+                        x: doc_x,
+                        y: doc_y,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn get_link_at(&self, x: i32, y: i32) -> Option<String> {
+        if let (Some(ref doc), Some(result)) = (&self.document, self.hit_test(x, y)) {
+            // Walk up the tree looking for an <a> element
+            let mut node_idx = Some(result.node_index);
+
+            while let Some(idx) = node_idx {
+                if let Some(node) = doc.get_node(idx) {
+                    if let Some(tag) = node.tag_name() {
+                        if tag.eq_ignore_ascii_case("a") {
+                            if let Some(href) = node.get_attribute("href") {
+                                return Some(self.resource_loader.resolve_url(href));
+                            }
+                        }
+                    }
+                    node_idx = node.parent;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        None
+    }
+
+    // --------------------------------------------------------
+    // State Queries
+    // --------------------------------------------------------
+
+    pub fn is_loading(&self) -> bool {
+        self.state == TabState::Loading
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.state == TabState::Loaded
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.state == TabState::Error
+    }
+
+    pub fn get_loading_progress(&self) -> f32 {
+        match self.loading_phase {
+            LoadingPhase::FetchingHtml => 0.1,
+            LoadingPhase::ParsingHtml => 0.2,
+            LoadingPhase::FetchingResources => 0.4,
+            LoadingPhase::ParsingCss => 0.5,
+            LoadingPhase::ExecutingScripts => 0.6,
+            LoadingPhase::Layout => 0.8,
+            LoadingPhase::Paint => 0.9,
+            LoadingPhase::Complete => 1.0,
+        }
+    }
+
+    pub fn content_height(&self) -> i32 {
+        if let Some(ref layout_root) = self.layout_root {
+            layout_root.dimensions.margin_box().height as i32
+        } else {
+            0
+        }
+    }
+
+    pub fn content_width(&self) -> i32 {
+        if let Some(ref layout_root) = self.layout_root {
+            layout_root.dimensions.margin_box().width as i32
+        } else {
+            0
+        }
+    }
+}
+
+// ============================================================
+// Hit Test Result
+// ============================================================
+
+pub struct HitTestResult {
+    pub node_index: usize,
+    pub x: i32,
+    pub y: i32,
+}
+
+// ============================================================
+// Load Error
+// ============================================================
+
+#[derive(Debug)]
+pub enum LoadError {
+    NetworkError(String),
+    TlsError(String),
+    HttpError(u16),
+    ParseError(String),
+    InvalidData,
+    Timeout,
+    NotFound,
+    Other(String),
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn fetch_url(url: &str) -> Result<Vec<u8>, LoadError> {
+    let parsed = Url::parse(url).map_err(|e| LoadError::Other(format!("{:?}", e)))?;
+
+    let port = parsed.port.unwrap_or(if parsed.scheme == "https" { 443 } else { 80 });
+
+    // For HTTPS, use TLS
+    if parsed.scheme == "https" {
+        // Would use TLS connection
+        // For now, return placeholder
+        return Err(LoadError::NetworkError("TLS not implemented in stub".to_string()));
+    }
+
+    // For HTTP, use plain TCP
+    // Would use HTTP client here
+    Err(LoadError::NetworkError("HTTP not implemented in stub".to_string()))
+}
+
+fn extract_title(doc: &Document) -> Option<String> {
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("title") {
+                // Get text content
+                for &child_idx in &node.children {
+                    if let Some(child) = doc.get_node(child_idx) {
+                        if let Some(text) = child.text_content() {
+                            return Some(text.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_favicon(doc: &Document) -> Option<String> {
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("link") {
+                if let Some(rel) = node.get_attribute("rel") {
+                    if rel.contains("icon") {
+                        if let Some(href) = node.get_attribute("href") {
+                            return Some(href.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_stylesheet_urls(doc: &Document) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("link") {
+                if let Some(rel) = node.get_attribute("rel") {
+                    if rel.eq_ignore_ascii_case("stylesheet") {
+                        if let Some(href) = node.get_attribute("href") {
+                            urls.push(href.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    urls
+}
+
+fn extract_inline_styles(doc: &Document) -> Vec<String> {
+    let mut styles = Vec::new();
+
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("style") {
+                let mut css = String::new();
+                for &child_idx in &node.children {
+                    if let Some(child) = doc.get_node(child_idx) {
+                        if let Some(text) = child.text_content() {
+                            css.push_str(text);
+                        }
+                    }
+                }
+                if !css.is_empty() {
+                    styles.push(css);
+                }
+            }
+        }
+    }
+
+    styles
+}
+
+fn extract_script_urls(doc: &Document) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("script") {
+                if let Some(src) = node.get_attribute("src") {
+                    urls.push(src.to_string());
+                }
+            }
+        }
+    }
+
+    urls
+}
+
+fn extract_inline_scripts(doc: &Document) -> Vec<String> {
+    let mut scripts = Vec::new();
+
+    for node in &doc.nodes {
+        if let Some(tag) = node.tag_name() {
+            if tag.eq_ignore_ascii_case("script") {
+                // Only inline scripts (no src attribute)
+                if node.get_attribute("src").is_none() {
+                    let mut script = String::new();
+                    for &child_idx in &node.children {
+                        if let Some(child) = doc.get_node(child_idx) {
+                            if let Some(text) = child.text_content() {
+                                script.push_str(text);
+                            }
+                        }
+                    }
+                    if !script.is_empty() {
+                        scripts.push(script);
+                    }
+                }
+            }
+        }
+    }
+
+    scripts
+}

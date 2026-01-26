@@ -1,0 +1,857 @@
+// CSS Selector Parsing and Matching
+// W3C Selectors Level 3
+
+use super::tokenizer::{CssToken, CssTokenizer, HashType};
+
+// ============================================================
+// Selector Types
+// ============================================================
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Selector {
+    // Simple selectors
+    Universal,                              // *
+    Type(String),                           // element
+    Id(String),                             // #id
+    Class(String),                          // .class
+    Attribute(AttributeSelector),           // [attr], [attr=value], etc.
+    PseudoClass(PseudoClass),              // :pseudo-class
+    PseudoElement(String),                  // ::pseudo-element
+
+    // Compound selector (list of simple selectors)
+    Compound(Vec<Selector>),
+
+    // Complex selectors (combinators)
+    Descendant(Box<Selector>, Box<Selector>),     // A B
+    Child(Box<Selector>, Box<Selector>),          // A > B
+    NextSibling(Box<Selector>, Box<Selector>),    // A + B
+    SubsequentSibling(Box<Selector>, Box<Selector>), // A ~ B
+
+    // Selector list
+    List(Vec<Selector>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttributeSelector {
+    pub name: String,
+    pub matcher: Option<AttributeMatcher>,
+    pub case_insensitive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AttributeMatcher {
+    Exact(String),              // [attr=value]
+    Includes(String),           // [attr~=value]
+    DashMatch(String),          // [attr|=value]
+    Prefix(String),             // [attr^=value]
+    Suffix(String),             // [attr$=value]
+    Substring(String),          // [attr*=value]
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PseudoClass {
+    // Standard pseudo-classes
+    Link,
+    Visited,
+    Hover,
+    Active,
+    Focus,
+    FocusWithin,
+    FocusVisible,
+    Target,
+    Enabled,
+    Disabled,
+    Checked,
+    Indeterminate,
+    Default,
+    Valid,
+    Invalid,
+    InRange,
+    OutOfRange,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
+    PlaceholderShown,
+    Root,
+    Empty,
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+
+    // Functional pseudo-classes
+    NthChild(NthExpr),
+    NthLastChild(NthExpr),
+    NthOfType(NthExpr),
+    NthLastOfType(NthExpr),
+    Lang(String),
+    Not(Box<Selector>),
+    Is(Vec<Selector>),
+    Where(Vec<Selector>),
+    Has(Vec<Selector>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NthExpr {
+    pub a: i32,  // Coefficient
+    pub b: i32,  // Offset
+}
+
+impl NthExpr {
+    pub fn new(a: i32, b: i32) -> NthExpr {
+        NthExpr { a, b }
+    }
+
+    // Check if index matches (1-based)
+    pub fn matches(&self, index: i32) -> bool {
+        if self.a == 0 {
+            return index == self.b;
+        }
+
+        let n = index - self.b;
+        if self.a > 0 {
+            n >= 0 && n % self.a == 0
+        } else {
+            n <= 0 && n % self.a == 0
+        }
+    }
+
+    // Parse "odd", "even", "An+B" syntax
+    pub fn parse(s: &str) -> Option<NthExpr> {
+        let s = s.trim().to_lowercase();
+
+        if s == "odd" {
+            return Some(NthExpr::new(2, 1));
+        }
+        if s == "even" {
+            return Some(NthExpr::new(2, 0));
+        }
+
+        // Parse An+B format
+        let mut a: i32 = 0;
+        let mut b: i32 = 0;
+        let mut in_b = false;
+        let mut sign = 1;
+        let mut num_str = String::new();
+        let mut has_n = false;
+
+        for c in s.chars() {
+            match c {
+                ' ' => continue,
+                'n' => {
+                    has_n = true;
+                    if num_str.is_empty() || num_str == "+" {
+                        a = sign;
+                    } else if num_str == "-" {
+                        a = -1;
+                    } else {
+                        a = num_str.parse().unwrap_or(0) * sign;
+                    }
+                    num_str = String::new();
+                    sign = 1;
+                    in_b = true;
+                },
+                '+' => {
+                    if in_b || has_n {
+                        sign = 1;
+                    }
+                },
+                '-' => {
+                    if in_b || has_n {
+                        sign = -1;
+                    } else {
+                        num_str.push('-');
+                    }
+                },
+                '0'..='9' => {
+                    num_str.push(c);
+                },
+                _ => {}
+            }
+        }
+
+        if !num_str.is_empty() {
+            let num: i32 = num_str.parse().unwrap_or(0);
+            if has_n {
+                b = num * sign;
+            } else {
+                b = num * sign;
+                if !has_n {
+                    a = 0;
+                }
+            }
+        }
+
+        Some(NthExpr::new(a, b))
+    }
+}
+
+// ============================================================
+// Specificity
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Specificity {
+    pub inline: u32,   // Inline styles (highest)
+    pub ids: u32,      // ID selectors
+    pub classes: u32,  // Class selectors, attributes, pseudo-classes
+    pub elements: u32, // Element selectors, pseudo-elements
+}
+
+impl Specificity {
+    pub fn new() -> Specificity {
+        Specificity {
+            inline: 0,
+            ids: 0,
+            classes: 0,
+            elements: 0,
+        }
+    }
+
+    pub fn inline_style() -> Specificity {
+        Specificity {
+            inline: 1,
+            ids: 0,
+            classes: 0,
+            elements: 0,
+        }
+    }
+
+    pub fn add(&mut self, other: &Specificity) {
+        self.inline += other.inline;
+        self.ids += other.ids;
+        self.classes += other.classes;
+        self.elements += other.elements;
+    }
+
+    // Compare specificity (returns ordering)
+    pub fn compare(&self, other: &Specificity) -> std::cmp::Ordering {
+        if self.inline != other.inline {
+            return self.inline.cmp(&other.inline);
+        }
+        if self.ids != other.ids {
+            return self.ids.cmp(&other.ids);
+        }
+        if self.classes != other.classes {
+            return self.classes.cmp(&other.classes);
+        }
+        self.elements.cmp(&other.elements)
+    }
+}
+
+impl Selector {
+    // Calculate specificity of a selector
+    pub fn specificity(&self) -> Specificity {
+        let mut spec = Specificity::new();
+        self.add_specificity(&mut spec);
+        spec
+    }
+
+    fn add_specificity(&self, spec: &mut Specificity) {
+        match self {
+            Selector::Universal => {},
+            Selector::Type(_) => spec.elements += 1,
+            Selector::Id(_) => spec.ids += 1,
+            Selector::Class(_) => spec.classes += 1,
+            Selector::Attribute(_) => spec.classes += 1,
+            Selector::PseudoClass(pc) => {
+                match pc {
+                    PseudoClass::Not(inner) |
+                    PseudoClass::Is(ref selectors) |
+                    PseudoClass::Has(ref selectors) => {
+                        // Add specificity of most specific argument
+                        match pc {
+                            PseudoClass::Not(inner) => inner.add_specificity(spec),
+                            PseudoClass::Is(selectors) |
+                            PseudoClass::Has(selectors) => {
+                                let mut max_spec = Specificity::new();
+                                for sel in selectors {
+                                    let s = sel.specificity();
+                                    if s.compare(&max_spec) == std::cmp::Ordering::Greater {
+                                        max_spec = s;
+                                    }
+                                }
+                                spec.add(&max_spec);
+                            },
+                            _ => {}
+                        }
+                    },
+                    PseudoClass::Where(_) => {
+                        // :where() has zero specificity
+                    },
+                    _ => spec.classes += 1,
+                }
+            },
+            Selector::PseudoElement(_) => spec.elements += 1,
+            Selector::Compound(selectors) => {
+                for sel in selectors {
+                    sel.add_specificity(spec);
+                }
+            },
+            Selector::Descendant(left, right) |
+            Selector::Child(left, right) |
+            Selector::NextSibling(left, right) |
+            Selector::SubsequentSibling(left, right) => {
+                left.add_specificity(spec);
+                right.add_specificity(spec);
+            },
+            Selector::List(selectors) => {
+                // For a list, use the highest specificity
+                let mut max_spec = Specificity::new();
+                for sel in selectors {
+                    let s = sel.specificity();
+                    if s.compare(&max_spec) == std::cmp::Ordering::Greater {
+                        max_spec = s;
+                    }
+                }
+                spec.add(&max_spec);
+            },
+        }
+    }
+}
+
+// ============================================================
+// Selector Parser
+// ============================================================
+
+pub struct SelectorParser {
+    tokens: Vec<CssToken>,
+    pos: usize,
+}
+
+impl SelectorParser {
+    pub fn new(css: &str) -> SelectorParser {
+        let mut tokenizer = CssTokenizer::new(css);
+        let tokens = tokenizer.tokenize_all();
+        SelectorParser { tokens, pos: 0 }
+    }
+
+    pub fn from_tokens(tokens: Vec<CssToken>) -> SelectorParser {
+        SelectorParser { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> &CssToken {
+        self.tokens.get(self.pos).unwrap_or(&CssToken::EOF)
+    }
+
+    fn consume(&mut self) -> &CssToken {
+        let token = self.tokens.get(self.pos).unwrap_or(&CssToken::EOF);
+        self.pos += 1;
+        token
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), CssToken::Whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    // Parse a selector list (comma-separated)
+    pub fn parse_selector_list(&mut self) -> Option<Selector> {
+        let mut selectors = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            if let Some(sel) = self.parse_complex_selector() {
+                selectors.push(sel);
+            } else {
+                break;
+            }
+
+            self.skip_whitespace();
+            if !matches!(self.peek(), CssToken::Comma) {
+                break;
+            }
+            self.pos += 1; // Consume comma
+        }
+
+        if selectors.is_empty() {
+            None
+        } else if selectors.len() == 1 {
+            selectors.pop()
+        } else {
+            Some(Selector::List(selectors))
+        }
+    }
+
+    // Parse a complex selector (with combinators)
+    fn parse_complex_selector(&mut self) -> Option<Selector> {
+        self.skip_whitespace();
+
+        let mut left = self.parse_compound_selector()?;
+
+        loop {
+            let had_whitespace = matches!(self.peek(), CssToken::Whitespace);
+            self.skip_whitespace();
+
+            let combinator = match self.peek() {
+                CssToken::Delim('>') => {
+                    self.pos += 1;
+                    Some(Combinator::Child)
+                },
+                CssToken::Delim('+') => {
+                    self.pos += 1;
+                    Some(Combinator::NextSibling)
+                },
+                CssToken::Delim('~') => {
+                    self.pos += 1;
+                    Some(Combinator::SubsequentSibling)
+                },
+                _ if had_whitespace => {
+                    // Check if there's a valid selector following
+                    if self.could_start_selector() {
+                        Some(Combinator::Descendant)
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            };
+
+            match combinator {
+                Some(comb) => {
+                    self.skip_whitespace();
+                    let right = self.parse_compound_selector()?;
+
+                    left = match comb {
+                        Combinator::Descendant => Selector::Descendant(Box::new(left), Box::new(right)),
+                        Combinator::Child => Selector::Child(Box::new(left), Box::new(right)),
+                        Combinator::NextSibling => Selector::NextSibling(Box::new(left), Box::new(right)),
+                        Combinator::SubsequentSibling => Selector::SubsequentSibling(Box::new(left), Box::new(right)),
+                    };
+                },
+                None => break,
+            }
+        }
+
+        Some(left)
+    }
+
+    // Parse a compound selector (no combinators)
+    fn parse_compound_selector(&mut self) -> Option<Selector> {
+        let mut selectors = Vec::new();
+
+        // Type selector or universal selector first
+        match self.peek() {
+            CssToken::Ident(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                selectors.push(Selector::Type(name.to_ascii_lowercase()));
+            },
+            CssToken::Delim('*') => {
+                self.pos += 1;
+                selectors.push(Selector::Universal);
+            },
+            _ => {}
+        }
+
+        // Followed by any number of simple selectors
+        loop {
+            match self.peek() {
+                CssToken::Hash(name, _) => {
+                    let name = name.clone();
+                    self.pos += 1;
+                    selectors.push(Selector::Id(name));
+                },
+                CssToken::Delim('.') => {
+                    self.pos += 1;
+                    if let CssToken::Ident(name) = self.peek() {
+                        let name = name.clone();
+                        self.pos += 1;
+                        selectors.push(Selector::Class(name));
+                    }
+                },
+                CssToken::OpenBracket => {
+                    if let Some(attr) = self.parse_attribute_selector() {
+                        selectors.push(Selector::Attribute(attr));
+                    }
+                },
+                CssToken::Colon => {
+                    self.pos += 1;
+                    if matches!(self.peek(), CssToken::Colon) {
+                        // Pseudo-element
+                        self.pos += 1;
+                        if let CssToken::Ident(name) = self.peek() {
+                            let name = name.clone();
+                            self.pos += 1;
+                            selectors.push(Selector::PseudoElement(name.to_ascii_lowercase()));
+                        }
+                    } else {
+                        // Pseudo-class
+                        if let Some(pc) = self.parse_pseudo_class() {
+                            selectors.push(Selector::PseudoClass(pc));
+                        }
+                    }
+                },
+                _ => break,
+            }
+        }
+
+        if selectors.is_empty() {
+            None
+        } else if selectors.len() == 1 {
+            selectors.pop()
+        } else {
+            Some(Selector::Compound(selectors))
+        }
+    }
+
+    // Parse an attribute selector
+    fn parse_attribute_selector(&mut self) -> Option<AttributeSelector> {
+        self.pos += 1; // [
+        self.skip_whitespace();
+
+        let name = match self.peek() {
+            CssToken::Ident(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                name.to_ascii_lowercase()
+            },
+            _ => return None,
+        };
+
+        self.skip_whitespace();
+
+        // Check for matcher
+        let matcher = match self.peek() {
+            CssToken::CloseBracket => None,
+            CssToken::Delim('=') => {
+                self.pos += 1;
+                Some(AttributeMatcher::Exact(self.parse_attr_value()?))
+            },
+            CssToken::Delim('~') => {
+                self.pos += 1;
+                if matches!(self.peek(), CssToken::Delim('=')) {
+                    self.pos += 1;
+                    Some(AttributeMatcher::Includes(self.parse_attr_value()?))
+                } else {
+                    return None;
+                }
+            },
+            CssToken::Delim('|') => {
+                self.pos += 1;
+                if matches!(self.peek(), CssToken::Delim('=')) {
+                    self.pos += 1;
+                    Some(AttributeMatcher::DashMatch(self.parse_attr_value()?))
+                } else {
+                    return None;
+                }
+            },
+            CssToken::Delim('^') => {
+                self.pos += 1;
+                if matches!(self.peek(), CssToken::Delim('=')) {
+                    self.pos += 1;
+                    Some(AttributeMatcher::Prefix(self.parse_attr_value()?))
+                } else {
+                    return None;
+                }
+            },
+            CssToken::Delim('$') => {
+                self.pos += 1;
+                if matches!(self.peek(), CssToken::Delim('=')) {
+                    self.pos += 1;
+                    Some(AttributeMatcher::Suffix(self.parse_attr_value()?))
+                } else {
+                    return None;
+                }
+            },
+            CssToken::Delim('*') => {
+                self.pos += 1;
+                if matches!(self.peek(), CssToken::Delim('=')) {
+                    self.pos += 1;
+                    Some(AttributeMatcher::Substring(self.parse_attr_value()?))
+                } else {
+                    return None;
+                }
+            },
+            _ => return None,
+        };
+
+        self.skip_whitespace();
+
+        // Check for case-insensitivity flag
+        let case_insensitive = match self.peek() {
+            CssToken::Ident(s) if s.to_ascii_lowercase() == "i" => {
+                self.pos += 1;
+                true
+            },
+            _ => false,
+        };
+
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::CloseBracket) {
+            return None;
+        }
+        self.pos += 1;
+
+        Some(AttributeSelector {
+            name,
+            matcher,
+            case_insensitive,
+        })
+    }
+
+    fn parse_attr_value(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        match self.peek() {
+            CssToken::Ident(s) => {
+                let s = s.clone();
+                self.pos += 1;
+                Some(s)
+            },
+            CssToken::String(s) => {
+                let s = s.clone();
+                self.pos += 1;
+                Some(s)
+            },
+            _ => None,
+        }
+    }
+
+    // Parse a pseudo-class
+    fn parse_pseudo_class(&mut self) -> Option<PseudoClass> {
+        match self.peek().clone() {
+            CssToken::Ident(name) => {
+                self.pos += 1;
+                match name.to_ascii_lowercase().as_str() {
+                    "link" => Some(PseudoClass::Link),
+                    "visited" => Some(PseudoClass::Visited),
+                    "hover" => Some(PseudoClass::Hover),
+                    "active" => Some(PseudoClass::Active),
+                    "focus" => Some(PseudoClass::Focus),
+                    "focus-within" => Some(PseudoClass::FocusWithin),
+                    "focus-visible" => Some(PseudoClass::FocusVisible),
+                    "target" => Some(PseudoClass::Target),
+                    "enabled" => Some(PseudoClass::Enabled),
+                    "disabled" => Some(PseudoClass::Disabled),
+                    "checked" => Some(PseudoClass::Checked),
+                    "indeterminate" => Some(PseudoClass::Indeterminate),
+                    "default" => Some(PseudoClass::Default),
+                    "valid" => Some(PseudoClass::Valid),
+                    "invalid" => Some(PseudoClass::Invalid),
+                    "in-range" => Some(PseudoClass::InRange),
+                    "out-of-range" => Some(PseudoClass::OutOfRange),
+                    "required" => Some(PseudoClass::Required),
+                    "optional" => Some(PseudoClass::Optional),
+                    "read-only" => Some(PseudoClass::ReadOnly),
+                    "read-write" => Some(PseudoClass::ReadWrite),
+                    "placeholder-shown" => Some(PseudoClass::PlaceholderShown),
+                    "root" => Some(PseudoClass::Root),
+                    "empty" => Some(PseudoClass::Empty),
+                    "first-child" => Some(PseudoClass::FirstChild),
+                    "last-child" => Some(PseudoClass::LastChild),
+                    "only-child" => Some(PseudoClass::OnlyChild),
+                    "first-of-type" => Some(PseudoClass::FirstOfType),
+                    "last-of-type" => Some(PseudoClass::LastOfType),
+                    "only-of-type" => Some(PseudoClass::OnlyOfType),
+                    _ => None,
+                }
+            },
+            CssToken::Function(name) => {
+                self.pos += 1;
+                let result = match name.to_ascii_lowercase().as_str() {
+                    "nth-child" => {
+                        let expr = self.parse_nth_expression()?;
+                        Some(PseudoClass::NthChild(expr))
+                    },
+                    "nth-last-child" => {
+                        let expr = self.parse_nth_expression()?;
+                        Some(PseudoClass::NthLastChild(expr))
+                    },
+                    "nth-of-type" => {
+                        let expr = self.parse_nth_expression()?;
+                        Some(PseudoClass::NthOfType(expr))
+                    },
+                    "nth-last-of-type" => {
+                        let expr = self.parse_nth_expression()?;
+                        Some(PseudoClass::NthLastOfType(expr))
+                    },
+                    "lang" => {
+                        self.skip_whitespace();
+                        let lang = match self.peek() {
+                            CssToken::Ident(s) => s.clone(),
+                            CssToken::String(s) => s.clone(),
+                            _ => return None,
+                        };
+                        self.pos += 1;
+                        self.skip_whitespace();
+                        if !matches!(self.peek(), CssToken::CloseParen) {
+                            return None;
+                        }
+                        self.pos += 1;
+                        Some(PseudoClass::Lang(lang))
+                    },
+                    "not" => {
+                        self.skip_whitespace();
+                        let mut inner_parser = SelectorParser::from_tokens(
+                            self.collect_until_close_paren()
+                        );
+                        let inner = inner_parser.parse_selector_list()?;
+                        self.pos += 1; // )
+                        Some(PseudoClass::Not(Box::new(inner)))
+                    },
+                    "is" | "matches" | "any" => {
+                        self.skip_whitespace();
+                        let mut inner_parser = SelectorParser::from_tokens(
+                            self.collect_until_close_paren()
+                        );
+                        let inner = inner_parser.parse_selector_list()?;
+                        self.pos += 1;
+                        let selectors = match inner {
+                            Selector::List(list) => list,
+                            other => vec![other],
+                        };
+                        Some(PseudoClass::Is(selectors))
+                    },
+                    "where" => {
+                        self.skip_whitespace();
+                        let mut inner_parser = SelectorParser::from_tokens(
+                            self.collect_until_close_paren()
+                        );
+                        let inner = inner_parser.parse_selector_list()?;
+                        self.pos += 1;
+                        let selectors = match inner {
+                            Selector::List(list) => list,
+                            other => vec![other],
+                        };
+                        Some(PseudoClass::Where(selectors))
+                    },
+                    "has" => {
+                        self.skip_whitespace();
+                        let mut inner_parser = SelectorParser::from_tokens(
+                            self.collect_until_close_paren()
+                        );
+                        let inner = inner_parser.parse_selector_list()?;
+                        self.pos += 1;
+                        let selectors = match inner {
+                            Selector::List(list) => list,
+                            other => vec![other],
+                        };
+                        Some(PseudoClass::Has(selectors))
+                    },
+                    _ => None,
+                };
+                result
+            },
+            _ => None,
+        }
+    }
+
+    fn parse_nth_expression(&mut self) -> Option<NthExpr> {
+        self.skip_whitespace();
+
+        let mut expr_str = String::new();
+        let mut depth = 1;
+
+        while depth > 0 {
+            match self.peek() {
+                CssToken::EOF => return None,
+                CssToken::OpenParen => {
+                    depth += 1;
+                    self.pos += 1;
+                },
+                CssToken::CloseParen => {
+                    depth -= 1;
+                    if depth > 0 {
+                        self.pos += 1;
+                    }
+                },
+                CssToken::Ident(s) => {
+                    expr_str.push_str(s);
+                    self.pos += 1;
+                },
+                CssToken::Number(n, _) => {
+                    expr_str.push_str(&n.to_string());
+                    self.pos += 1;
+                },
+                CssToken::Dimension(n, unit) => {
+                    expr_str.push_str(&n.to_string());
+                    expr_str.push_str(unit);
+                    self.pos += 1;
+                },
+                CssToken::Delim(c) => {
+                    expr_str.push(*c);
+                    self.pos += 1;
+                },
+                CssToken::Whitespace => {
+                    expr_str.push(' ');
+                    self.pos += 1;
+                },
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+
+        self.pos += 1; // Consume final )
+        NthExpr::parse(&expr_str)
+    }
+
+    fn collect_until_close_paren(&mut self) -> Vec<CssToken> {
+        let mut tokens = Vec::new();
+        let mut depth = 1;
+
+        while depth > 0 {
+            match self.peek() {
+                CssToken::EOF => break,
+                CssToken::OpenParen | CssToken::Function(_) => {
+                    depth += 1;
+                    tokens.push(self.consume().clone());
+                },
+                CssToken::CloseParen => {
+                    depth -= 1;
+                    if depth > 0 {
+                        tokens.push(self.consume().clone());
+                    }
+                },
+                _ => {
+                    tokens.push(self.consume().clone());
+                }
+            }
+        }
+
+        tokens.push(CssToken::EOF);
+        tokens
+    }
+
+    fn could_start_selector(&self) -> bool {
+        match self.peek() {
+            CssToken::Ident(_) |
+            CssToken::Hash(_, _) |
+            CssToken::Delim('.') |
+            CssToken::Delim('*') |
+            CssToken::OpenBracket |
+            CssToken::Colon => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Combinator {
+    Descendant,
+    Child,
+    NextSibling,
+    SubsequentSibling,
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+pub fn parse_selector(css: &str) -> Option<Selector> {
+    let mut parser = SelectorParser::new(css);
+    parser.parse_selector_list()
+}
+
+pub fn parse_selector_list(css: &str) -> Vec<Selector> {
+    match parse_selector(css) {
+        Some(Selector::List(list)) => list,
+        Some(sel) => vec![sel],
+        None => Vec::new(),
+    }
+}

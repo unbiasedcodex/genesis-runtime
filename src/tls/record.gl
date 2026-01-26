@@ -1,0 +1,403 @@
+// TLS Record Layer
+// RFC 5246 - TLS 1.2 Record Protocol
+
+// ============================================================
+// TLS Constants
+// ============================================================
+
+pub const TLS_VERSION_1_2: u16 = 0x0303;
+pub const TLS_VERSION_1_1: u16 = 0x0302;
+pub const TLS_VERSION_1_0: u16 = 0x0301;
+
+// Content types
+pub const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 20;
+pub const CONTENT_TYPE_ALERT: u8 = 21;
+pub const CONTENT_TYPE_HANDSHAKE: u8 = 22;
+pub const CONTENT_TYPE_APPLICATION_DATA: u8 = 23;
+
+// Maximum record sizes
+pub const MAX_PLAINTEXT_LENGTH: usize = 16384;
+pub const MAX_COMPRESSED_LENGTH: usize = 16384 + 1024;
+pub const MAX_CIPHERTEXT_LENGTH: usize = 16384 + 2048;
+
+// ============================================================
+// TLS Record
+// ============================================================
+
+#[repr(C)]
+pub struct TlsRecord {
+    pub content_type: u8,
+    pub version: u16,
+    pub length: u16,
+    pub fragment: Vec<u8>,
+}
+
+impl TlsRecord {
+    pub fn new(content_type: u8, fragment: Vec<u8>) -> TlsRecord {
+        TlsRecord {
+            content_type: content_type,
+            version: TLS_VERSION_1_2,
+            length: fragment.len() as u16,
+            fragment: fragment,
+        }
+    }
+
+    // Serialize record to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(self.content_type);
+        bytes.push((self.version >> 8) as u8);
+        bytes.push(self.version as u8);
+        bytes.push((self.length >> 8) as u8);
+        bytes.push(self.length as u8);
+
+        let mut i: usize = 0;
+        while i < self.fragment.len() {
+            bytes.push(self.fragment[i]);
+            i = i + 1;
+        }
+
+        bytes
+    }
+
+    // Parse record from bytes
+    pub fn from_bytes(data: &[u8]) -> Option<(TlsRecord, usize)> {
+        if data.len() < 5 {
+            return None;
+        }
+
+        let content_type = data[0];
+        let version = ((data[1] as u16) << 8) | (data[2] as u16);
+        let length = ((data[3] as u16) << 8) | (data[4] as u16);
+
+        if data.len() < 5 + length as usize {
+            return None;
+        }
+
+        let mut fragment = Vec::new();
+        let mut i: usize = 0;
+        while i < length as usize {
+            fragment.push(data[5 + i]);
+            i = i + 1;
+        }
+
+        let record = TlsRecord {
+            content_type: content_type,
+            version: version,
+            length: length,
+            fragment: fragment,
+        };
+
+        Some((record, 5 + length as usize))
+    }
+}
+
+// ============================================================
+// Record Layer State
+// ============================================================
+
+#[repr(C)]
+pub struct RecordLayer {
+    // Connection state
+    pub version: u16,
+    pub is_client: bool,
+
+    // Sequence numbers
+    pub read_seq: u64,
+    pub write_seq: u64,
+
+    // Cipher state
+    pub cipher_active: bool,
+    pub mac_key_client: [u8; 32],
+    pub mac_key_server: [u8; 32],
+    pub enc_key_client: [u8; 32],
+    pub enc_key_server: [u8; 32],
+    pub iv_client: [u8; 12],
+    pub iv_server: [u8; 12],
+
+    // Key sizes
+    pub mac_key_len: usize,
+    pub enc_key_len: usize,
+    pub iv_len: usize,
+
+    // Read/write buffers
+    pub read_buffer: Vec<u8>,
+    pub write_buffer: Vec<u8>,
+}
+
+impl RecordLayer {
+    pub fn new(is_client: bool) -> RecordLayer {
+        RecordLayer {
+            version: TLS_VERSION_1_2,
+            is_client: is_client,
+            read_seq: 0,
+            write_seq: 0,
+            cipher_active: false,
+            mac_key_client: [0; 32],
+            mac_key_server: [0; 32],
+            enc_key_client: [0; 32],
+            enc_key_server: [0; 32],
+            iv_client: [0; 12],
+            iv_server: [0; 12],
+            mac_key_len: 0,
+            enc_key_len: 0,
+            iv_len: 0,
+            read_buffer: Vec::new(),
+            write_buffer: Vec::new(),
+        }
+    }
+
+    // Set up cipher keys
+    pub fn set_cipher_keys(
+        &mut self,
+        mac_key_client: &[u8],
+        mac_key_server: &[u8],
+        enc_key_client: &[u8],
+        enc_key_server: &[u8],
+        iv_client: &[u8],
+        iv_server: &[u8],
+    ) {
+        let mac_len = if mac_key_client.len() > 32 { 32 } else { mac_key_client.len() };
+        let enc_len = if enc_key_client.len() > 32 { 32 } else { enc_key_client.len() };
+        let iv_len = if iv_client.len() > 12 { 12 } else { iv_client.len() };
+
+        let mut i: usize = 0;
+        while i < mac_len {
+            self.mac_key_client[i] = mac_key_client[i];
+            self.mac_key_server[i] = mac_key_server[i];
+            i = i + 1;
+        }
+
+        i = 0;
+        while i < enc_len {
+            self.enc_key_client[i] = enc_key_client[i];
+            self.enc_key_server[i] = enc_key_server[i];
+            i = i + 1;
+        }
+
+        i = 0;
+        while i < iv_len {
+            self.iv_client[i] = iv_client[i];
+            self.iv_server[i] = iv_server[i];
+            i = i + 1;
+        }
+
+        self.mac_key_len = mac_len;
+        self.enc_key_len = enc_len;
+        self.iv_len = iv_len;
+    }
+
+    // Activate cipher (after ChangeCipherSpec)
+    pub fn activate_cipher(&mut self) {
+        self.cipher_active = true;
+        self.read_seq = 0;
+        self.write_seq = 0;
+    }
+
+    // Get write key and IV based on role
+    pub fn get_write_key(&self) -> (&[u8], &[u8]) {
+        if self.is_client {
+            (&self.enc_key_client[..self.enc_key_len], &self.iv_client[..self.iv_len])
+        } else {
+            (&self.enc_key_server[..self.enc_key_len], &self.iv_server[..self.iv_len])
+        }
+    }
+
+    // Get read key and IV based on role
+    pub fn get_read_key(&self) -> (&[u8], &[u8]) {
+        if self.is_client {
+            (&self.enc_key_server[..self.enc_key_len], &self.iv_server[..self.iv_len])
+        } else {
+            (&self.enc_key_client[..self.enc_key_len], &self.iv_client[..self.iv_len])
+        }
+    }
+
+    // Increment and get write sequence number
+    pub fn next_write_seq(&mut self) -> u64 {
+        let seq = self.write_seq;
+        self.write_seq = self.write_seq + 1;
+        seq
+    }
+
+    // Increment and get read sequence number
+    pub fn next_read_seq(&mut self) -> u64 {
+        let seq = self.read_seq;
+        self.read_seq = self.read_seq + 1;
+        seq
+    }
+}
+
+// ============================================================
+// Record Encryption (AES-GCM)
+// ============================================================
+
+use super::super::crypto::{aes_gcm_seal, aes_gcm_open};
+
+// Build nonce for AEAD
+fn build_nonce(implicit_iv: &[u8], seq_num: u64) -> [u8; 12] {
+    let mut nonce: [u8; 12] = [0; 12];
+
+    // Copy implicit IV
+    let mut i: usize = 0;
+    while i < 4 && i < implicit_iv.len() {
+        nonce[i] = implicit_iv[i];
+        i = i + 1;
+    }
+
+    // XOR with sequence number (last 8 bytes)
+    nonce[4] = ((seq_num >> 56) as u8) ^ (if implicit_iv.len() > 4 { implicit_iv[4] } else { 0 });
+    nonce[5] = ((seq_num >> 48) as u8) ^ (if implicit_iv.len() > 5 { implicit_iv[5] } else { 0 });
+    nonce[6] = ((seq_num >> 40) as u8) ^ (if implicit_iv.len() > 6 { implicit_iv[6] } else { 0 });
+    nonce[7] = ((seq_num >> 32) as u8) ^ (if implicit_iv.len() > 7 { implicit_iv[7] } else { 0 });
+    nonce[8] = ((seq_num >> 24) as u8) ^ (if implicit_iv.len() > 8 { implicit_iv[8] } else { 0 });
+    nonce[9] = ((seq_num >> 16) as u8) ^ (if implicit_iv.len() > 9 { implicit_iv[9] } else { 0 });
+    nonce[10] = ((seq_num >> 8) as u8) ^ (if implicit_iv.len() > 10 { implicit_iv[10] } else { 0 });
+    nonce[11] = (seq_num as u8) ^ (if implicit_iv.len() > 11 { implicit_iv[11] } else { 0 });
+
+    nonce
+}
+
+// Build additional data for AEAD
+fn build_aad(seq_num: u64, content_type: u8, version: u16, length: u16) -> [u8; 13] {
+    let mut aad: [u8; 13] = [0; 13];
+
+    // Sequence number (8 bytes)
+    aad[0] = (seq_num >> 56) as u8;
+    aad[1] = (seq_num >> 48) as u8;
+    aad[2] = (seq_num >> 40) as u8;
+    aad[3] = (seq_num >> 32) as u8;
+    aad[4] = (seq_num >> 24) as u8;
+    aad[5] = (seq_num >> 16) as u8;
+    aad[6] = (seq_num >> 8) as u8;
+    aad[7] = seq_num as u8;
+
+    // Content type
+    aad[8] = content_type;
+
+    // Version
+    aad[9] = (version >> 8) as u8;
+    aad[10] = version as u8;
+
+    // Length
+    aad[11] = (length >> 8) as u8;
+    aad[12] = length as u8;
+
+    aad
+}
+
+// Encrypt a record
+pub fn encrypt_record(layer: &mut RecordLayer, record: &TlsRecord) -> Vec<u8> {
+    if !layer.cipher_active {
+        return record.to_bytes();
+    }
+
+    let seq = layer.next_write_seq();
+    let (key, iv) = layer.get_write_key();
+
+    let nonce = build_nonce(iv, seq);
+    let aad = build_aad(seq, record.content_type, record.version, record.length);
+
+    // Encrypt with AES-GCM
+    let ciphertext = aes_gcm_seal(key, &nonce, &aad, &record.fragment);
+
+    // Build encrypted record
+    let mut output = Vec::new();
+    output.push(record.content_type);
+    output.push((record.version >> 8) as u8);
+    output.push(record.version as u8);
+
+    // Length includes explicit nonce (8 bytes) + ciphertext + tag (16 bytes)
+    let ct_len = 8 + ciphertext.len();
+    output.push((ct_len >> 8) as u8);
+    output.push(ct_len as u8);
+
+    // Explicit nonce (last 8 bytes of full nonce)
+    let mut i: usize = 4;
+    while i < 12 {
+        output.push(nonce[i]);
+        i = i + 1;
+    }
+
+    // Ciphertext + tag
+    i = 0;
+    while i < ciphertext.len() {
+        output.push(ciphertext[i]);
+        i = i + 1;
+    }
+
+    output
+}
+
+// Decrypt a record
+pub fn decrypt_record(layer: &mut RecordLayer, data: &[u8]) -> Option<TlsRecord> {
+    if data.len() < 5 {
+        return None;
+    }
+
+    let content_type = data[0];
+    let version = ((data[1] as u16) << 8) | (data[2] as u16);
+    let length = ((data[3] as u16) << 8) | (data[4] as u16);
+
+    if data.len() < 5 + length as usize {
+        return None;
+    }
+
+    if !layer.cipher_active {
+        // Plaintext record
+        let mut fragment = Vec::new();
+        let mut i: usize = 0;
+        while i < length as usize {
+            fragment.push(data[5 + i]);
+            i = i + 1;
+        }
+
+        return Some(TlsRecord {
+            content_type: content_type,
+            version: version,
+            length: length,
+            fragment: fragment,
+        });
+    }
+
+    // Encrypted record
+    if length < 24 {  // 8 (explicit nonce) + 16 (tag minimum)
+        return None;
+    }
+
+    let seq = layer.next_read_seq();
+    let (key, iv) = layer.get_read_key();
+
+    // Build nonce from implicit IV and explicit nonce
+    let mut nonce: [u8; 12] = [0; 12];
+    let mut i: usize = 0;
+    while i < 4 {
+        nonce[i] = iv[i];
+        i = i + 1;
+    }
+    while i < 12 {
+        nonce[i] = data[5 + i - 4];
+        i = i + 1;
+    }
+
+    // Ciphertext starts after explicit nonce
+    let ct_start = 5 + 8;
+    let ct_len = length as usize - 8;
+
+    // Build AAD
+    let plaintext_len = ct_len - 16;  // Subtract tag
+    let aad = build_aad(seq, content_type, version, plaintext_len as u16);
+
+    // Decrypt
+    let ciphertext = &data[ct_start..ct_start + ct_len];
+    match aes_gcm_open(key, &nonce, &aad, ciphertext) {
+        Some(plaintext) => {
+            Some(TlsRecord {
+                content_type: content_type,
+                version: version,
+                length: plaintext.len() as u16,
+                fragment: plaintext,
+            })
+        },
+        None => None
+    }
+}

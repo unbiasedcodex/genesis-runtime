@@ -1,0 +1,891 @@
+// Genesis Browser (Geb)
+// Main browser application for Genesis OS
+
+use super::tab::{Tab, TabState, LoadError};
+use super::ui::{
+    BrowserTheme, TabBar, TabInfo, Toolbar, AddressBar, LoadingBar, StatusBar, ContextMenu,
+    UICommand, UIRect, RectExt, TabBarHitResult, ToolbarHitResult, MenuItem,
+};
+use super::super::layout::{PaintCommand, PaintOperation, Rect};
+use super::super::css::Color;
+
+// ============================================================
+// Browser Configuration
+// ============================================================
+
+pub struct BrowserConfig {
+    pub home_page: String,
+    pub search_engine: String,
+    pub user_agent: String,
+    pub enable_javascript: bool,
+    pub enable_images: bool,
+    pub enable_cookies: bool,
+    pub block_popups: bool,
+    pub dark_mode: bool,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> BrowserConfig {
+        BrowserConfig {
+            home_page: "about:newtab".to_string(),
+            search_engine: "https://duckduckgo.com/?q=".to_string(),
+            user_agent: "GenesisOS/1.0 Geb/1.0".to_string(),
+            enable_javascript: true,
+            enable_images: true,
+            enable_cookies: true,
+            block_popups: true,
+            dark_mode: false,
+        }
+    }
+}
+
+// ============================================================
+// Browser State
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrowserMode {
+    Normal,
+    AddressBarFocused,
+    FindInPage,
+    ContextMenu,
+}
+
+// ============================================================
+// Browser
+// ============================================================
+
+pub struct Browser {
+    // Configuration
+    pub config: BrowserConfig,
+    pub theme: BrowserTheme,
+
+    // Window dimensions
+    pub window_width: u32,
+    pub window_height: u32,
+
+    // Tabs
+    pub tabs: Vec<Tab>,
+    pub active_tab_index: usize,
+    next_tab_id: u64,
+
+    // UI Components
+    pub tab_bar: TabBar,
+    pub toolbar: Toolbar,
+    pub loading_bar: LoadingBar,
+    pub status_bar: StatusBar,
+    pub context_menu: ContextMenu,
+
+    // State
+    pub mode: BrowserMode,
+    pub needs_redraw: bool,
+
+    // Find in page
+    pub find_query: String,
+    pub find_results: Vec<FindResult>,
+    pub find_current: usize,
+
+    // Hover state
+    pub hover_link: Option<String>,
+
+    // Content area
+    pub content_rect: UIRect,
+}
+
+pub struct FindResult {
+    pub node_index: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Browser {
+    pub fn new(width: u32, height: u32) -> Browser {
+        let config = BrowserConfig::default();
+        let theme = if config.dark_mode {
+            BrowserTheme::default_dark()
+        } else {
+            BrowserTheme::default_light()
+        };
+
+        let mut browser = Browser {
+            config,
+            theme,
+            window_width: width,
+            window_height: height,
+            tabs: Vec::new(),
+            active_tab_index: 0,
+            next_tab_id: 1,
+            tab_bar: TabBar::new(),
+            toolbar: Toolbar::new(),
+            loading_bar: LoadingBar::new(),
+            status_bar: StatusBar::new(),
+            context_menu: ContextMenu::new(),
+            mode: BrowserMode::Normal,
+            needs_redraw: true,
+            find_query: String::new(),
+            find_results: Vec::new(),
+            find_current: 0,
+            hover_link: None,
+            content_rect: UIRect { x: 0, y: 0, width: 0, height: 0 },
+        };
+
+        // Create initial tab
+        browser.new_tab();
+
+        // Layout
+        browser.layout();
+
+        browser
+    }
+
+    // --------------------------------------------------------
+    // Tab Management
+    // --------------------------------------------------------
+
+    pub fn new_tab(&mut self) -> usize {
+        let content_height = self.window_height - self.theme.tab_bar_height - self.theme.toolbar_height;
+        let tab = Tab::new(self.next_tab_id, self.window_width, content_height);
+        self.next_tab_id += 1;
+
+        self.tabs.push(tab);
+        self.active_tab_index = self.tabs.len() - 1;
+        self.update_tab_bar();
+        self.needs_redraw = true;
+
+        self.active_tab_index
+    }
+
+    pub fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() > 1 && index < self.tabs.len() {
+            self.tabs.remove(index);
+
+            if self.active_tab_index >= self.tabs.len() {
+                self.active_tab_index = self.tabs.len() - 1;
+            } else if self.active_tab_index > index {
+                self.active_tab_index -= 1;
+            }
+
+            self.update_tab_bar();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn switch_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active_tab_index = index;
+            self.update_tab_bar();
+            self.toolbar.address_bar.set_url(&self.tabs[index].url);
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab_index)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab_index)
+    }
+
+    fn update_tab_bar(&mut self) {
+        self.tab_bar.tabs = self.tabs.iter().map(|tab| TabInfo {
+            id: tab.id,
+            title: tab.title.clone(),
+            favicon: None,
+            is_loading: tab.is_loading(),
+            bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            close_button_bounds: UIRect { x: 0, y: 0, width: 0, height: 0 },
+        }).collect();
+
+        self.tab_bar.active_tab = self.active_tab_index;
+    }
+
+    // --------------------------------------------------------
+    // Navigation
+    // --------------------------------------------------------
+
+    pub fn navigate(&mut self, url: &str) {
+        // Check if it's a search query or URL
+        let navigation_url = if url.contains('.') || url.contains("://") || url.starts_with("about:") {
+            if url.contains("://") {
+                url.to_string()
+            } else {
+                format!("https://{}", url)
+            }
+        } else {
+            format!("{}{}", self.config.search_engine, url)
+        };
+
+        if let Some(tab) = self.active_tab_mut() {
+            match tab.navigate(&navigation_url) {
+                Ok(()) => {
+                    self.toolbar.address_bar.set_url(&tab.url);
+                    self.update_tab_bar();
+                },
+                Err(e) => {
+                    self.show_error(&format!("Navigation error: {:?}", e));
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn go_back(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            if let Ok(true) = tab.go_back() {
+                self.toolbar.address_bar.set_url(&tab.url);
+                self.update_tab_bar();
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    pub fn go_forward(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            if let Ok(true) = tab.go_forward() {
+                self.toolbar.address_bar.set_url(&tab.url);
+                self.update_tab_bar();
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    pub fn reload(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            let _ = tab.reload();
+            self.update_tab_bar();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.stop();
+            self.update_tab_bar();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn go_home(&mut self) {
+        self.navigate(&self.config.home_page.clone());
+    }
+
+    // --------------------------------------------------------
+    // Layout
+    // --------------------------------------------------------
+
+    pub fn layout(&mut self) {
+        let mut y = 0i32;
+
+        // Tab bar
+        self.tab_bar.layout(
+            0,
+            y,
+            self.window_width,
+            self.theme.tab_bar_height,
+            &self.theme,
+        );
+        y += self.theme.tab_bar_height as i32;
+
+        // Toolbar
+        self.toolbar.layout(
+            0,
+            y,
+            self.window_width,
+            self.theme.toolbar_height,
+            &self.theme,
+        );
+        y += self.theme.toolbar_height as i32;
+
+        // Loading bar
+        self.loading_bar.layout(0, y, self.window_width);
+        y += 3;
+
+        // Content area
+        let content_height = self.window_height - y as u32 - 24;
+        self.content_rect = UIRect {
+            x: 0,
+            y,
+            width: self.window_width,
+            height: content_height,
+        };
+
+        // Status bar
+        self.status_bar.layout(
+            0,
+            self.window_height as i32 - 24,
+            self.window_width,
+            24,
+        );
+
+        // Update tab viewports
+        for tab in &mut self.tabs {
+            tab.resize(self.window_width, content_height);
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.window_width = width;
+        self.window_height = height;
+        self.layout();
+        self.needs_redraw = true;
+    }
+
+    // --------------------------------------------------------
+    // Rendering
+    // --------------------------------------------------------
+
+    pub fn render(&mut self) -> Vec<UICommand> {
+        let mut commands = Vec::new();
+
+        // Background
+        commands.push(UICommand::FillRect {
+            rect: UIRect {
+                x: 0,
+                y: 0,
+                width: self.window_width,
+                height: self.window_height,
+            },
+            color: self.theme.background,
+        });
+
+        // Tab bar
+        commands.extend(self.tab_bar.render(&self.theme));
+
+        // Toolbar
+        let can_back = self.active_tab().map(|t| t.can_go_back()).unwrap_or(false);
+        let can_forward = self.active_tab().map(|t| t.can_go_forward()).unwrap_or(false);
+        let is_loading = self.active_tab().map(|t| t.is_loading()).unwrap_or(false);
+        commands.extend(self.toolbar.render(can_back, can_forward, is_loading, &self.theme));
+
+        // Loading bar
+        if let Some(tab) = self.active_tab() {
+            self.loading_bar.is_visible = tab.is_loading();
+            self.loading_bar.progress = tab.get_loading_progress();
+        }
+        commands.extend(self.loading_bar.render(&self.theme));
+
+        // Content area - clip to content rect
+        commands.push(UICommand::Clip { rect: self.content_rect });
+
+        // Render page content
+        if let Some(tab) = self.active_tab() {
+            let paint_commands = tab.get_paint_commands();
+            for cmd in paint_commands {
+                commands.push(self.translate_paint_command(cmd, tab.scroll_x, tab.scroll_y));
+            }
+        }
+
+        commands.push(UICommand::UnClip);
+
+        // Status bar
+        commands.extend(self.status_bar.render(&self.theme));
+
+        // Context menu (on top)
+        commands.extend(self.context_menu.render(&self.theme));
+
+        self.needs_redraw = false;
+        commands
+    }
+
+    fn translate_paint_command(&self, cmd: &PaintCommand, scroll_x: i32, scroll_y: i32) -> UICommand {
+        let x = cmd.bounds.x as i32 - scroll_x + self.content_rect.x;
+        let y = cmd.bounds.y as i32 - scroll_y + self.content_rect.y;
+
+        match &cmd.command {
+            PaintOperation::Background { color } => UICommand::FillRect {
+                rect: UIRect {
+                    x,
+                    y,
+                    width: cmd.bounds.width as u32,
+                    height: cmd.bounds.height as u32,
+                },
+                color: *color,
+            },
+            PaintOperation::Text { text, font_size, color, .. } => UICommand::Text {
+                text: text.clone(),
+                x,
+                y: y + *font_size as i32,
+                size: *font_size,
+                color: *color,
+            },
+            PaintOperation::Border { top, right, bottom, left } => {
+                // Simplified - just draw rectangles for borders
+                UICommand::StrokeRect {
+                    rect: UIRect {
+                        x,
+                        y,
+                        width: cmd.bounds.width as u32,
+                        height: cmd.bounds.height as u32,
+                    },
+                    color: top.color,
+                    width: top.width as u32,
+                }
+            },
+            PaintOperation::Image { url } => {
+                // Image placeholder
+                UICommand::FillRect {
+                    rect: UIRect {
+                        x,
+                        y,
+                        width: cmd.bounds.width as u32,
+                        height: cmd.bounds.height as u32,
+                    },
+                    color: Color::new(200, 200, 200, 1.0),
+                }
+            },
+        }
+    }
+
+    // --------------------------------------------------------
+    // Event Handling
+    // --------------------------------------------------------
+
+    pub fn handle_mouse_click(&mut self, x: i32, y: i32, button: MouseButton) {
+        // Hide context menu on click
+        if self.context_menu.is_visible && button == MouseButton::Left {
+            if let Some(index) = self.context_menu.hit_test(x, y) {
+                self.execute_context_menu_action(index);
+            }
+            self.context_menu.hide();
+            self.needs_redraw = true;
+            return;
+        }
+
+        // Right click - show context menu
+        if button == MouseButton::Right {
+            self.show_context_menu(x, y);
+            return;
+        }
+
+        // Tab bar
+        if self.tab_bar.bounds.contains_point(x, y) {
+            match self.tab_bar.hit_test(x, y) {
+                TabBarHitResult::Tab(index) => self.switch_tab(index),
+                TabBarHitResult::CloseTab(index) => self.close_tab(index),
+                TabBarHitResult::NewTab => { self.new_tab(); },
+                TabBarHitResult::None => {},
+            }
+            return;
+        }
+
+        // Toolbar
+        if self.toolbar.bounds.contains_point(x, y) {
+            match self.toolbar.hit_test(x, y) {
+                ToolbarHitResult::Back => self.go_back(),
+                ToolbarHitResult::Forward => self.go_forward(),
+                ToolbarHitResult::Reload => {
+                    if let Some(tab) = self.active_tab() {
+                        if tab.is_loading() {
+                            self.stop();
+                        } else {
+                            self.reload();
+                        }
+                    }
+                },
+                ToolbarHitResult::Home => self.go_home(),
+                ToolbarHitResult::AddressBar => {
+                    self.mode = BrowserMode::AddressBarFocused;
+                    self.toolbar.address_bar.is_focused = true;
+                    self.toolbar.address_bar.select_all();
+                    self.needs_redraw = true;
+                },
+                ToolbarHitResult::Menu => self.show_main_menu(x, y),
+                ToolbarHitResult::None => {},
+            }
+            return;
+        }
+
+        // Content area - handle link clicks
+        if self.content_rect.contains_point(x, y) {
+            let content_x = x - self.content_rect.x;
+            let content_y = y - self.content_rect.y;
+
+            if let Some(link) = self.active_tab().and_then(|t| t.get_link_at(content_x, content_y)) {
+                self.navigate(&link);
+            }
+        }
+    }
+
+    pub fn handle_mouse_move(&mut self, x: i32, y: i32) {
+        // Update context menu hover
+        if self.context_menu.is_visible {
+            self.context_menu.selected_index = self.context_menu.hit_test(x, y);
+            self.needs_redraw = true;
+            return;
+        }
+
+        // Content area - show link URL in status bar
+        if self.content_rect.contains_point(x, y) {
+            let content_x = x - self.content_rect.x;
+            let content_y = y - self.content_rect.y;
+
+            let link = self.active_tab().and_then(|t| t.get_link_at(content_x, content_y));
+
+            if link != self.hover_link {
+                self.hover_link = link.clone();
+                if let Some(url) = link {
+                    self.status_bar.show(&url);
+                } else {
+                    self.status_bar.hide();
+                }
+                self.needs_redraw = true;
+            }
+        } else if self.hover_link.is_some() {
+            self.hover_link = None;
+            self.status_bar.hide();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn handle_scroll(&mut self, delta_x: i32, delta_y: i32) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.scroll(delta_x, delta_y);
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn handle_key_down(&mut self, key: Key, modifiers: Modifiers) {
+        // Global shortcuts
+        if modifiers.ctrl {
+            match key {
+                Key::Char('t') => { self.new_tab(); },
+                Key::Char('w') => { self.close_tab(self.active_tab_index); },
+                Key::Char('r') | Key::F5 => { self.reload(); },
+                Key::Char('l') => {
+                    self.mode = BrowserMode::AddressBarFocused;
+                    self.toolbar.address_bar.is_focused = true;
+                    self.toolbar.address_bar.select_all();
+                    self.needs_redraw = true;
+                },
+                Key::Char('f') => {
+                    self.mode = BrowserMode::FindInPage;
+                    self.needs_redraw = true;
+                },
+                Key::Tab => {
+                    if modifiers.shift {
+                        let new_index = if self.active_tab_index > 0 {
+                            self.active_tab_index - 1
+                        } else {
+                            self.tabs.len() - 1
+                        };
+                        self.switch_tab(new_index);
+                    } else {
+                        let new_index = (self.active_tab_index + 1) % self.tabs.len();
+                        self.switch_tab(new_index);
+                    }
+                },
+                Key::Char('1') ..= Key::Char('9') => {
+                    if let Key::Char(c) = key {
+                        let index = (c as usize) - ('1' as usize);
+                        if index < self.tabs.len() {
+                            self.switch_tab(index);
+                        }
+                    }
+                },
+                _ => {}
+            }
+            return;
+        }
+
+        if modifiers.alt {
+            match key {
+                Key::Left => self.go_back(),
+                Key::Right => self.go_forward(),
+                _ => {}
+            }
+            return;
+        }
+
+        // Address bar focused mode
+        if self.mode == BrowserMode::AddressBarFocused {
+            match key {
+                Key::Enter => {
+                    let url = self.toolbar.address_bar.get_url().to_string();
+                    self.toolbar.address_bar.is_focused = false;
+                    self.mode = BrowserMode::Normal;
+                    self.navigate(&url);
+                },
+                Key::Escape => {
+                    self.toolbar.address_bar.is_focused = false;
+                    self.mode = BrowserMode::Normal;
+                    if let Some(tab) = self.active_tab() {
+                        self.toolbar.address_bar.set_url(&tab.url);
+                    }
+                    self.needs_redraw = true;
+                },
+                Key::Backspace => {
+                    self.toolbar.address_bar.handle_key('\x08');
+                    self.needs_redraw = true;
+                },
+                Key::Delete => {
+                    self.toolbar.address_bar.handle_key('\x7f');
+                    self.needs_redraw = true;
+                },
+                Key::Left => {
+                    self.toolbar.address_bar.move_cursor(-1);
+                    self.needs_redraw = true;
+                },
+                Key::Right => {
+                    self.toolbar.address_bar.move_cursor(1);
+                    self.needs_redraw = true;
+                },
+                Key::Home => {
+                    self.toolbar.address_bar.cursor_position = 0;
+                    self.needs_redraw = true;
+                },
+                Key::End => {
+                    self.toolbar.address_bar.cursor_position = self.toolbar.address_bar.text.len();
+                    self.needs_redraw = true;
+                },
+                Key::Char(c) => {
+                    self.toolbar.address_bar.handle_key(c);
+                    self.needs_redraw = true;
+                },
+                _ => {}
+            }
+            return;
+        }
+
+        // Normal mode
+        match key {
+            Key::Escape => {
+                if self.context_menu.is_visible {
+                    self.context_menu.hide();
+                    self.needs_redraw = true;
+                }
+            },
+            Key::F5 => self.reload(),
+            Key::Home => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.scroll_to(0, 0);
+                    self.needs_redraw = true;
+                }
+            },
+            Key::End => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let max_scroll = tab.content_height() - tab.viewport_height as i32;
+                    tab.scroll_to(0, max_scroll.max(0));
+                    self.needs_redraw = true;
+                }
+            },
+            Key::PageUp => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let page = tab.viewport_height as i32 - 40;
+                    tab.scroll(0, -page);
+                    self.needs_redraw = true;
+                }
+            },
+            Key::PageDown => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let page = tab.viewport_height as i32 - 40;
+                    tab.scroll(0, page);
+                    self.needs_redraw = true;
+                }
+            },
+            Key::Up => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.scroll(0, -40);
+                    self.needs_redraw = true;
+                }
+            },
+            Key::Down => {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.scroll(0, 40);
+                    self.needs_redraw = true;
+                }
+            },
+            Key::Space => {
+                if let Some(tab) = self.active_tab_mut() {
+                    let scroll_amount = if modifiers.shift {
+                        -(tab.viewport_height as i32 - 40)
+                    } else {
+                        tab.viewport_height as i32 - 40
+                    };
+                    tab.scroll(0, scroll_amount);
+                    self.needs_redraw = true;
+                }
+            },
+            _ => {}
+        }
+    }
+
+    // --------------------------------------------------------
+    // Context Menu
+    // --------------------------------------------------------
+
+    fn show_context_menu(&mut self, x: i32, y: i32) {
+        let items = if self.content_rect.contains_point(x, y) {
+            // Page context menu
+            let mut items = vec![
+                MenuItem { label: "Back".to_string(), shortcut: Some("Alt+Left".to_string()), enabled: self.active_tab().map(|t| t.can_go_back()).unwrap_or(false), separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+                MenuItem { label: "Forward".to_string(), shortcut: Some("Alt+Right".to_string()), enabled: self.active_tab().map(|t| t.can_go_forward()).unwrap_or(false), separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+                MenuItem { label: "Reload".to_string(), shortcut: Some("Ctrl+R".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+                MenuItem { label: String::new(), shortcut: None, enabled: false, separator: true, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            ];
+
+            // Check if hovering over a link
+            if self.hover_link.is_some() {
+                items.push(MenuItem { label: "Open Link in New Tab".to_string(), shortcut: None, enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } });
+                items.push(MenuItem { label: "Copy Link Address".to_string(), shortcut: None, enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } });
+                items.push(MenuItem { label: String::new(), shortcut: None, enabled: false, separator: true, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } });
+            }
+
+            items.push(MenuItem { label: "View Page Source".to_string(), shortcut: Some("Ctrl+U".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } });
+            items.push(MenuItem { label: "Inspect Element".to_string(), shortcut: Some("Ctrl+Shift+I".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } });
+
+            items
+        } else {
+            // Toolbar context menu
+            vec![
+                MenuItem { label: "New Tab".to_string(), shortcut: Some("Ctrl+T".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+                MenuItem { label: "Close Tab".to_string(), shortcut: Some("Ctrl+W".to_string()), enabled: self.tabs.len() > 1, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            ]
+        };
+
+        self.context_menu.show(x, y, items, &self.theme);
+        self.mode = BrowserMode::ContextMenu;
+        self.needs_redraw = true;
+    }
+
+    fn show_main_menu(&mut self, x: i32, y: i32) {
+        let items = vec![
+            MenuItem { label: "New Tab".to_string(), shortcut: Some("Ctrl+T".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "New Window".to_string(), shortcut: Some("Ctrl+N".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: String::new(), shortcut: None, enabled: false, separator: true, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "History".to_string(), shortcut: Some("Ctrl+H".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "Downloads".to_string(), shortcut: Some("Ctrl+J".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "Bookmarks".to_string(), shortcut: Some("Ctrl+B".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: String::new(), shortcut: None, enabled: false, separator: true, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "Find in Page".to_string(), shortcut: Some("Ctrl+F".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "Print".to_string(), shortcut: Some("Ctrl+P".to_string()), enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: String::new(), shortcut: None, enabled: false, separator: true, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "Settings".to_string(), shortcut: None, enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+            MenuItem { label: "About Geb".to_string(), shortcut: None, enabled: true, separator: false, bounds: UIRect { x: 0, y: 0, width: 0, height: 0 } },
+        ];
+
+        // Show menu below the button
+        self.context_menu.show(x - 150, y + 10, items, &self.theme);
+        self.mode = BrowserMode::ContextMenu;
+        self.needs_redraw = true;
+    }
+
+    fn execute_context_menu_action(&mut self, index: usize) {
+        let label = self.context_menu.items.get(index).map(|i| i.label.clone()).unwrap_or_default();
+
+        match label.as_str() {
+            "Back" => self.go_back(),
+            "Forward" => self.go_forward(),
+            "Reload" => self.reload(),
+            "New Tab" => { self.new_tab(); },
+            "Close Tab" => { self.close_tab(self.active_tab_index); },
+            "Open Link in New Tab" => {
+                if let Some(url) = self.hover_link.clone() {
+                    self.new_tab();
+                    self.navigate(&url);
+                }
+            },
+            "View Page Source" => {
+                // Would show page source
+            },
+            "Settings" => {
+                self.navigate("about:settings");
+            },
+            "About Geb" => {
+                self.navigate("about:about");
+            },
+            _ => {}
+        }
+    }
+
+    // --------------------------------------------------------
+    // Utility
+    // --------------------------------------------------------
+
+    fn show_error(&mut self, message: &str) {
+        self.status_bar.show(message);
+        // Would also show a notification or error page
+    }
+
+    pub fn tick(&mut self) {
+        // Process JavaScript timers
+        for tab in &mut self.tabs {
+            let _ = tab.process_js_timers();
+        }
+
+        // Check if layout/paint needed
+        for tab in &mut self.tabs {
+            if tab.needs_layout {
+                tab.perform_layout();
+            }
+            if tab.needs_paint {
+                tab.build_paint_commands();
+                self.needs_redraw = true;
+            }
+        }
+
+        // Update loading bar
+        if let Some(tab) = self.active_tab() {
+            if tab.is_loading() {
+                self.loading_bar.progress = tab.get_loading_progress();
+                self.needs_redraw = true;
+            }
+        }
+
+        self.update_tab_bar();
+    }
+}
+
+// ============================================================
+// Input Types
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Escape,
+    Backspace,
+    Delete,
+    Tab,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+// ============================================================
+// Entry Point
+// ============================================================
+
+/// Create and run the browser
+pub fn run_browser() {
+    // Create browser with default window size
+    let mut browser = Browser::new(1024, 768);
+
+    // Navigate to home page
+    browser.go_home();
+
+    // Main loop would be here, handling events from window manager
+    // For now, just return the browser instance
+}

@@ -1,0 +1,1815 @@
+// JavaScript Interpreter
+// Tree-walking interpreter for JavaScript execution
+
+use super::parser::{
+    Program, Stmt, Expr, Literal, Pattern, Property, PropertyKey, PropertyKind,
+    FunctionExpr, ArrowFunction, ArrowBody, ClassExpr, ClassMember, ClassMemberKind,
+    VarKind, VariableDeclarator, FunctionDecl, ClassDecl, SwitchCase, ForInit, ForLeft,
+    CatchClause, UnaryOp, BinaryOp, LogicalOp, AssignOp,
+};
+
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::cell::RefCell;
+
+// ============================================================
+// JavaScript Values
+// ============================================================
+
+#[derive(Clone)]
+pub enum JsValue {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Object(Rc<RefCell<JsObject>>),
+    Function(Rc<JsFunction>),
+    Array(Rc<RefCell<Vec<JsValue>>>),
+    Symbol(u64),
+    BigInt(i128),
+}
+
+impl JsValue {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            JsValue::Undefined | JsValue::Null => false,
+            JsValue::Boolean(b) => *b,
+            JsValue::Number(n) => *n != 0.0 && !n.is_nan(),
+            JsValue::String(s) => !s.is_empty(),
+            _ => true,
+        }
+    }
+
+    pub fn is_nullish(&self) -> bool {
+        matches!(self, JsValue::Undefined | JsValue::Null)
+    }
+
+    pub fn to_number(&self) -> f64 {
+        match self {
+            JsValue::Undefined => f64::NAN,
+            JsValue::Null => 0.0,
+            JsValue::Boolean(b) => if *b { 1.0 } else { 0.0 },
+            JsValue::Number(n) => *n,
+            JsValue::String(s) => s.parse().unwrap_or(f64::NAN),
+            JsValue::BigInt(n) => *n as f64,
+            _ => f64::NAN,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            JsValue::Undefined => "undefined".to_string(),
+            JsValue::Null => "null".to_string(),
+            JsValue::Boolean(b) => b.to_string(),
+            JsValue::Number(n) => {
+                if n.is_nan() {
+                    "NaN".to_string()
+                } else if n.is_infinite() {
+                    if *n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+                } else if *n == 0.0 {
+                    "0".to_string()
+                } else {
+                    n.to_string()
+                }
+            },
+            JsValue::String(s) => s.clone(),
+            JsValue::Object(_) => "[object Object]".to_string(),
+            JsValue::Function(_) => "[Function]".to_string(),
+            JsValue::Array(arr) => {
+                let arr = arr.borrow();
+                arr.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+            JsValue::Symbol(id) => format!("Symbol({})", id),
+            JsValue::BigInt(n) => format!("{}n", n),
+        }
+    }
+
+    pub fn to_boolean(&self) -> bool {
+        self.is_truthy()
+    }
+
+    pub fn type_of(&self) -> &'static str {
+        match self {
+            JsValue::Undefined => "undefined",
+            JsValue::Null => "object",  // Historical quirk
+            JsValue::Boolean(_) => "boolean",
+            JsValue::Number(_) => "number",
+            JsValue::String(_) => "string",
+            JsValue::Object(_) => "object",
+            JsValue::Function(_) => "function",
+            JsValue::Array(_) => "object",
+            JsValue::Symbol(_) => "symbol",
+            JsValue::BigInt(_) => "bigint",
+        }
+    }
+
+    pub fn strict_equals(&self, other: &JsValue) -> bool {
+        match (self, other) {
+            (JsValue::Undefined, JsValue::Undefined) => true,
+            (JsValue::Null, JsValue::Null) => true,
+            (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
+            (JsValue::Number(a), JsValue::Number(b)) => {
+                if a.is_nan() || b.is_nan() {
+                    false
+                } else {
+                    a == b
+                }
+            },
+            (JsValue::String(a), JsValue::String(b)) => a == b,
+            (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
+            (JsValue::Function(a), JsValue::Function(b)) => Rc::ptr_eq(a, b),
+            (JsValue::Array(a), JsValue::Array(b)) => Rc::ptr_eq(a, b),
+            (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub fn loose_equals(&self, other: &JsValue) -> bool {
+        match (self, other) {
+            (JsValue::Undefined, JsValue::Null) => true,
+            (JsValue::Null, JsValue::Undefined) => true,
+            (JsValue::Number(_), JsValue::String(_)) => {
+                self.to_number() == other.to_number()
+            },
+            (JsValue::String(_), JsValue::Number(_)) => {
+                self.to_number() == other.to_number()
+            },
+            (JsValue::Boolean(_), _) => {
+                JsValue::Number(self.to_number()).loose_equals(other)
+            },
+            (_, JsValue::Boolean(_)) => {
+                self.loose_equals(&JsValue::Number(other.to_number()))
+            },
+            _ => self.strict_equals(other),
+        }
+    }
+}
+
+impl std::fmt::Debug for JsValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
+}
+
+// ============================================================
+// JavaScript Object
+// ============================================================
+
+#[derive(Clone)]
+pub struct JsObject {
+    pub properties: HashMap<String, PropertyDescriptor>,
+    pub prototype: Option<Rc<RefCell<JsObject>>>,
+    pub extensible: bool,
+    pub internal: ObjectInternal,
+}
+
+#[derive(Clone)]
+pub struct PropertyDescriptor {
+    pub value: JsValue,
+    pub writable: bool,
+    pub enumerable: bool,
+    pub configurable: bool,
+    pub getter: Option<Rc<JsFunction>>,
+    pub setter: Option<Rc<JsFunction>>,
+}
+
+impl PropertyDescriptor {
+    pub fn data(value: JsValue) -> PropertyDescriptor {
+        PropertyDescriptor {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            getter: None,
+            setter: None,
+        }
+    }
+
+    pub fn readonly(value: JsValue) -> PropertyDescriptor {
+        PropertyDescriptor {
+            value,
+            writable: false,
+            enumerable: true,
+            configurable: false,
+            getter: None,
+            setter: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ObjectInternal {
+    Ordinary,
+    BoundFunction {
+        target: Rc<JsFunction>,
+        this_arg: JsValue,
+        bound_args: Vec<JsValue>,
+    },
+    Error {
+        message: String,
+        name: String,
+    },
+    Date {
+        timestamp: f64,
+    },
+    RegExp {
+        pattern: String,
+        flags: String,
+    },
+    Promise {
+        state: PromiseState,
+        result: Option<JsValue>,
+    },
+    Map {
+        entries: Vec<(JsValue, JsValue)>,
+    },
+    Set {
+        values: Vec<JsValue>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+impl JsObject {
+    pub fn new() -> JsObject {
+        JsObject {
+            properties: HashMap::new(),
+            prototype: None,
+            extensible: true,
+            internal: ObjectInternal::Ordinary,
+        }
+    }
+
+    pub fn with_prototype(prototype: Rc<RefCell<JsObject>>) -> JsObject {
+        JsObject {
+            properties: HashMap::new(),
+            prototype: Some(prototype),
+            extensible: true,
+            internal: ObjectInternal::Ordinary,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> JsValue {
+        if let Some(prop) = self.properties.get(key) {
+            return prop.value.clone();
+        }
+
+        if let Some(ref proto) = self.prototype {
+            return proto.borrow().get(key);
+        }
+
+        JsValue::Undefined
+    }
+
+    pub fn set(&mut self, key: String, value: JsValue) {
+        if let Some(prop) = self.properties.get_mut(&key) {
+            if prop.writable {
+                prop.value = value;
+            }
+            return;
+        }
+
+        if self.extensible {
+            self.properties.insert(key, PropertyDescriptor::data(value));
+        }
+    }
+
+    pub fn has(&self, key: &str) -> bool {
+        if self.properties.contains_key(key) {
+            return true;
+        }
+
+        if let Some(ref proto) = self.prototype {
+            return proto.borrow().has(key);
+        }
+
+        false
+    }
+
+    pub fn delete(&mut self, key: &str) -> bool {
+        if let Some(prop) = self.properties.get(key) {
+            if !prop.configurable {
+                return false;
+            }
+        }
+        self.properties.remove(key).is_some()
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.properties
+            .iter()
+            .filter(|(_, v)| v.enumerable)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+// ============================================================
+// JavaScript Function
+// ============================================================
+
+#[derive(Clone)]
+pub struct JsFunction {
+    pub name: Option<String>,
+    pub params: Vec<Pattern>,
+    pub body: FunctionBody,
+    pub scope: Rc<RefCell<Scope>>,
+    pub this_mode: ThisMode,
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub prototype: Option<Rc<RefCell<JsObject>>>,
+}
+
+#[derive(Clone)]
+pub enum FunctionBody {
+    Statements(Vec<Stmt>),
+    Native(fn(&mut Interpreter, JsValue, Vec<JsValue>) -> Result<JsValue, JsError>),
+    ArrowExpr(Box<Expr>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ThisMode {
+    Global,
+    Strict,
+    Lexical,  // Arrow functions
+}
+
+// ============================================================
+// Scope
+// ============================================================
+
+pub struct Scope {
+    pub variables: HashMap<String, JsValue>,
+    pub parent: Option<Rc<RefCell<Scope>>>,
+    pub this_binding: JsValue,
+    pub new_target: Option<Rc<JsFunction>>,
+}
+
+impl Scope {
+    pub fn new() -> Scope {
+        Scope {
+            variables: HashMap::new(),
+            parent: None,
+            this_binding: JsValue::Undefined,
+            new_target: None,
+        }
+    }
+
+    pub fn child(parent: Rc<RefCell<Scope>>) -> Scope {
+        let this_binding = parent.borrow().this_binding.clone();
+        Scope {
+            variables: HashMap::new(),
+            parent: Some(parent),
+            this_binding,
+            new_target: None,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<JsValue> {
+        if let Some(value) = self.variables.get(name) {
+            return Some(value.clone());
+        }
+
+        if let Some(ref parent) = self.parent {
+            return parent.borrow().get(name);
+        }
+
+        None
+    }
+
+    pub fn set(&mut self, name: String, value: JsValue) {
+        // Check if variable exists in this scope
+        if self.variables.contains_key(&name) {
+            self.variables.insert(name, value);
+            return;
+        }
+
+        // Check parent scopes
+        if let Some(ref parent) = self.parent {
+            let mut p = parent.borrow_mut();
+            if p.has(&name) {
+                p.set(name, value);
+                return;
+            }
+        }
+
+        // Create in current scope
+        self.variables.insert(name, value);
+    }
+
+    pub fn declare(&mut self, name: String, value: JsValue) {
+        self.variables.insert(name, value);
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        if self.variables.contains_key(name) {
+            return true;
+        }
+
+        if let Some(ref parent) = self.parent {
+            return parent.borrow().has(name);
+        }
+
+        false
+    }
+}
+
+// ============================================================
+// Error Type
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct JsError {
+    pub name: String,
+    pub message: String,
+    pub stack: Vec<String>,
+}
+
+impl JsError {
+    pub fn type_error(message: &str) -> JsError {
+        JsError {
+            name: "TypeError".to_string(),
+            message: message.to_string(),
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn reference_error(message: &str) -> JsError {
+        JsError {
+            name: "ReferenceError".to_string(),
+            message: message.to_string(),
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn syntax_error(message: &str) -> JsError {
+        JsError {
+            name: "SyntaxError".to_string(),
+            message: message.to_string(),
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn range_error(message: &str) -> JsError {
+        JsError {
+            name: "RangeError".to_string(),
+            message: message.to_string(),
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn to_value(&self) -> JsValue {
+        let mut obj = JsObject::new();
+        obj.set("name".to_string(), JsValue::String(self.name.clone()));
+        obj.set("message".to_string(), JsValue::String(self.message.clone()));
+        JsValue::Object(Rc::new(RefCell::new(obj)))
+    }
+}
+
+// ============================================================
+// Control Flow
+// ============================================================
+
+pub enum ControlFlow {
+    Normal(JsValue),
+    Return(JsValue),
+    Break(Option<String>),
+    Continue(Option<String>),
+    Throw(JsValue),
+}
+
+// ============================================================
+// Interpreter
+// ============================================================
+
+pub struct Interpreter {
+    pub global: Rc<RefCell<JsObject>>,
+    pub scope: Rc<RefCell<Scope>>,
+    pub symbol_counter: u64,
+}
+
+impl Interpreter {
+    pub fn new() -> Interpreter {
+        let global = Rc::new(RefCell::new(JsObject::new()));
+        let mut scope = Scope::new();
+        scope.this_binding = JsValue::Object(global.clone());
+
+        let interpreter = Interpreter {
+            global: global.clone(),
+            scope: Rc::new(RefCell::new(scope)),
+            symbol_counter: 0,
+        };
+
+        interpreter
+    }
+
+    pub fn run(&mut self, program: &Program) -> Result<JsValue, JsError> {
+        let mut result = JsValue::Undefined;
+
+        for stmt in &program.body {
+            match self.execute_statement(stmt)? {
+                ControlFlow::Normal(value) => result = value,
+                ControlFlow::Return(value) => return Ok(value),
+                ControlFlow::Throw(value) => {
+                    return Err(JsError {
+                        name: "Error".to_string(),
+                        message: value.to_string(),
+                        stack: Vec::new(),
+                    });
+                },
+                _ => {}
+            }
+        }
+
+        Ok(result)
+    }
+
+    // --------------------------------------------------------
+    // Statement execution
+    // --------------------------------------------------------
+
+    pub fn execute_statement(&mut self, stmt: &Stmt) -> Result<ControlFlow, JsError> {
+        match stmt {
+            Stmt::Variable { kind, declarations } => {
+                for decl in declarations {
+                    let value = match &decl.init {
+                        Some(expr) => self.evaluate_expression(expr)?,
+                        None => JsValue::Undefined,
+                    };
+                    self.bind_pattern(&decl.id, value)?;
+                }
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::Function(decl) => {
+                let func = self.create_function(
+                    Some(decl.name.clone()),
+                    decl.params.clone(),
+                    decl.body.clone(),
+                    decl.is_async,
+                    decl.is_generator,
+                );
+                self.scope.borrow_mut().declare(
+                    decl.name.clone(),
+                    JsValue::Function(Rc::new(func)),
+                );
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::Class(decl) => {
+                let class_value = self.create_class(
+                    Some(decl.name.clone()),
+                    decl.super_class.as_ref(),
+                    &decl.body,
+                )?;
+                self.scope.borrow_mut().declare(decl.name.clone(), class_value);
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::If { test, consequent, alternate } => {
+                let test_value = self.evaluate_expression(test)?;
+                if test_value.is_truthy() {
+                    self.execute_statement(consequent)
+                } else if let Some(alt) = alternate {
+                    self.execute_statement(alt)
+                } else {
+                    Ok(ControlFlow::Normal(JsValue::Undefined))
+                }
+            },
+
+            Stmt::Switch { discriminant, cases } => {
+                let disc_value = self.evaluate_expression(discriminant)?;
+                let mut matched = false;
+                let mut default_index = None;
+
+                // Find matching case
+                for (i, case) in cases.iter().enumerate() {
+                    if case.test.is_none() {
+                        default_index = Some(i);
+                        continue;
+                    }
+
+                    if !matched {
+                        let test_value = self.evaluate_expression(case.test.as_ref().unwrap())?;
+                        if disc_value.strict_equals(&test_value) {
+                            matched = true;
+                        }
+                    }
+
+                    if matched {
+                        for stmt in &case.consequent {
+                            match self.execute_statement(stmt)? {
+                                ControlFlow::Break(None) => {
+                                    return Ok(ControlFlow::Normal(JsValue::Undefined));
+                                },
+                                flow @ ControlFlow::Return(_) |
+                                flow @ ControlFlow::Break(_) |
+                                flow @ ControlFlow::Continue(_) |
+                                flow @ ControlFlow::Throw(_) => return Ok(flow),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // Execute default if no match
+                if !matched {
+                    if let Some(idx) = default_index {
+                        for stmt in &cases[idx].consequent {
+                            match self.execute_statement(stmt)? {
+                                ControlFlow::Break(None) => {
+                                    return Ok(ControlFlow::Normal(JsValue::Undefined));
+                                },
+                                flow @ ControlFlow::Return(_) |
+                                flow @ ControlFlow::Break(_) |
+                                flow @ ControlFlow::Continue(_) |
+                                flow @ ControlFlow::Throw(_) => return Ok(flow),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::For { init, test, update, body } => {
+                // Create new scope for loop
+                let old_scope = self.scope.clone();
+                self.scope = Rc::new(RefCell::new(Scope::child(old_scope.clone())));
+
+                // Initialize
+                if let Some(init) = init {
+                    match init {
+                        ForInit::Variable(kind, decls) => {
+                            for decl in decls {
+                                let value = match &decl.init {
+                                    Some(expr) => self.evaluate_expression(expr)?,
+                                    None => JsValue::Undefined,
+                                };
+                                self.bind_pattern(&decl.id, value)?;
+                            }
+                        },
+                        ForInit::Expression(expr) => {
+                            self.evaluate_expression(expr)?;
+                        },
+                    }
+                }
+
+                loop {
+                    // Test
+                    if let Some(test) = test {
+                        let test_value = self.evaluate_expression(test)?;
+                        if !test_value.is_truthy() {
+                            break;
+                        }
+                    }
+
+                    // Body
+                    match self.execute_statement(body)? {
+                        ControlFlow::Break(None) => break,
+                        ControlFlow::Continue(None) => {},
+                        flow @ ControlFlow::Return(_) |
+                        flow @ ControlFlow::Throw(_) => {
+                            self.scope = old_scope;
+                            return Ok(flow);
+                        },
+                        _ => {}
+                    }
+
+                    // Update
+                    if let Some(update) = update {
+                        self.evaluate_expression(update)?;
+                    }
+                }
+
+                self.scope = old_scope;
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::ForIn { left, right, body } => {
+                let obj = self.evaluate_expression(right)?;
+
+                if let JsValue::Object(obj_ref) = obj {
+                    let keys = obj_ref.borrow().keys();
+
+                    for key in keys {
+                        self.bind_for_left(left, JsValue::String(key))?;
+
+                        match self.execute_statement(body)? {
+                            ControlFlow::Break(None) => break,
+                            ControlFlow::Continue(None) => continue,
+                            flow @ ControlFlow::Return(_) |
+                            flow @ ControlFlow::Throw(_) => return Ok(flow),
+                            _ => {}
+                        }
+                    }
+                }
+
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::ForOf { left, right, body, .. } => {
+                let iterable = self.evaluate_expression(right)?;
+
+                match iterable {
+                    JsValue::Array(arr_ref) => {
+                        let arr = arr_ref.borrow();
+                        for value in arr.iter() {
+                            self.bind_for_left(left, value.clone())?;
+
+                            match self.execute_statement(body)? {
+                                ControlFlow::Break(None) => break,
+                                ControlFlow::Continue(None) => continue,
+                                flow @ ControlFlow::Return(_) |
+                                flow @ ControlFlow::Throw(_) => return Ok(flow),
+                                _ => {}
+                            }
+                        }
+                    },
+                    JsValue::String(s) => {
+                        for c in s.chars() {
+                            self.bind_for_left(left, JsValue::String(c.to_string()))?;
+
+                            match self.execute_statement(body)? {
+                                ControlFlow::Break(None) => break,
+                                ControlFlow::Continue(None) => continue,
+                                flow @ ControlFlow::Return(_) |
+                                flow @ ControlFlow::Throw(_) => return Ok(flow),
+                                _ => {}
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::While { test, body } => {
+                loop {
+                    let test_value = self.evaluate_expression(test)?;
+                    if !test_value.is_truthy() {
+                        break;
+                    }
+
+                    match self.execute_statement(body)? {
+                        ControlFlow::Break(None) => break,
+                        ControlFlow::Continue(None) => continue,
+                        flow @ ControlFlow::Return(_) |
+                        flow @ ControlFlow::Throw(_) => return Ok(flow),
+                        _ => {}
+                    }
+                }
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::DoWhile { body, test } => {
+                loop {
+                    match self.execute_statement(body)? {
+                        ControlFlow::Break(None) => break,
+                        ControlFlow::Continue(None) => {},
+                        flow @ ControlFlow::Return(_) |
+                        flow @ ControlFlow::Throw(_) => return Ok(flow),
+                        _ => {}
+                    }
+
+                    let test_value = self.evaluate_expression(test)?;
+                    if !test_value.is_truthy() {
+                        break;
+                    }
+                }
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::Break(label) => Ok(ControlFlow::Break(label.clone())),
+
+            Stmt::Continue(label) => Ok(ControlFlow::Continue(label.clone())),
+
+            Stmt::Return(expr) => {
+                let value = match expr {
+                    Some(e) => self.evaluate_expression(e)?,
+                    None => JsValue::Undefined,
+                };
+                Ok(ControlFlow::Return(value))
+            },
+
+            Stmt::Throw(expr) => {
+                let value = self.evaluate_expression(expr)?;
+                Ok(ControlFlow::Throw(value))
+            },
+
+            Stmt::Try { block, handler, finalizer } => {
+                let result = self.execute_block(block);
+
+                let result = match result {
+                    Err(err) if handler.is_some() => {
+                        let handler = handler.as_ref().unwrap();
+                        let old_scope = self.scope.clone();
+                        self.scope = Rc::new(RefCell::new(Scope::child(old_scope.clone())));
+
+                        if let Some(ref param) = handler.param {
+                            self.bind_pattern(param, err.to_value())?;
+                        }
+
+                        let result = self.execute_block(&handler.body);
+                        self.scope = old_scope;
+                        result
+                    },
+                    Ok(ControlFlow::Throw(value)) if handler.is_some() => {
+                        let handler = handler.as_ref().unwrap();
+                        let old_scope = self.scope.clone();
+                        self.scope = Rc::new(RefCell::new(Scope::child(old_scope.clone())));
+
+                        if let Some(ref param) = handler.param {
+                            self.bind_pattern(param, value)?;
+                        }
+
+                        let result = self.execute_block(&handler.body);
+                        self.scope = old_scope;
+                        result
+                    },
+                    other => other,
+                };
+
+                if let Some(ref fin) = finalizer {
+                    let fin_result = self.execute_block(fin)?;
+                    // Finally block can override return/throw
+                    match fin_result {
+                        ControlFlow::Return(_) | ControlFlow::Throw(_) => {
+                            return Ok(fin_result);
+                        },
+                        _ => {}
+                    }
+                }
+
+                result.map(|cf| cf)
+            },
+
+            Stmt::Block(stmts) => {
+                let old_scope = self.scope.clone();
+                self.scope = Rc::new(RefCell::new(Scope::child(old_scope.clone())));
+
+                let result = self.execute_block(stmts);
+
+                self.scope = old_scope;
+                result
+            },
+
+            Stmt::Expression(expr) => {
+                let value = self.evaluate_expression(expr)?;
+                Ok(ControlFlow::Normal(value))
+            },
+
+            Stmt::Labeled { label, body } => {
+                match self.execute_statement(body)? {
+                    ControlFlow::Break(Some(l)) if l == *label => {
+                        Ok(ControlFlow::Normal(JsValue::Undefined))
+                    },
+                    ControlFlow::Continue(Some(l)) if l == *label => {
+                        Ok(ControlFlow::Continue(None))
+                    },
+                    other => Ok(other),
+                }
+            },
+
+            Stmt::With { object, body } => {
+                // With statement (deprecated but supported)
+                let obj = self.evaluate_expression(object)?;
+                // Simplified: just execute body
+                self.execute_statement(body)
+            },
+
+            Stmt::Debugger => {
+                // No-op in this implementation
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+
+            Stmt::Empty => Ok(ControlFlow::Normal(JsValue::Undefined)),
+
+            Stmt::Import(_) | Stmt::Export(_) => {
+                // Module handling would go here
+                Ok(ControlFlow::Normal(JsValue::Undefined))
+            },
+        }
+    }
+
+    fn execute_block(&mut self, stmts: &[Stmt]) -> Result<ControlFlow, JsError> {
+        let mut result = JsValue::Undefined;
+
+        for stmt in stmts {
+            match self.execute_statement(stmt)? {
+                ControlFlow::Normal(value) => result = value,
+                flow => return Ok(flow),
+            }
+        }
+
+        Ok(ControlFlow::Normal(result))
+    }
+
+    fn bind_for_left(&mut self, left: &ForLeft, value: JsValue) -> Result<(), JsError> {
+        match left {
+            ForLeft::Variable(_, pattern) => self.bind_pattern(pattern, value),
+            ForLeft::Pattern(pattern) => self.bind_pattern(pattern, value),
+        }
+    }
+
+    // --------------------------------------------------------
+    // Expression evaluation
+    // --------------------------------------------------------
+
+    pub fn evaluate_expression(&mut self, expr: &Expr) -> Result<JsValue, JsError> {
+        match expr {
+            Expr::Literal(lit) => Ok(self.evaluate_literal(lit)),
+
+            Expr::Identifier(name) => {
+                self.scope
+                    .borrow()
+                    .get(name)
+                    .or_else(|| self.global.borrow().get(name).into())
+                    .ok_or_else(|| JsError::reference_error(&format!("{} is not defined", name)))
+            },
+
+            Expr::This => Ok(self.scope.borrow().this_binding.clone()),
+
+            Expr::Super => {
+                // Super handling would be more complex in full implementation
+                Ok(JsValue::Undefined)
+            },
+
+            Expr::Array(elements) => {
+                let mut arr = Vec::new();
+                for elem in elements {
+                    if let Expr::Spread(inner) = elem {
+                        let value = self.evaluate_expression(inner)?;
+                        if let JsValue::Array(arr_ref) = value {
+                            arr.extend(arr_ref.borrow().iter().cloned());
+                        }
+                    } else {
+                        arr.push(self.evaluate_expression(elem)?);
+                    }
+                }
+                Ok(JsValue::Array(Rc::new(RefCell::new(arr))))
+            },
+
+            Expr::Object(properties) => {
+                let mut obj = JsObject::new();
+
+                for prop in properties {
+                    if let Expr::Spread(inner) = &prop.value {
+                        let value = self.evaluate_expression(inner)?;
+                        if let JsValue::Object(obj_ref) = value {
+                            for (k, v) in &obj_ref.borrow().properties {
+                                obj.properties.insert(k.clone(), v.clone());
+                            }
+                        }
+                        continue;
+                    }
+
+                    let key = self.evaluate_property_key(&prop.key)?;
+                    let value = self.evaluate_expression(&prop.value)?;
+
+                    match prop.kind {
+                        PropertyKind::Get => {
+                            if let JsValue::Function(func) = value {
+                                let mut desc = PropertyDescriptor::data(JsValue::Undefined);
+                                desc.getter = Some(func);
+                                obj.properties.insert(key, desc);
+                            }
+                        },
+                        PropertyKind::Set => {
+                            if let JsValue::Function(func) = value {
+                                let mut desc = PropertyDescriptor::data(JsValue::Undefined);
+                                desc.setter = Some(func);
+                                obj.properties.insert(key, desc);
+                            }
+                        },
+                        _ => {
+                            obj.set(key, value);
+                        }
+                    }
+                }
+
+                Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+            },
+
+            Expr::Function(func_expr) => {
+                let func = self.create_function(
+                    func_expr.name.clone(),
+                    func_expr.params.clone(),
+                    func_expr.body.clone(),
+                    func_expr.is_async,
+                    func_expr.is_generator,
+                );
+                Ok(JsValue::Function(Rc::new(func)))
+            },
+
+            Expr::ArrowFunction(arrow) => {
+                let body = match &arrow.body {
+                    ArrowBody::Expr(expr) => FunctionBody::ArrowExpr(expr.clone()),
+                    ArrowBody::Block(stmts) => FunctionBody::Statements(stmts.clone()),
+                };
+
+                let func = JsFunction {
+                    name: None,
+                    params: arrow.params.clone(),
+                    body,
+                    scope: self.scope.clone(),
+                    this_mode: ThisMode::Lexical,
+                    is_async: arrow.is_async,
+                    is_generator: false,
+                    prototype: None,
+                };
+
+                Ok(JsValue::Function(Rc::new(func)))
+            },
+
+            Expr::Class(class_expr) => {
+                self.create_class(
+                    class_expr.name.clone(),
+                    class_expr.super_class.as_ref().map(|b| b.as_ref()),
+                    &class_expr.body,
+                )
+            },
+
+            Expr::Unary { operator, operand, prefix } => {
+                self.evaluate_unary(*operator, operand, *prefix)
+            },
+
+            Expr::Binary { left, operator, right } => {
+                self.evaluate_binary(left, *operator, right)
+            },
+
+            Expr::Logical { left, operator, right } => {
+                self.evaluate_logical(left, *operator, right)
+            },
+
+            Expr::Assignment { target, operator, value } => {
+                self.evaluate_assignment(target, *operator, value)
+            },
+
+            Expr::Conditional { test, consequent, alternate } => {
+                let test_value = self.evaluate_expression(test)?;
+                if test_value.is_truthy() {
+                    self.evaluate_expression(consequent)
+                } else {
+                    self.evaluate_expression(alternate)
+                }
+            },
+
+            Expr::Member { object, property, .. } => {
+                let obj = self.evaluate_expression(object)?;
+                self.get_property(&obj, property)
+            },
+
+            Expr::Index { object, index } => {
+                let obj = self.evaluate_expression(object)?;
+                let idx = self.evaluate_expression(index)?;
+                let key = idx.to_string();
+                self.get_property(&obj, &key)
+            },
+
+            Expr::Call { callee, arguments } => {
+                self.evaluate_call(callee, arguments, None)
+            },
+
+            Expr::New { callee, arguments } => {
+                let constructor = self.evaluate_expression(callee)?;
+
+                if let JsValue::Function(func) = constructor {
+                    let args: Vec<JsValue> = arguments
+                        .iter()
+                        .map(|a| self.evaluate_expression(a))
+                        .collect::<Result<_, _>>()?;
+
+                    self.construct(&func, args)
+                } else {
+                    Err(JsError::type_error("not a constructor"))
+                }
+            },
+
+            Expr::Sequence(exprs) => {
+                let mut result = JsValue::Undefined;
+                for expr in exprs {
+                    result = self.evaluate_expression(expr)?;
+                }
+                Ok(result)
+            },
+
+            Expr::Spread(_) => {
+                // Spread is handled in context
+                Err(JsError::syntax_error("unexpected spread"))
+            },
+
+            Expr::Yield(expr, delegate) => {
+                // Generator yield - simplified
+                match expr {
+                    Some(e) => self.evaluate_expression(e),
+                    None => Ok(JsValue::Undefined),
+                }
+            },
+
+            Expr::Await(expr) => {
+                // Await - simplified (synchronous execution)
+                self.evaluate_expression(expr)
+            },
+
+            Expr::TemplateLiteral { quasis, expressions } => {
+                let mut result = String::new();
+
+                for (i, quasi) in quasis.iter().enumerate() {
+                    result.push_str(quasi);
+                    if i < expressions.len() {
+                        let value = self.evaluate_expression(&expressions[i])?;
+                        result.push_str(&value.to_string());
+                    }
+                }
+
+                Ok(JsValue::String(result))
+            },
+        }
+    }
+
+    fn evaluate_literal(&self, lit: &Literal) -> JsValue {
+        match lit {
+            Literal::Number(n) => JsValue::Number(*n),
+            Literal::String(s) => JsValue::String(s.clone()),
+            Literal::Boolean(b) => JsValue::Boolean(*b),
+            Literal::Null => JsValue::Null,
+            Literal::Undefined => JsValue::Undefined,
+            Literal::RegExp(pattern, flags) => {
+                let mut obj = JsObject::new();
+                obj.internal = ObjectInternal::RegExp {
+                    pattern: pattern.clone(),
+                    flags: flags.clone(),
+                };
+                JsValue::Object(Rc::new(RefCell::new(obj)))
+            },
+        }
+    }
+
+    fn evaluate_property_key(&mut self, key: &PropertyKey) -> Result<String, JsError> {
+        match key {
+            PropertyKey::Identifier(name) => Ok(name.clone()),
+            PropertyKey::String(s) => Ok(s.clone()),
+            PropertyKey::Number(n) => Ok(n.to_string()),
+            PropertyKey::Computed(expr) => {
+                let value = self.evaluate_expression(expr)?;
+                Ok(value.to_string())
+            },
+        }
+    }
+
+    fn evaluate_unary(&mut self, op: UnaryOp, operand: &Expr, prefix: bool) -> Result<JsValue, JsError> {
+        match op {
+            UnaryOp::Minus => {
+                let value = self.evaluate_expression(operand)?;
+                Ok(JsValue::Number(-value.to_number()))
+            },
+            UnaryOp::Plus => {
+                let value = self.evaluate_expression(operand)?;
+                Ok(JsValue::Number(value.to_number()))
+            },
+            UnaryOp::Not => {
+                let value = self.evaluate_expression(operand)?;
+                Ok(JsValue::Boolean(!value.is_truthy()))
+            },
+            UnaryOp::BitwiseNot => {
+                let value = self.evaluate_expression(operand)?;
+                Ok(JsValue::Number(!(value.to_number() as i32) as f64))
+            },
+            UnaryOp::Typeof => {
+                let value = self.evaluate_expression(operand)?;
+                Ok(JsValue::String(value.type_of().to_string()))
+            },
+            UnaryOp::Void => {
+                self.evaluate_expression(operand)?;
+                Ok(JsValue::Undefined)
+            },
+            UnaryOp::Delete => {
+                // Simplified delete
+                match operand {
+                    Expr::Member { object, property, .. } => {
+                        let obj = self.evaluate_expression(object)?;
+                        if let JsValue::Object(obj_ref) = obj {
+                            let deleted = obj_ref.borrow_mut().delete(property);
+                            Ok(JsValue::Boolean(deleted))
+                        } else {
+                            Ok(JsValue::Boolean(true))
+                        }
+                    },
+                    _ => Ok(JsValue::Boolean(true)),
+                }
+            },
+            UnaryOp::Increment => {
+                let value = self.evaluate_expression(operand)?;
+                let num = value.to_number();
+                let new_value = JsValue::Number(num + 1.0);
+                self.assign_to_expr(operand, new_value.clone())?;
+                Ok(if prefix { new_value } else { JsValue::Number(num) })
+            },
+            UnaryOp::Decrement => {
+                let value = self.evaluate_expression(operand)?;
+                let num = value.to_number();
+                let new_value = JsValue::Number(num - 1.0);
+                self.assign_to_expr(operand, new_value.clone())?;
+                Ok(if prefix { new_value } else { JsValue::Number(num) })
+            },
+        }
+    }
+
+    fn evaluate_binary(&mut self, left: &Expr, op: BinaryOp, right: &Expr) -> Result<JsValue, JsError> {
+        let lval = self.evaluate_expression(left)?;
+
+        match op {
+            BinaryOp::Add => {
+                let rval = self.evaluate_expression(right)?;
+                // String concatenation or numeric addition
+                match (&lval, &rval) {
+                    (JsValue::String(l), _) => {
+                        Ok(JsValue::String(l.clone() + &rval.to_string()))
+                    },
+                    (_, JsValue::String(r)) => {
+                        Ok(JsValue::String(lval.to_string() + r))
+                    },
+                    _ => Ok(JsValue::Number(lval.to_number() + rval.to_number())),
+                }
+            },
+            BinaryOp::Sub => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(lval.to_number() - rval.to_number()))
+            },
+            BinaryOp::Mul => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(lval.to_number() * rval.to_number()))
+            },
+            BinaryOp::Div => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(lval.to_number() / rval.to_number()))
+            },
+            BinaryOp::Mod => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(lval.to_number() % rval.to_number()))
+            },
+            BinaryOp::Pow => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(lval.to_number().powf(rval.to_number())))
+            },
+            BinaryOp::BitwiseAnd => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number((lval.to_number() as i32 & rval.to_number() as i32) as f64))
+            },
+            BinaryOp::BitwiseOr => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number((lval.to_number() as i32 | rval.to_number() as i32) as f64))
+            },
+            BinaryOp::BitwiseXor => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number((lval.to_number() as i32 ^ rval.to_number() as i32) as f64))
+            },
+            BinaryOp::LeftShift => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(((lval.to_number() as i32) << (rval.to_number() as u32 & 0x1f)) as f64))
+            },
+            BinaryOp::RightShift => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(((lval.to_number() as i32) >> (rval.to_number() as u32 & 0x1f)) as f64))
+            },
+            BinaryOp::UnsignedRightShift => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Number(((lval.to_number() as u32) >> (rval.to_number() as u32 & 0x1f)) as f64))
+            },
+            BinaryOp::Equal => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.loose_equals(&rval)))
+            },
+            BinaryOp::NotEqual => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(!lval.loose_equals(&rval)))
+            },
+            BinaryOp::StrictEqual => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.strict_equals(&rval)))
+            },
+            BinaryOp::StrictNotEqual => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(!lval.strict_equals(&rval)))
+            },
+            BinaryOp::Less => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.to_number() < rval.to_number()))
+            },
+            BinaryOp::LessEqual => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.to_number() <= rval.to_number()))
+            },
+            BinaryOp::Greater => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.to_number() > rval.to_number()))
+            },
+            BinaryOp::GreaterEqual => {
+                let rval = self.evaluate_expression(right)?;
+                Ok(JsValue::Boolean(lval.to_number() >= rval.to_number()))
+            },
+            BinaryOp::Instanceof => {
+                let rval = self.evaluate_expression(right)?;
+                // Simplified instanceof
+                Ok(JsValue::Boolean(false))
+            },
+            BinaryOp::In => {
+                let rval = self.evaluate_expression(right)?;
+                if let JsValue::Object(obj_ref) = rval {
+                    let key = lval.to_string();
+                    Ok(JsValue::Boolean(obj_ref.borrow().has(&key)))
+                } else {
+                    Err(JsError::type_error("in operator requires object"))
+                }
+            },
+        }
+    }
+
+    fn evaluate_logical(&mut self, left: &Expr, op: LogicalOp, right: &Expr) -> Result<JsValue, JsError> {
+        let lval = self.evaluate_expression(left)?;
+
+        match op {
+            LogicalOp::And => {
+                if !lval.is_truthy() {
+                    Ok(lval)
+                } else {
+                    self.evaluate_expression(right)
+                }
+            },
+            LogicalOp::Or => {
+                if lval.is_truthy() {
+                    Ok(lval)
+                } else {
+                    self.evaluate_expression(right)
+                }
+            },
+            LogicalOp::NullishCoalescing => {
+                if !lval.is_nullish() {
+                    Ok(lval)
+                } else {
+                    self.evaluate_expression(right)
+                }
+            },
+        }
+    }
+
+    fn evaluate_assignment(&mut self, target: &Expr, op: AssignOp, value: &Expr) -> Result<JsValue, JsError> {
+        let new_value = if op == AssignOp::Assign {
+            self.evaluate_expression(value)?
+        } else {
+            let old_value = self.evaluate_expression(target)?;
+            let rhs = self.evaluate_expression(value)?;
+
+            match op {
+                AssignOp::AddAssign => {
+                    match (&old_value, &rhs) {
+                        (JsValue::String(l), _) => JsValue::String(l.clone() + &rhs.to_string()),
+                        (_, JsValue::String(r)) => JsValue::String(old_value.to_string() + r),
+                        _ => JsValue::Number(old_value.to_number() + rhs.to_number()),
+                    }
+                },
+                AssignOp::SubAssign => JsValue::Number(old_value.to_number() - rhs.to_number()),
+                AssignOp::MulAssign => JsValue::Number(old_value.to_number() * rhs.to_number()),
+                AssignOp::DivAssign => JsValue::Number(old_value.to_number() / rhs.to_number()),
+                AssignOp::ModAssign => JsValue::Number(old_value.to_number() % rhs.to_number()),
+                _ => unreachable!(),
+            }
+        };
+
+        self.assign_to_expr(target, new_value.clone())?;
+        Ok(new_value)
+    }
+
+    fn assign_to_expr(&mut self, target: &Expr, value: JsValue) -> Result<(), JsError> {
+        match target {
+            Expr::Identifier(name) => {
+                self.scope.borrow_mut().set(name.clone(), value);
+                Ok(())
+            },
+            Expr::Member { object, property, .. } => {
+                let obj = self.evaluate_expression(object)?;
+                self.set_property(&obj, property, value)
+            },
+            Expr::Index { object, index } => {
+                let obj = self.evaluate_expression(object)?;
+                let key = self.evaluate_expression(index)?.to_string();
+                self.set_property(&obj, &key, value)
+            },
+            _ => Err(JsError::reference_error("invalid assignment target")),
+        }
+    }
+
+    fn evaluate_call(&mut self, callee: &Expr, arguments: &[Expr], new_target: Option<Rc<JsFunction>>) -> Result<JsValue, JsError> {
+        // Determine this_arg for method calls
+        let (func, this_arg) = match callee {
+            Expr::Member { object, property, .. } => {
+                let obj = self.evaluate_expression(object)?;
+                let func = self.get_property(&obj, property)?;
+                (func, obj)
+            },
+            Expr::Index { object, index } => {
+                let obj = self.evaluate_expression(object)?;
+                let key = self.evaluate_expression(index)?.to_string();
+                let func = self.get_property(&obj, &key)?;
+                (func, obj)
+            },
+            _ => {
+                let func = self.evaluate_expression(callee)?;
+                (func, self.global.borrow().get("undefined").unwrap_or(JsValue::Undefined))
+            },
+        };
+
+        // Evaluate arguments
+        let mut args = Vec::new();
+        for arg in arguments {
+            if let Expr::Spread(inner) = arg {
+                let value = self.evaluate_expression(inner)?;
+                if let JsValue::Array(arr_ref) = value {
+                    args.extend(arr_ref.borrow().iter().cloned());
+                }
+            } else {
+                args.push(self.evaluate_expression(arg)?);
+            }
+        }
+
+        // Call function
+        if let JsValue::Function(func_ref) = func {
+            self.call_function(&func_ref, this_arg, args)
+        } else {
+            Err(JsError::type_error("not a function"))
+        }
+    }
+
+    // --------------------------------------------------------
+    // Function operations
+    // --------------------------------------------------------
+
+    fn create_function(
+        &self,
+        name: Option<String>,
+        params: Vec<Pattern>,
+        body: Vec<Stmt>,
+        is_async: bool,
+        is_generator: bool,
+    ) -> JsFunction {
+        JsFunction {
+            name,
+            params,
+            body: FunctionBody::Statements(body),
+            scope: self.scope.clone(),
+            this_mode: ThisMode::Global,
+            is_async,
+            is_generator,
+            prototype: Some(Rc::new(RefCell::new(JsObject::new()))),
+        }
+    }
+
+    pub fn call_function(&mut self, func: &Rc<JsFunction>, this_arg: JsValue, args: Vec<JsValue>) -> Result<JsValue, JsError> {
+        // Create new scope
+        let old_scope = self.scope.clone();
+        self.scope = Rc::new(RefCell::new(Scope::child(func.scope.clone())));
+
+        // Set this binding
+        match func.this_mode {
+            ThisMode::Lexical => {
+                // Arrow functions inherit this from enclosing scope
+                self.scope.borrow_mut().this_binding = func.scope.borrow().this_binding.clone();
+            },
+            _ => {
+                self.scope.borrow_mut().this_binding = this_arg;
+            }
+        }
+
+        // Bind parameters
+        for (i, param) in func.params.iter().enumerate() {
+            let value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+            self.bind_pattern(param, value)?;
+        }
+
+        // Execute body
+        let result = match &func.body {
+            FunctionBody::Statements(stmts) => {
+                match self.execute_block(stmts)? {
+                    ControlFlow::Return(value) => value,
+                    ControlFlow::Throw(value) => {
+                        self.scope = old_scope;
+                        return Err(JsError {
+                            name: "Error".to_string(),
+                            message: value.to_string(),
+                            stack: Vec::new(),
+                        });
+                    },
+                    _ => JsValue::Undefined,
+                }
+            },
+            FunctionBody::Native(native_fn) => {
+                let this = self.scope.borrow().this_binding.clone();
+                native_fn(self, this, args)?
+            },
+            FunctionBody::ArrowExpr(expr) => {
+                self.evaluate_expression(expr)?
+            },
+        };
+
+        self.scope = old_scope;
+        Ok(result)
+    }
+
+    fn construct(&mut self, func: &Rc<JsFunction>, args: Vec<JsValue>) -> Result<JsValue, JsError> {
+        // Create new object
+        let prototype = func.prototype.clone().unwrap_or_else(|| Rc::new(RefCell::new(JsObject::new())));
+        let new_obj = Rc::new(RefCell::new(JsObject::with_prototype(prototype)));
+        let this = JsValue::Object(new_obj.clone());
+
+        // Call constructor
+        let result = self.call_function(func, this.clone(), args)?;
+
+        // Return result if it's an object, otherwise return new object
+        match result {
+            JsValue::Object(_) => Ok(result),
+            _ => Ok(this),
+        }
+    }
+
+    fn create_class(
+        &mut self,
+        name: Option<String>,
+        super_class: Option<&Expr>,
+        body: &[ClassMember],
+    ) -> Result<JsValue, JsError> {
+        let super_proto = if let Some(super_expr) = super_class {
+            let super_val = self.evaluate_expression(super_expr)?;
+            if let JsValue::Function(f) = super_val {
+                f.prototype.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Create prototype object
+        let prototype = if let Some(sp) = super_proto {
+            Rc::new(RefCell::new(JsObject::with_prototype(sp)))
+        } else {
+            Rc::new(RefCell::new(JsObject::new()))
+        };
+
+        // Find constructor
+        let constructor_member = body.iter().find(|m| m.kind == ClassMemberKind::Constructor);
+
+        let constructor = if let Some(cm) = constructor_member {
+            if let Some(Expr::Function(fe)) = &cm.value {
+                self.create_function(
+                    name.clone(),
+                    fe.params.clone(),
+                    fe.body.clone(),
+                    fe.is_async,
+                    fe.is_generator,
+                )
+            } else {
+                JsFunction {
+                    name: name.clone(),
+                    params: vec![],
+                    body: FunctionBody::Statements(vec![]),
+                    scope: self.scope.clone(),
+                    this_mode: ThisMode::Global,
+                    is_async: false,
+                    is_generator: false,
+                    prototype: Some(prototype.clone()),
+                }
+            }
+        } else {
+            JsFunction {
+                name: name.clone(),
+                params: vec![],
+                body: FunctionBody::Statements(vec![]),
+                scope: self.scope.clone(),
+                this_mode: ThisMode::Global,
+                is_async: false,
+                is_generator: false,
+                prototype: Some(prototype.clone()),
+            }
+        };
+
+        let class_func = Rc::new(JsFunction {
+            prototype: Some(prototype.clone()),
+            ..constructor
+        });
+
+        // Add methods to prototype
+        for member in body {
+            if member.kind == ClassMemberKind::Constructor {
+                continue;
+            }
+
+            let key = match &member.key {
+                PropertyKey::Identifier(s) => s.clone(),
+                PropertyKey::String(s) => s.clone(),
+                PropertyKey::Number(n) => n.to_string(),
+                PropertyKey::Computed(_) => continue, // Simplified
+            };
+
+            if let Some(value_expr) = &member.value {
+                let value = self.evaluate_expression(value_expr)?;
+
+                if member.is_static {
+                    // Would add to class function object
+                } else {
+                    prototype.borrow_mut().set(key, value);
+                }
+            }
+        }
+
+        Ok(JsValue::Function(class_func))
+    }
+
+    // --------------------------------------------------------
+    // Property access
+    // --------------------------------------------------------
+
+    fn get_property(&self, obj: &JsValue, key: &str) -> Result<JsValue, JsError> {
+        match obj {
+            JsValue::Object(obj_ref) => {
+                Ok(obj_ref.borrow().get(key))
+            },
+            JsValue::Array(arr_ref) => {
+                if key == "length" {
+                    return Ok(JsValue::Number(arr_ref.borrow().len() as f64));
+                }
+                if let Ok(index) = key.parse::<usize>() {
+                    return Ok(arr_ref.borrow().get(index).cloned().unwrap_or(JsValue::Undefined));
+                }
+                Ok(JsValue::Undefined)
+            },
+            JsValue::String(s) => {
+                if key == "length" {
+                    return Ok(JsValue::Number(s.len() as f64));
+                }
+                if let Ok(index) = key.parse::<usize>() {
+                    return Ok(s.chars().nth(index)
+                        .map(|c| JsValue::String(c.to_string()))
+                        .unwrap_or(JsValue::Undefined));
+                }
+                Ok(JsValue::Undefined)
+            },
+            _ => Ok(JsValue::Undefined),
+        }
+    }
+
+    fn set_property(&self, obj: &JsValue, key: &str, value: JsValue) -> Result<(), JsError> {
+        match obj {
+            JsValue::Object(obj_ref) => {
+                obj_ref.borrow_mut().set(key.to_string(), value);
+                Ok(())
+            },
+            JsValue::Array(arr_ref) => {
+                if let Ok(index) = key.parse::<usize>() {
+                    let mut arr = arr_ref.borrow_mut();
+                    if index >= arr.len() {
+                        arr.resize(index + 1, JsValue::Undefined);
+                    }
+                    arr[index] = value;
+                }
+                Ok(())
+            },
+            _ => Err(JsError::type_error("cannot set property of non-object")),
+        }
+    }
+
+    // --------------------------------------------------------
+    // Pattern binding
+    // --------------------------------------------------------
+
+    fn bind_pattern(&mut self, pattern: &Pattern, value: JsValue) -> Result<(), JsError> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                self.scope.borrow_mut().declare(name.clone(), value);
+                Ok(())
+            },
+            Pattern::Array(elements) => {
+                let arr = match value {
+                    JsValue::Array(arr_ref) => arr_ref.borrow().clone(),
+                    _ => vec![value],
+                };
+
+                for (i, elem) in elements.iter().enumerate() {
+                    if let Some(elem) = elem {
+                        if let Pattern::Rest(rest_pattern) = &elem.pattern {
+                            let rest: Vec<JsValue> = arr.iter().skip(i).cloned().collect();
+                            self.bind_pattern(rest_pattern, JsValue::Array(Rc::new(RefCell::new(rest))))?;
+                            break;
+                        }
+
+                        let val = arr.get(i).cloned().unwrap_or(JsValue::Undefined);
+                        let val = if val == JsValue::Undefined {
+                            elem.default_value.as_ref()
+                                .map(|e| self.evaluate_expression(e))
+                                .transpose()?
+                                .unwrap_or(JsValue::Undefined)
+                        } else {
+                            val
+                        };
+                        self.bind_pattern(&elem.pattern, val)?;
+                    }
+                }
+                Ok(())
+            },
+            Pattern::Object(properties) => {
+                let obj = match &value {
+                    JsValue::Object(obj_ref) => obj_ref.clone(),
+                    _ => return Err(JsError::type_error("cannot destructure non-object")),
+                };
+
+                for prop in properties {
+                    if let Pattern::Rest(rest_pattern) = &prop.value {
+                        // Collect remaining properties
+                        let mut rest_obj = JsObject::new();
+                        let bound_keys: Vec<_> = properties.iter()
+                            .filter_map(|p| if matches!(p.value, Pattern::Rest(_)) { None } else { Some(p.key.clone()) })
+                            .collect();
+
+                        for (key, desc) in &obj.borrow().properties {
+                            if !bound_keys.contains(key) {
+                                rest_obj.properties.insert(key.clone(), desc.clone());
+                            }
+                        }
+
+                        self.bind_pattern(rest_pattern, JsValue::Object(Rc::new(RefCell::new(rest_obj))))?;
+                        continue;
+                    }
+
+                    let val = obj.borrow().get(&prop.key);
+                    self.bind_pattern(&prop.value, val)?;
+                }
+                Ok(())
+            },
+            Pattern::Assignment { pattern, default } => {
+                let val = if value == JsValue::Undefined {
+                    self.evaluate_expression(default)?
+                } else {
+                    value
+                };
+                self.bind_pattern(pattern, val)
+            },
+            Pattern::Rest(inner) => {
+                self.bind_pattern(inner, value)
+            },
+        }
+    }
+
+    // --------------------------------------------------------
+    // Utilities
+    // --------------------------------------------------------
+
+    pub fn create_native_function(
+        &self,
+        name: &str,
+        func: fn(&mut Interpreter, JsValue, Vec<JsValue>) -> Result<JsValue, JsError>,
+    ) -> JsValue {
+        let js_func = JsFunction {
+            name: Some(name.to_string()),
+            params: vec![],
+            body: FunctionBody::Native(func),
+            scope: self.scope.clone(),
+            this_mode: ThisMode::Global,
+            is_async: false,
+            is_generator: false,
+            prototype: None,
+        };
+        JsValue::Function(Rc::new(js_func))
+    }
+
+    pub fn define_global(&mut self, name: &str, value: JsValue) {
+        self.global.borrow_mut().set(name.to_string(), value.clone());
+        self.scope.borrow_mut().declare(name.to_string(), value);
+    }
+
+    pub fn new_symbol(&mut self) -> JsValue {
+        self.symbol_counter += 1;
+        JsValue::Symbol(self.symbol_counter)
+    }
+}
+
+// ============================================================
+// Equality implementation
+// ============================================================
+
+impl PartialEq for JsValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.strict_equals(other)
+    }
+}

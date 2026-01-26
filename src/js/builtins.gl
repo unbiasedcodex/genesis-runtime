@@ -1,0 +1,1566 @@
+// JavaScript Built-in Objects
+// Standard ECMAScript built-ins
+
+use super::interpreter::{
+    Interpreter, JsValue, JsObject, JsFunction, JsError, PropertyDescriptor,
+    ObjectInternal, Scope, FunctionBody, ThisMode,
+};
+use super::parser::Pattern;
+
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// ============================================================
+// Built-in Registration
+// ============================================================
+
+pub fn register_builtins(interp: &mut Interpreter) {
+    // Global values
+    interp.define_global("undefined", JsValue::Undefined);
+    interp.define_global("NaN", JsValue::Number(f64::NAN));
+    interp.define_global("Infinity", JsValue::Number(f64::INFINITY));
+
+    // Global functions
+    register_global_functions(interp);
+
+    // Object constructor
+    register_object(interp);
+
+    // Array constructor
+    register_array(interp);
+
+    // String constructor
+    register_string(interp);
+
+    // Number constructor
+    register_number(interp);
+
+    // Boolean constructor
+    register_boolean(interp);
+
+    // Function constructor
+    register_function(interp);
+
+    // Math object
+    register_math(interp);
+
+    // JSON object
+    register_json(interp);
+
+    // console object
+    register_console(interp);
+
+    // Date constructor
+    register_date(interp);
+
+    // Error constructors
+    register_errors(interp);
+
+    // Promise constructor
+    register_promise(interp);
+
+    // Map and Set
+    register_map_set(interp);
+}
+
+// ============================================================
+// Global Functions
+// ============================================================
+
+fn register_global_functions(interp: &mut Interpreter) {
+    // parseInt
+    let parse_int = interp.create_native_function("parseInt", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let radix = args.get(1).map(|v| v.to_number() as i32).unwrap_or(10);
+
+        let s = s.trim();
+        let (s, radix) = if s.starts_with("0x") || s.starts_with("0X") {
+            (&s[2..], 16)
+        } else {
+            (s, radix)
+        };
+
+        match i64::from_str_radix(s, radix as u32) {
+            Ok(n) => Ok(JsValue::Number(n as f64)),
+            Err(_) => Ok(JsValue::Number(f64::NAN)),
+        }
+    });
+    interp.define_global("parseInt", parse_int);
+
+    // parseFloat
+    let parse_float = interp.create_native_function("parseFloat", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        match s.trim().parse::<f64>() {
+            Ok(n) => Ok(JsValue::Number(n)),
+            Err(_) => Ok(JsValue::Number(f64::NAN)),
+        }
+    });
+    interp.define_global("parseFloat", parse_float);
+
+    // isNaN
+    let is_nan = interp.create_native_function("isNaN", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Boolean(n.is_nan()))
+    });
+    interp.define_global("isNaN", is_nan);
+
+    // isFinite
+    let is_finite = interp.create_native_function("isFinite", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Boolean(n.is_finite()))
+    });
+    interp.define_global("isFinite", is_finite);
+
+    // encodeURI
+    let encode_uri = interp.create_native_function("encodeURI", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        // Simplified encoding
+        Ok(JsValue::String(s.replace(' ', "%20")))
+    });
+    interp.define_global("encodeURI", encode_uri);
+
+    // decodeURI
+    let decode_uri = interp.create_native_function("decodeURI", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        Ok(JsValue::String(s.replace("%20", " ")))
+    });
+    interp.define_global("decodeURI", decode_uri);
+
+    // encodeURIComponent
+    let encode_uri_component = interp.create_native_function("encodeURIComponent", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut result = String::new();
+        for c in s.chars() {
+            if c.is_alphanumeric() || "-_.!~*'()".contains(c) {
+                result.push(c);
+            } else {
+                for byte in c.to_string().as_bytes() {
+                    result.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+        Ok(JsValue::String(result))
+    });
+    interp.define_global("encodeURIComponent", encode_uri_component);
+
+    // decodeURIComponent
+    let decode_uri_component = interp.create_native_function("decodeURIComponent", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hex: String = chars.by_ref().take(2).collect();
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        Ok(JsValue::String(result))
+    });
+    interp.define_global("decodeURIComponent", decode_uri_component);
+
+    // eval (stub - full eval requires parser)
+    let eval_fn = interp.create_native_function("eval", |_interp, _this, args| {
+        let code = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        // Would need to parse and execute code
+        Ok(JsValue::Undefined)
+    });
+    interp.define_global("eval", eval_fn);
+}
+
+// ============================================================
+// Object Constructor
+// ============================================================
+
+fn register_object(interp: &mut Interpreter) {
+    let mut obj_constructor = JsObject::new();
+
+    // Object.keys
+    obj_constructor.set("keys".to_string(), interp.create_native_function("keys", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = obj {
+            let keys: Vec<JsValue> = obj_ref.borrow().keys()
+                .into_iter()
+                .map(JsValue::String)
+                .collect();
+            Ok(JsValue::Array(Rc::new(RefCell::new(keys))))
+        } else {
+            Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+        }
+    }));
+
+    // Object.values
+    obj_constructor.set("values".to_string(), interp.create_native_function("values", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = obj {
+            let values: Vec<JsValue> = obj_ref.borrow().properties
+                .values()
+                .filter(|p| p.enumerable)
+                .map(|p| p.value.clone())
+                .collect();
+            Ok(JsValue::Array(Rc::new(RefCell::new(values))))
+        } else {
+            Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+        }
+    }));
+
+    // Object.entries
+    obj_constructor.set("entries".to_string(), interp.create_native_function("entries", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = obj {
+            let entries: Vec<JsValue> = obj_ref.borrow().properties
+                .iter()
+                .filter(|(_, p)| p.enumerable)
+                .map(|(k, p)| {
+                    JsValue::Array(Rc::new(RefCell::new(vec![
+                        JsValue::String(k.clone()),
+                        p.value.clone(),
+                    ])))
+                })
+                .collect();
+            Ok(JsValue::Array(Rc::new(RefCell::new(entries))))
+        } else {
+            Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+        }
+    }));
+
+    // Object.assign
+    obj_constructor.set("assign".to_string(), interp.create_native_function("assign", |_interp, _this, args| {
+        let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(target_ref) = &target {
+            for source in args.iter().skip(1) {
+                if let JsValue::Object(source_ref) = source {
+                    for (key, prop) in &source_ref.borrow().properties {
+                        if prop.enumerable {
+                            target_ref.borrow_mut().set(key.clone(), prop.value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(target)
+    }));
+
+    // Object.create
+    obj_constructor.set("create".to_string(), interp.create_native_function("create", |_interp, _this, args| {
+        let proto = args.get(0).cloned().unwrap_or(JsValue::Null);
+        let new_obj = match proto {
+            JsValue::Object(proto_ref) => JsObject::with_prototype(proto_ref),
+            JsValue::Null => JsObject::new(),
+            _ => return Err(JsError::type_error("Object prototype may only be an Object or null")),
+        };
+        Ok(JsValue::Object(Rc::new(RefCell::new(new_obj))))
+    }));
+
+    // Object.freeze
+    obj_constructor.set("freeze".to_string(), interp.create_native_function("freeze", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = &obj {
+            let mut obj_mut = obj_ref.borrow_mut();
+            obj_mut.extensible = false;
+            for prop in obj_mut.properties.values_mut() {
+                prop.writable = false;
+                prop.configurable = false;
+            }
+        }
+        Ok(obj)
+    }));
+
+    // Object.isFrozen
+    obj_constructor.set("isFrozen".to_string(), interp.create_native_function("isFrozen", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = obj {
+            let obj = obj_ref.borrow();
+            let frozen = !obj.extensible && obj.properties.values().all(|p| !p.writable && !p.configurable);
+            Ok(JsValue::Boolean(frozen))
+        } else {
+            Ok(JsValue::Boolean(true))
+        }
+    }));
+
+    // Object.seal
+    obj_constructor.set("seal".to_string(), interp.create_native_function("seal", |_interp, _this, args| {
+        let obj = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(obj_ref) = &obj {
+            let mut obj_mut = obj_ref.borrow_mut();
+            obj_mut.extensible = false;
+            for prop in obj_mut.properties.values_mut() {
+                prop.configurable = false;
+            }
+        }
+        Ok(obj)
+    }));
+
+    // Object.fromEntries
+    obj_constructor.set("fromEntries".to_string(), interp.create_native_function("fromEntries", |_interp, _this, args| {
+        let iterable = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let mut new_obj = JsObject::new();
+
+        if let JsValue::Array(arr_ref) = iterable {
+            for entry in arr_ref.borrow().iter() {
+                if let JsValue::Array(entry_ref) = entry {
+                    let entry = entry_ref.borrow();
+                    if entry.len() >= 2 {
+                        let key = entry[0].to_string();
+                        let value = entry[1].clone();
+                        new_obj.set(key, value);
+                    }
+                }
+            }
+        }
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(new_obj))))
+    }));
+
+    interp.define_global("Object", JsValue::Object(Rc::new(RefCell::new(obj_constructor))));
+}
+
+// ============================================================
+// Array Constructor
+// ============================================================
+
+fn register_array(interp: &mut Interpreter) {
+    let mut arr_constructor = JsObject::new();
+
+    // Array.isArray
+    arr_constructor.set("isArray".to_string(), interp.create_native_function("isArray", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        Ok(JsValue::Boolean(matches!(value, JsValue::Array(_))))
+    }));
+
+    // Array.from
+    arr_constructor.set("from".to_string(), interp.create_native_function("from", |interp, _this, args| {
+        let iterable = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let map_fn = args.get(1).cloned();
+
+        let mut result = Vec::new();
+
+        match iterable {
+            JsValue::Array(arr_ref) => {
+                for (i, value) in arr_ref.borrow().iter().enumerate() {
+                    let mapped = if let Some(JsValue::Function(ref f)) = map_fn {
+                        interp.call_function(f, JsValue::Undefined, vec![value.clone(), JsValue::Number(i as f64)])?
+                    } else {
+                        value.clone()
+                    };
+                    result.push(mapped);
+                }
+            },
+            JsValue::String(s) => {
+                for (i, c) in s.chars().enumerate() {
+                    let value = JsValue::String(c.to_string());
+                    let mapped = if let Some(JsValue::Function(ref f)) = map_fn {
+                        interp.call_function(f, JsValue::Undefined, vec![value, JsValue::Number(i as f64)])?
+                    } else {
+                        value
+                    };
+                    result.push(mapped);
+                }
+            },
+            _ => {}
+        }
+
+        Ok(JsValue::Array(Rc::new(RefCell::new(result))))
+    }));
+
+    // Array.of
+    arr_constructor.set("of".to_string(), interp.create_native_function("of", |_interp, _this, args| {
+        Ok(JsValue::Array(Rc::new(RefCell::new(args))))
+    }));
+
+    interp.define_global("Array", JsValue::Object(Rc::new(RefCell::new(arr_constructor))));
+
+    // Array prototype methods (would be on Array.prototype)
+    // For simplicity, we'll define them directly on arrays when created
+}
+
+// ============================================================
+// String Constructor
+// ============================================================
+
+fn register_string(interp: &mut Interpreter) {
+    let mut str_constructor = JsObject::new();
+
+    // String.fromCharCode
+    str_constructor.set("fromCharCode".to_string(), interp.create_native_function("fromCharCode", |_interp, _this, args| {
+        let s: String = args.iter()
+            .map(|v| char::from_u32(v.to_number() as u32).unwrap_or('\0'))
+            .collect();
+        Ok(JsValue::String(s))
+    }));
+
+    // String.fromCodePoint
+    str_constructor.set("fromCodePoint".to_string(), interp.create_native_function("fromCodePoint", |_interp, _this, args| {
+        let mut s = String::new();
+        for arg in args {
+            if let Some(c) = char::from_u32(arg.to_number() as u32) {
+                s.push(c);
+            }
+        }
+        Ok(JsValue::String(s))
+    }));
+
+    interp.define_global("String", JsValue::Object(Rc::new(RefCell::new(str_constructor))));
+}
+
+// ============================================================
+// Number Constructor
+// ============================================================
+
+fn register_number(interp: &mut Interpreter) {
+    let mut num_constructor = JsObject::new();
+
+    num_constructor.set("MAX_VALUE".to_string(), JsValue::Number(f64::MAX));
+    num_constructor.set("MIN_VALUE".to_string(), JsValue::Number(f64::MIN_POSITIVE));
+    num_constructor.set("NaN".to_string(), JsValue::Number(f64::NAN));
+    num_constructor.set("POSITIVE_INFINITY".to_string(), JsValue::Number(f64::INFINITY));
+    num_constructor.set("NEGATIVE_INFINITY".to_string(), JsValue::Number(f64::NEG_INFINITY));
+    num_constructor.set("MAX_SAFE_INTEGER".to_string(), JsValue::Number(9007199254740991.0));
+    num_constructor.set("MIN_SAFE_INTEGER".to_string(), JsValue::Number(-9007199254740991.0));
+    num_constructor.set("EPSILON".to_string(), JsValue::Number(f64::EPSILON));
+
+    // Number.isInteger
+    num_constructor.set("isInteger".to_string(), interp.create_native_function("isInteger", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Number(n) = value {
+            Ok(JsValue::Boolean(n.is_finite() && n.trunc() == n))
+        } else {
+            Ok(JsValue::Boolean(false))
+        }
+    }));
+
+    // Number.isFinite
+    num_constructor.set("isFinite".to_string(), interp.create_native_function("isFinite", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Number(n) = value {
+            Ok(JsValue::Boolean(n.is_finite()))
+        } else {
+            Ok(JsValue::Boolean(false))
+        }
+    }));
+
+    // Number.isNaN
+    num_constructor.set("isNaN".to_string(), interp.create_native_function("isNaN", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Number(n) = value {
+            Ok(JsValue::Boolean(n.is_nan()))
+        } else {
+            Ok(JsValue::Boolean(false))
+        }
+    }));
+
+    // Number.isSafeInteger
+    num_constructor.set("isSafeInteger".to_string(), interp.create_native_function("isSafeInteger", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Number(n) = value {
+            Ok(JsValue::Boolean(
+                n.is_finite() &&
+                n.trunc() == n &&
+                n.abs() <= 9007199254740991.0
+            ))
+        } else {
+            Ok(JsValue::Boolean(false))
+        }
+    }));
+
+    // Number.parseFloat
+    num_constructor.set("parseFloat".to_string(), interp.create_native_function("parseFloat", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        match s.trim().parse::<f64>() {
+            Ok(n) => Ok(JsValue::Number(n)),
+            Err(_) => Ok(JsValue::Number(f64::NAN)),
+        }
+    }));
+
+    // Number.parseInt
+    num_constructor.set("parseInt".to_string(), interp.create_native_function("parseInt", |_interp, _this, args| {
+        let s = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let radix = args.get(1).map(|v| v.to_number() as i32).unwrap_or(10);
+        match i64::from_str_radix(s.trim(), radix as u32) {
+            Ok(n) => Ok(JsValue::Number(n as f64)),
+            Err(_) => Ok(JsValue::Number(f64::NAN)),
+        }
+    }));
+
+    interp.define_global("Number", JsValue::Object(Rc::new(RefCell::new(num_constructor))));
+}
+
+// ============================================================
+// Boolean Constructor
+// ============================================================
+
+fn register_boolean(interp: &mut Interpreter) {
+    let bool_constructor = JsObject::new();
+    interp.define_global("Boolean", JsValue::Object(Rc::new(RefCell::new(bool_constructor))));
+}
+
+// ============================================================
+// Function Constructor
+// ============================================================
+
+fn register_function(interp: &mut Interpreter) {
+    let func_constructor = JsObject::new();
+    interp.define_global("Function", JsValue::Object(Rc::new(RefCell::new(func_constructor))));
+}
+
+// ============================================================
+// Math Object
+// ============================================================
+
+fn register_math(interp: &mut Interpreter) {
+    let mut math_obj = JsObject::new();
+
+    // Constants
+    math_obj.set("E".to_string(), JsValue::Number(std::f64::consts::E));
+    math_obj.set("LN2".to_string(), JsValue::Number(std::f64::consts::LN_2));
+    math_obj.set("LN10".to_string(), JsValue::Number(std::f64::consts::LN_10));
+    math_obj.set("LOG2E".to_string(), JsValue::Number(std::f64::consts::LOG2_E));
+    math_obj.set("LOG10E".to_string(), JsValue::Number(std::f64::consts::LOG10_E));
+    math_obj.set("PI".to_string(), JsValue::Number(std::f64::consts::PI));
+    math_obj.set("SQRT1_2".to_string(), JsValue::Number(std::f64::consts::FRAC_1_SQRT_2));
+    math_obj.set("SQRT2".to_string(), JsValue::Number(std::f64::consts::SQRT_2));
+
+    // Methods
+    math_obj.set("abs".to_string(), interp.create_native_function("abs", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.abs()))
+    }));
+
+    math_obj.set("acos".to_string(), interp.create_native_function("acos", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.acos()))
+    }));
+
+    math_obj.set("asin".to_string(), interp.create_native_function("asin", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.asin()))
+    }));
+
+    math_obj.set("atan".to_string(), interp.create_native_function("atan", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.atan()))
+    }));
+
+    math_obj.set("atan2".to_string(), interp.create_native_function("atan2", |_interp, _this, args| {
+        let y = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        let x = args.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(y.atan2(x)))
+    }));
+
+    math_obj.set("ceil".to_string(), interp.create_native_function("ceil", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.ceil()))
+    }));
+
+    math_obj.set("cos".to_string(), interp.create_native_function("cos", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.cos()))
+    }));
+
+    math_obj.set("exp".to_string(), interp.create_native_function("exp", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.exp()))
+    }));
+
+    math_obj.set("floor".to_string(), interp.create_native_function("floor", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.floor()))
+    }));
+
+    math_obj.set("log".to_string(), interp.create_native_function("log", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.ln()))
+    }));
+
+    math_obj.set("log10".to_string(), interp.create_native_function("log10", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.log10()))
+    }));
+
+    math_obj.set("log2".to_string(), interp.create_native_function("log2", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.log2()))
+    }));
+
+    math_obj.set("max".to_string(), interp.create_native_function("max", |_interp, _this, args| {
+        if args.is_empty() {
+            return Ok(JsValue::Number(f64::NEG_INFINITY));
+        }
+        let mut max = f64::NEG_INFINITY;
+        for arg in args {
+            let n = arg.to_number();
+            if n.is_nan() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if n > max {
+                max = n;
+            }
+        }
+        Ok(JsValue::Number(max))
+    }));
+
+    math_obj.set("min".to_string(), interp.create_native_function("min", |_interp, _this, args| {
+        if args.is_empty() {
+            return Ok(JsValue::Number(f64::INFINITY));
+        }
+        let mut min = f64::INFINITY;
+        for arg in args {
+            let n = arg.to_number();
+            if n.is_nan() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            if n < min {
+                min = n;
+            }
+        }
+        Ok(JsValue::Number(min))
+    }));
+
+    math_obj.set("pow".to_string(), interp.create_native_function("pow", |_interp, _this, args| {
+        let base = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        let exp = args.get(1).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(base.powf(exp)))
+    }));
+
+    math_obj.set("random".to_string(), interp.create_native_function("random", |_interp, _this, _args| {
+        // Simple PRNG - in production would use proper random source
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345);
+        let random = ((seed * 1103515245 + 12345) % (1 << 31)) as f64 / (1u64 << 31) as f64;
+        Ok(JsValue::Number(random))
+    }));
+
+    math_obj.set("round".to_string(), interp.create_native_function("round", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.round()))
+    }));
+
+    math_obj.set("sign".to_string(), interp.create_native_function("sign", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(if n > 0.0 { 1.0 } else if n < 0.0 { -1.0 } else { 0.0 }))
+    }));
+
+    math_obj.set("sin".to_string(), interp.create_native_function("sin", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.sin()))
+    }));
+
+    math_obj.set("sqrt".to_string(), interp.create_native_function("sqrt", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.sqrt()))
+    }));
+
+    math_obj.set("tan".to_string(), interp.create_native_function("tan", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.tan()))
+    }));
+
+    math_obj.set("trunc".to_string(), interp.create_native_function("trunc", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.trunc()))
+    }));
+
+    math_obj.set("hypot".to_string(), interp.create_native_function("hypot", |_interp, _this, args| {
+        let sum: f64 = args.iter().map(|v| v.to_number().powi(2)).sum();
+        Ok(JsValue::Number(sum.sqrt()))
+    }));
+
+    math_obj.set("cbrt".to_string(), interp.create_native_function("cbrt", |_interp, _this, args| {
+        let n = args.get(0).map(|v| v.to_number()).unwrap_or(f64::NAN);
+        Ok(JsValue::Number(n.cbrt()))
+    }));
+
+    interp.define_global("Math", JsValue::Object(Rc::new(RefCell::new(math_obj))));
+}
+
+// ============================================================
+// JSON Object
+// ============================================================
+
+fn register_json(interp: &mut Interpreter) {
+    let mut json_obj = JsObject::new();
+
+    // JSON.parse
+    json_obj.set("parse".to_string(), interp.create_native_function("parse", |interp, _this, args| {
+        let text = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        parse_json(&text)
+    }));
+
+    // JSON.stringify
+    json_obj.set("stringify".to_string(), interp.create_native_function("stringify", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let indent = args.get(2).map(|v| v.to_number() as usize).unwrap_or(0);
+        Ok(JsValue::String(stringify_json(&value, indent, 0)))
+    }));
+
+    interp.define_global("JSON", JsValue::Object(Rc::new(RefCell::new(json_obj))));
+}
+
+fn parse_json(text: &str) -> Result<JsValue, JsError> {
+    let mut chars = text.trim().chars().peekable();
+
+    fn parse_value(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsValue, JsError> {
+        skip_whitespace(chars);
+
+        match chars.peek() {
+            Some('"') => parse_string(chars),
+            Some('{') => parse_object(chars),
+            Some('[') => parse_array(chars),
+            Some('t') => {
+                expect_literal(chars, "true")?;
+                Ok(JsValue::Boolean(true))
+            },
+            Some('f') => {
+                expect_literal(chars, "false")?;
+                Ok(JsValue::Boolean(false))
+            },
+            Some('n') => {
+                expect_literal(chars, "null")?;
+                Ok(JsValue::Null)
+            },
+            Some(c) if c.is_ascii_digit() || *c == '-' => parse_number(chars),
+            _ => Err(JsError::syntax_error("Unexpected token in JSON")),
+        }
+    }
+
+    fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
+        while chars.peek().map_or(false, |c| c.is_whitespace()) {
+            chars.next();
+        }
+    }
+
+    fn expect_literal(chars: &mut std::iter::Peekable<std::str::Chars>, s: &str) -> Result<(), JsError> {
+        for expected in s.chars() {
+            match chars.next() {
+                Some(c) if c == expected => continue,
+                _ => return Err(JsError::syntax_error("Unexpected token")),
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsValue, JsError> {
+        chars.next(); // Opening quote
+        let mut s = String::new();
+
+        loop {
+            match chars.next() {
+                Some('"') => break,
+                Some('\\') => {
+                    match chars.next() {
+                        Some('n') => s.push('\n'),
+                        Some('r') => s.push('\r'),
+                        Some('t') => s.push('\t'),
+                        Some('\\') => s.push('\\'),
+                        Some('"') => s.push('"'),
+                        Some('u') => {
+                            let hex: String = chars.take(4).collect();
+                            if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                                if let Some(c) = char::from_u32(code) {
+                                    s.push(c);
+                                }
+                            }
+                        },
+                        Some(c) => s.push(c),
+                        None => return Err(JsError::syntax_error("Unterminated string")),
+                    }
+                },
+                Some(c) => s.push(c),
+                None => return Err(JsError::syntax_error("Unterminated string")),
+            }
+        }
+
+        Ok(JsValue::String(s))
+    }
+
+    fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsValue, JsError> {
+        let mut s = String::new();
+
+        while chars.peek().map_or(false, |c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+' || *c == 'e' || *c == 'E') {
+            s.push(chars.next().unwrap());
+        }
+
+        s.parse::<f64>()
+            .map(JsValue::Number)
+            .map_err(|_| JsError::syntax_error("Invalid number"))
+    }
+
+    fn parse_array(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsValue, JsError> {
+        chars.next(); // [
+        let mut arr = Vec::new();
+
+        skip_whitespace(chars);
+
+        if chars.peek() == Some(&']') {
+            chars.next();
+            return Ok(JsValue::Array(Rc::new(RefCell::new(arr))));
+        }
+
+        loop {
+            arr.push(parse_value(chars)?);
+            skip_whitespace(chars);
+
+            match chars.peek() {
+                Some(',') => { chars.next(); },
+                Some(']') => { chars.next(); break; },
+                _ => return Err(JsError::syntax_error("Expected ',' or ']'")),
+            }
+        }
+
+        Ok(JsValue::Array(Rc::new(RefCell::new(arr))))
+    }
+
+    fn parse_object(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsValue, JsError> {
+        chars.next(); // {
+        let mut obj = JsObject::new();
+
+        skip_whitespace(chars);
+
+        if chars.peek() == Some(&'}') {
+            chars.next();
+            return Ok(JsValue::Object(Rc::new(RefCell::new(obj))));
+        }
+
+        loop {
+            skip_whitespace(chars);
+
+            let key = if let JsValue::String(k) = parse_string(chars)? {
+                k
+            } else {
+                return Err(JsError::syntax_error("Expected string key"));
+            };
+
+            skip_whitespace(chars);
+
+            if chars.next() != Some(':') {
+                return Err(JsError::syntax_error("Expected ':'"));
+            }
+
+            let value = parse_value(chars)?;
+            obj.set(key, value);
+
+            skip_whitespace(chars);
+
+            match chars.peek() {
+                Some(',') => { chars.next(); },
+                Some('}') => { chars.next(); break; },
+                _ => return Err(JsError::syntax_error("Expected ',' or '}'")),
+            }
+        }
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    }
+
+    parse_value(&mut chars)
+}
+
+fn stringify_json(value: &JsValue, indent: usize, depth: usize) -> String {
+    let prefix = if indent > 0 { " ".repeat(indent * depth) } else { String::new() };
+    let inner_prefix = if indent > 0 { " ".repeat(indent * (depth + 1)) } else { String::new() };
+    let newline = if indent > 0 { "\n" } else { "" };
+
+    match value {
+        JsValue::Undefined => "undefined".to_string(),
+        JsValue::Null => "null".to_string(),
+        JsValue::Boolean(b) => b.to_string(),
+        JsValue::Number(n) => {
+            if n.is_nan() || n.is_infinite() {
+                "null".to_string()
+            } else {
+                n.to_string()
+            }
+        },
+        JsValue::String(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{}\"", escaped)
+        },
+        JsValue::Array(arr_ref) => {
+            let arr = arr_ref.borrow();
+            if arr.is_empty() {
+                "[]".to_string()
+            } else {
+                let items: Vec<String> = arr.iter()
+                    .map(|v| format!("{}{}", inner_prefix, stringify_json(v, indent, depth + 1)))
+                    .collect();
+                format!("[{}{}{}{}]", newline, items.join(&format!(",{}", newline)), newline, prefix)
+            }
+        },
+        JsValue::Object(obj_ref) => {
+            let obj = obj_ref.borrow();
+            if obj.properties.is_empty() {
+                "{}".to_string()
+            } else {
+                let items: Vec<String> = obj.properties.iter()
+                    .filter(|(_, p)| p.enumerable)
+                    .map(|(k, p)| {
+                        format!("{}\"{}\":{}{}",
+                            inner_prefix,
+                            k,
+                            if indent > 0 { " " } else { "" },
+                            stringify_json(&p.value, indent, depth + 1)
+                        )
+                    })
+                    .collect();
+                format!("{{{}{}{}{}}}", newline, items.join(&format!(",{}", newline)), newline, prefix)
+            }
+        },
+        JsValue::Function(_) => "undefined".to_string(),
+        JsValue::Symbol(_) => "undefined".to_string(),
+        JsValue::BigInt(n) => n.to_string(),
+    }
+}
+
+// ============================================================
+// Console Object
+// ============================================================
+
+fn register_console(interp: &mut Interpreter) {
+    let mut console_obj = JsObject::new();
+
+    // console.log
+    console_obj.set("log".to_string(), interp.create_native_function("log", |_interp, _this, args| {
+        let output: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        println!("{}", output.join(" "));
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.error
+    console_obj.set("error".to_string(), interp.create_native_function("error", |_interp, _this, args| {
+        let output: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        eprintln!("Error: {}", output.join(" "));
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.warn
+    console_obj.set("warn".to_string(), interp.create_native_function("warn", |_interp, _this, args| {
+        let output: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        eprintln!("Warning: {}", output.join(" "));
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.info
+    console_obj.set("info".to_string(), interp.create_native_function("info", |_interp, _this, args| {
+        let output: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        println!("Info: {}", output.join(" "));
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.debug
+    console_obj.set("debug".to_string(), interp.create_native_function("debug", |_interp, _this, args| {
+        let output: Vec<String> = args.iter().map(|v| v.to_string()).collect();
+        println!("Debug: {}", output.join(" "));
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.assert
+    console_obj.set("assert".to_string(), interp.create_native_function("assert", |_interp, _this, args| {
+        let condition = args.get(0).map(|v| v.is_truthy()).unwrap_or(false);
+        if !condition {
+            let message = args.get(1).map(|v| v.to_string()).unwrap_or("Assertion failed".to_string());
+            eprintln!("Assertion failed: {}", message);
+        }
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.clear
+    console_obj.set("clear".to_string(), interp.create_native_function("clear", |_interp, _this, _args| {
+        print!("\x1B[2J\x1B[H");
+        Ok(JsValue::Undefined)
+    }));
+
+    // console.time / console.timeEnd (simplified)
+    console_obj.set("time".to_string(), interp.create_native_function("time", |_interp, _this, _args| {
+        Ok(JsValue::Undefined)
+    }));
+
+    console_obj.set("timeEnd".to_string(), interp.create_native_function("timeEnd", |_interp, _this, _args| {
+        Ok(JsValue::Undefined)
+    }));
+
+    interp.define_global("console", JsValue::Object(Rc::new(RefCell::new(console_obj))));
+}
+
+// ============================================================
+// Date Constructor
+// ============================================================
+
+fn register_date(interp: &mut Interpreter) {
+    let mut date_constructor = JsObject::new();
+
+    // Date.now
+    date_constructor.set("now".to_string(), interp.create_native_function("now", |_interp, _this, _args| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        Ok(JsValue::Number(timestamp))
+    }));
+
+    // Date.parse
+    date_constructor.set("parse".to_string(), interp.create_native_function("parse", |_interp, _this, args| {
+        // Simplified - would need full date parsing
+        let _date_string = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        Ok(JsValue::Number(f64::NAN))
+    }));
+
+    // Date.UTC
+    date_constructor.set("UTC".to_string(), interp.create_native_function("UTC", |_interp, _this, args| {
+        // Simplified
+        let _year = args.get(0).map(|v| v.to_number()).unwrap_or(0.0);
+        Ok(JsValue::Number(0.0))
+    }));
+
+    interp.define_global("Date", JsValue::Object(Rc::new(RefCell::new(date_constructor))));
+}
+
+// ============================================================
+// Error Constructors
+// ============================================================
+
+fn register_errors(interp: &mut Interpreter) {
+    // Error
+    let error_constructor = interp.create_native_function("Error", |_interp, _this, args| {
+        let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Error {
+            message: message.clone(),
+            name: "Error".to_string(),
+        };
+        obj.set("message".to_string(), JsValue::String(message));
+        obj.set("name".to_string(), JsValue::String("Error".to_string()));
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("Error", error_constructor);
+
+    // TypeError
+    let type_error_constructor = interp.create_native_function("TypeError", |_interp, _this, args| {
+        let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Error {
+            message: message.clone(),
+            name: "TypeError".to_string(),
+        };
+        obj.set("message".to_string(), JsValue::String(message));
+        obj.set("name".to_string(), JsValue::String("TypeError".to_string()));
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("TypeError", type_error_constructor);
+
+    // ReferenceError
+    let reference_error_constructor = interp.create_native_function("ReferenceError", |_interp, _this, args| {
+        let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Error {
+            message: message.clone(),
+            name: "ReferenceError".to_string(),
+        };
+        obj.set("message".to_string(), JsValue::String(message));
+        obj.set("name".to_string(), JsValue::String("ReferenceError".to_string()));
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("ReferenceError", reference_error_constructor);
+
+    // SyntaxError
+    let syntax_error_constructor = interp.create_native_function("SyntaxError", |_interp, _this, args| {
+        let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Error {
+            message: message.clone(),
+            name: "SyntaxError".to_string(),
+        };
+        obj.set("message".to_string(), JsValue::String(message));
+        obj.set("name".to_string(), JsValue::String("SyntaxError".to_string()));
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("SyntaxError", syntax_error_constructor);
+
+    // RangeError
+    let range_error_constructor = interp.create_native_function("RangeError", |_interp, _this, args| {
+        let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Error {
+            message: message.clone(),
+            name: "RangeError".to_string(),
+        };
+        obj.set("message".to_string(), JsValue::String(message));
+        obj.set("name".to_string(), JsValue::String("RangeError".to_string()));
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("RangeError", range_error_constructor);
+}
+
+// ============================================================
+// Promise Constructor
+// ============================================================
+
+fn register_promise(interp: &mut Interpreter) {
+    let mut promise_constructor = JsObject::new();
+
+    // Promise.resolve
+    promise_constructor.set("resolve".to_string(), interp.create_native_function("resolve", |_interp, _this, args| {
+        let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Promise {
+            state: super::interpreter::PromiseState::Fulfilled,
+            result: Some(value),
+        };
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    }));
+
+    // Promise.reject
+    promise_constructor.set("reject".to_string(), interp.create_native_function("reject", |_interp, _this, args| {
+        let reason = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Promise {
+            state: super::interpreter::PromiseState::Rejected,
+            result: Some(reason),
+        };
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    }));
+
+    // Promise.all
+    promise_constructor.set("all".to_string(), interp.create_native_function("all", |_interp, _this, args| {
+        // Simplified - synchronous execution
+        let iterable = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Array(arr_ref) = iterable {
+            let results: Vec<JsValue> = arr_ref.borrow().clone();
+            Ok(JsValue::Array(Rc::new(RefCell::new(results))))
+        } else {
+            Ok(JsValue::Array(Rc::new(RefCell::new(Vec::new()))))
+        }
+    }));
+
+    // Promise.race
+    promise_constructor.set("race".to_string(), interp.create_native_function("race", |_interp, _this, args| {
+        let iterable = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Array(arr_ref) = iterable {
+            let arr = arr_ref.borrow();
+            if let Some(first) = arr.first() {
+                return Ok(first.clone());
+            }
+        }
+        Ok(JsValue::Undefined)
+    }));
+
+    interp.define_global("Promise", JsValue::Object(Rc::new(RefCell::new(promise_constructor))));
+}
+
+// ============================================================
+// Map and Set
+// ============================================================
+
+fn register_map_set(interp: &mut Interpreter) {
+    // Map constructor
+    let map_constructor = interp.create_native_function("Map", |_interp, _this, args| {
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Map { entries: Vec::new() };
+
+        // Initialize from iterable if provided
+        if let Some(JsValue::Array(arr_ref)) = args.get(0) {
+            let entries: Vec<(JsValue, JsValue)> = arr_ref.borrow().iter()
+                .filter_map(|entry| {
+                    if let JsValue::Array(pair) = entry {
+                        let pair = pair.borrow();
+                        if pair.len() >= 2 {
+                            return Some((pair[0].clone(), pair[1].clone()));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            obj.internal = ObjectInternal::Map { entries };
+        }
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("Map", map_constructor);
+
+    // Set constructor
+    let set_constructor = interp.create_native_function("Set", |_interp, _this, args| {
+        let mut obj = JsObject::new();
+        obj.internal = ObjectInternal::Set { values: Vec::new() };
+
+        // Initialize from iterable if provided
+        if let Some(JsValue::Array(arr_ref)) = args.get(0) {
+            let values: Vec<JsValue> = arr_ref.borrow().clone();
+            obj.internal = ObjectInternal::Set { values };
+        }
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(obj))))
+    });
+    interp.define_global("Set", set_constructor);
+}
+
+// ============================================================
+// Array Prototype Methods
+// ============================================================
+
+pub fn get_array_method(interp: &Interpreter, method: &str) -> Option<JsValue> {
+    match method {
+        "push" => Some(interp.create_native_function("push", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let mut arr = arr_ref.borrow_mut();
+                for arg in args {
+                    arr.push(arg);
+                }
+                Ok(JsValue::Number(arr.len() as f64))
+            } else {
+                Err(JsError::type_error("push called on non-array"))
+            }
+        })),
+
+        "pop" => Some(interp.create_native_function("pop", |_interp, this, _args| {
+            if let JsValue::Array(arr_ref) = this {
+                Ok(arr_ref.borrow_mut().pop().unwrap_or(JsValue::Undefined))
+            } else {
+                Err(JsError::type_error("pop called on non-array"))
+            }
+        })),
+
+        "shift" => Some(interp.create_native_function("shift", |_interp, this, _args| {
+            if let JsValue::Array(arr_ref) = this {
+                let mut arr = arr_ref.borrow_mut();
+                if arr.is_empty() {
+                    Ok(JsValue::Undefined)
+                } else {
+                    Ok(arr.remove(0))
+                }
+            } else {
+                Err(JsError::type_error("shift called on non-array"))
+            }
+        })),
+
+        "unshift" => Some(interp.create_native_function("unshift", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let mut arr = arr_ref.borrow_mut();
+                for (i, arg) in args.into_iter().enumerate() {
+                    arr.insert(i, arg);
+                }
+                Ok(JsValue::Number(arr.len() as f64))
+            } else {
+                Err(JsError::type_error("unshift called on non-array"))
+            }
+        })),
+
+        "indexOf" => Some(interp.create_native_function("indexOf", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let search = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+                let arr = arr_ref.borrow();
+                for (i, item) in arr.iter().enumerate() {
+                    if item.strict_equals(&search) {
+                        return Ok(JsValue::Number(i as f64));
+                    }
+                }
+                Ok(JsValue::Number(-1.0))
+            } else {
+                Err(JsError::type_error("indexOf called on non-array"))
+            }
+        })),
+
+        "includes" => Some(interp.create_native_function("includes", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let search = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+                let arr = arr_ref.borrow();
+                Ok(JsValue::Boolean(arr.iter().any(|item| item.strict_equals(&search))))
+            } else {
+                Err(JsError::type_error("includes called on non-array"))
+            }
+        })),
+
+        "join" => Some(interp.create_native_function("join", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let separator = args.get(0).map(|v| v.to_string()).unwrap_or(",".to_string());
+                let arr = arr_ref.borrow();
+                let result: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                Ok(JsValue::String(result.join(&separator)))
+            } else {
+                Err(JsError::type_error("join called on non-array"))
+            }
+        })),
+
+        "slice" => Some(interp.create_native_function("slice", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let arr = arr_ref.borrow();
+                let len = arr.len() as i64;
+
+                let start = args.get(0).map(|v| v.to_number() as i64).unwrap_or(0);
+                let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
+
+                let end = args.get(1).map(|v| v.to_number() as i64).unwrap_or(len);
+                let end = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
+
+                let slice: Vec<JsValue> = arr[start..end].to_vec();
+                Ok(JsValue::Array(Rc::new(RefCell::new(slice))))
+            } else {
+                Err(JsError::type_error("slice called on non-array"))
+            }
+        })),
+
+        "concat" => Some(interp.create_native_function("concat", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = this {
+                let mut result = arr_ref.borrow().clone();
+                for arg in args {
+                    if let JsValue::Array(other_ref) = arg {
+                        result.extend(other_ref.borrow().iter().cloned());
+                    } else {
+                        result.push(arg);
+                    }
+                }
+                Ok(JsValue::Array(Rc::new(RefCell::new(result))))
+            } else {
+                Err(JsError::type_error("concat called on non-array"))
+            }
+        })),
+
+        "reverse" => Some(interp.create_native_function("reverse", |_interp, this, _args| {
+            if let JsValue::Array(arr_ref) = &this {
+                arr_ref.borrow_mut().reverse();
+                Ok(this)
+            } else {
+                Err(JsError::type_error("reverse called on non-array"))
+            }
+        })),
+
+        "fill" => Some(interp.create_native_function("fill", |_interp, this, args| {
+            if let JsValue::Array(arr_ref) = &this {
+                let value = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+                let mut arr = arr_ref.borrow_mut();
+                let len = arr.len();
+
+                let start = args.get(1).map(|v| v.to_number() as i64).unwrap_or(0);
+                let start = if start < 0 { (len as i64 + start).max(0) as usize } else { start.min(len as i64) as usize };
+
+                let end = args.get(2).map(|v| v.to_number() as i64).unwrap_or(len as i64);
+                let end = if end < 0 { (len as i64 + end).max(0) as usize } else { end.min(len as i64) as usize };
+
+                for i in start..end {
+                    arr[i] = value.clone();
+                }
+                Ok(this)
+            } else {
+                Err(JsError::type_error("fill called on non-array"))
+            }
+        })),
+
+        _ => None,
+    }
+}
+
+// ============================================================
+// String Prototype Methods
+// ============================================================
+
+pub fn get_string_method(interp: &Interpreter, method: &str) -> Option<JsValue> {
+    match method {
+        "charAt" => Some(interp.create_native_function("charAt", |_interp, this, args| {
+            let s = this.to_string();
+            let index = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            Ok(s.chars().nth(index)
+                .map(|c| JsValue::String(c.to_string()))
+                .unwrap_or(JsValue::String(String::new())))
+        })),
+
+        "charCodeAt" => Some(interp.create_native_function("charCodeAt", |_interp, this, args| {
+            let s = this.to_string();
+            let index = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            Ok(s.chars().nth(index)
+                .map(|c| JsValue::Number(c as u32 as f64))
+                .unwrap_or(JsValue::Number(f64::NAN)))
+        })),
+
+        "concat" => Some(interp.create_native_function("concat", |_interp, this, args| {
+            let mut s = this.to_string();
+            for arg in args {
+                s.push_str(&arg.to_string());
+            }
+            Ok(JsValue::String(s))
+        })),
+
+        "includes" => Some(interp.create_native_function("includes", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::Boolean(s.contains(&search)))
+        })),
+
+        "indexOf" => Some(interp.create_native_function("indexOf", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(s.find(&search)
+                .map(|i| JsValue::Number(i as f64))
+                .unwrap_or(JsValue::Number(-1.0)))
+        })),
+
+        "lastIndexOf" => Some(interp.create_native_function("lastIndexOf", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(s.rfind(&search)
+                .map(|i| JsValue::Number(i as f64))
+                .unwrap_or(JsValue::Number(-1.0)))
+        })),
+
+        "slice" => Some(interp.create_native_function("slice", |_interp, this, args| {
+            let s = this.to_string();
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+
+            let start = args.get(0).map(|v| v.to_number() as i64).unwrap_or(0);
+            let start = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
+
+            let end = args.get(1).map(|v| v.to_number() as i64).unwrap_or(len);
+            let end = if end < 0 { (len + end).max(0) as usize } else { end.min(len) as usize };
+
+            let result: String = chars[start..end].iter().collect();
+            Ok(JsValue::String(result))
+        })),
+
+        "substring" => Some(interp.create_native_function("substring", |_interp, this, args| {
+            let s = this.to_string();
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len();
+
+            let mut start = args.get(0).map(|v| v.to_number() as i64).unwrap_or(0);
+            let mut end = args.get(1).map(|v| v.to_number() as i64).unwrap_or(len as i64);
+
+            start = start.max(0).min(len as i64);
+            end = end.max(0).min(len as i64);
+
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+
+            let result: String = chars[start as usize..end as usize].iter().collect();
+            Ok(JsValue::String(result))
+        })),
+
+        "toLowerCase" => Some(interp.create_native_function("toLowerCase", |_interp, this, _args| {
+            Ok(JsValue::String(this.to_string().to_lowercase()))
+        })),
+
+        "toUpperCase" => Some(interp.create_native_function("toUpperCase", |_interp, this, _args| {
+            Ok(JsValue::String(this.to_string().to_uppercase()))
+        })),
+
+        "trim" => Some(interp.create_native_function("trim", |_interp, this, _args| {
+            Ok(JsValue::String(this.to_string().trim().to_string()))
+        })),
+
+        "trimStart" | "trimLeft" => Some(interp.create_native_function("trimStart", |_interp, this, _args| {
+            Ok(JsValue::String(this.to_string().trim_start().to_string()))
+        })),
+
+        "trimEnd" | "trimRight" => Some(interp.create_native_function("trimEnd", |_interp, this, _args| {
+            Ok(JsValue::String(this.to_string().trim_end().to_string()))
+        })),
+
+        "split" => Some(interp.create_native_function("split", |_interp, this, args| {
+            let s = this.to_string();
+            let separator = args.get(0).map(|v| v.to_string());
+            let limit = args.get(1).map(|v| v.to_number() as usize);
+
+            let parts: Vec<JsValue> = match separator {
+                Some(sep) if !sep.is_empty() => {
+                    let split: Vec<&str> = if let Some(limit) = limit {
+                        s.splitn(limit, &sep).collect()
+                    } else {
+                        s.split(&sep).collect()
+                    };
+                    split.into_iter().map(|p| JsValue::String(p.to_string())).collect()
+                },
+                Some(_) => {
+                    // Empty separator - split into characters
+                    s.chars().map(|c| JsValue::String(c.to_string())).collect()
+                },
+                None => vec![JsValue::String(s)],
+            };
+
+            Ok(JsValue::Array(Rc::new(RefCell::new(parts))))
+        })),
+
+        "replace" => Some(interp.create_native_function("replace", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let replacement = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::String(s.replacen(&search, &replacement, 1)))
+        })),
+
+        "replaceAll" => Some(interp.create_native_function("replaceAll", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let replacement = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::String(s.replace(&search, &replacement)))
+        })),
+
+        "repeat" => Some(interp.create_native_function("repeat", |_interp, this, args| {
+            let s = this.to_string();
+            let count = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            Ok(JsValue::String(s.repeat(count)))
+        })),
+
+        "startsWith" => Some(interp.create_native_function("startsWith", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::Boolean(s.starts_with(&search)))
+        })),
+
+        "endsWith" => Some(interp.create_native_function("endsWith", |_interp, this, args| {
+            let s = this.to_string();
+            let search = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::Boolean(s.ends_with(&search)))
+        })),
+
+        "padStart" => Some(interp.create_native_function("padStart", |_interp, this, args| {
+            let s = this.to_string();
+            let target_len = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            let pad_str = args.get(1).map(|v| v.to_string()).unwrap_or(" ".to_string());
+
+            if s.len() >= target_len || pad_str.is_empty() {
+                return Ok(JsValue::String(s));
+            }
+
+            let pad_len = target_len - s.len();
+            let mut padding = String::new();
+            while padding.len() < pad_len {
+                padding.push_str(&pad_str);
+            }
+            padding.truncate(pad_len);
+
+            Ok(JsValue::String(padding + &s))
+        })),
+
+        "padEnd" => Some(interp.create_native_function("padEnd", |_interp, this, args| {
+            let s = this.to_string();
+            let target_len = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            let pad_str = args.get(1).map(|v| v.to_string()).unwrap_or(" ".to_string());
+
+            if s.len() >= target_len || pad_str.is_empty() {
+                return Ok(JsValue::String(s));
+            }
+
+            let pad_len = target_len - s.len();
+            let mut result = s;
+            while result.len() < target_len {
+                result.push_str(&pad_str);
+            }
+            result.truncate(target_len);
+
+            Ok(JsValue::String(result))
+        })),
+
+        _ => None,
+    }
+}

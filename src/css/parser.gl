@@ -1,0 +1,875 @@
+// CSS3 Parser
+// Parses CSS stylesheets into rule structures
+
+use super::tokenizer::{CssToken, CssTokenizer};
+use super::selectors::{Selector, SelectorParser, Specificity, parse_selector};
+use super::values::{CssValue, ValueParser, parse_value_list};
+
+// ============================================================
+// CSS Rule Types
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct Stylesheet {
+    pub rules: Vec<CssRule>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CssRule {
+    Style(StyleRule),
+    Import(ImportRule),
+    Media(MediaRule),
+    FontFace(FontFaceRule),
+    Keyframes(KeyframesRule),
+    Supports(SupportsRule),
+    Page(PageRule),
+}
+
+#[derive(Clone, Debug)]
+pub struct StyleRule {
+    pub selectors: Vec<Selector>,
+    pub declarations: Vec<Declaration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Declaration {
+    pub property: String,
+    pub value: Vec<CssValue>,
+    pub important: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportRule {
+    pub url: String,
+    pub media: Vec<MediaQuery>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaRule {
+    pub queries: Vec<MediaQuery>,
+    pub rules: Vec<CssRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaQuery {
+    pub modifier: Option<MediaModifier>,
+    pub media_type: Option<String>,
+    pub features: Vec<MediaFeature>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MediaModifier {
+    Only,
+    Not,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaFeature {
+    pub name: String,
+    pub value: Option<CssValue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FontFaceRule {
+    pub declarations: Vec<Declaration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeyframesRule {
+    pub name: String,
+    pub keyframes: Vec<Keyframe>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Keyframe {
+    pub selectors: Vec<KeyframeSelector>,
+    pub declarations: Vec<Declaration>,
+}
+
+#[derive(Clone, Debug)]
+pub enum KeyframeSelector {
+    From,
+    To,
+    Percentage(f64),
+}
+
+#[derive(Clone, Debug)]
+pub struct SupportsRule {
+    pub condition: String,
+    pub rules: Vec<CssRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PageRule {
+    pub selector: Option<String>,
+    pub declarations: Vec<Declaration>,
+}
+
+// ============================================================
+// CSS Parser
+// ============================================================
+
+pub struct CssParser {
+    tokens: Vec<CssToken>,
+    pos: usize,
+}
+
+impl CssParser {
+    pub fn new(css: &str) -> CssParser {
+        let mut tokenizer = CssTokenizer::new(css);
+        CssParser {
+            tokens: tokenizer.tokenize_all(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> &CssToken {
+        self.tokens.get(self.pos).unwrap_or(&CssToken::EOF)
+    }
+
+    fn peek_at(&self, offset: usize) -> &CssToken {
+        self.tokens.get(self.pos + offset).unwrap_or(&CssToken::EOF)
+    }
+
+    fn consume(&mut self) -> CssToken {
+        let token = self.tokens.get(self.pos).cloned().unwrap_or(CssToken::EOF);
+        self.pos += 1;
+        token
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), CssToken::Whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            match self.peek() {
+                CssToken::Whitespace => { self.pos += 1; },
+                CssToken::CDO | CssToken::CDC => { self.pos += 1; },
+                _ => break,
+            }
+        }
+    }
+
+    // Parse entire stylesheet
+    pub fn parse(&mut self) -> Stylesheet {
+        let mut rules = Vec::new();
+
+        loop {
+            self.skip_whitespace_and_comments();
+
+            match self.peek() {
+                CssToken::EOF => break,
+                CssToken::AtKeyword(_) => {
+                    if let Some(rule) = self.parse_at_rule() {
+                        rules.push(rule);
+                    }
+                },
+                _ => {
+                    if let Some(rule) = self.parse_style_rule() {
+                        rules.push(CssRule::Style(rule));
+                    }
+                }
+            }
+        }
+
+        Stylesheet { rules }
+    }
+
+    // Parse an at-rule
+    fn parse_at_rule(&mut self) -> Option<CssRule> {
+        let name = match self.consume() {
+            CssToken::AtKeyword(name) => name.to_ascii_lowercase(),
+            _ => return None,
+        };
+
+        match name.as_str() {
+            "import" => self.parse_import_rule(),
+            "media" => self.parse_media_rule(),
+            "font-face" => self.parse_font_face_rule(),
+            "keyframes" | "-webkit-keyframes" => self.parse_keyframes_rule(),
+            "supports" => self.parse_supports_rule(),
+            "page" => self.parse_page_rule(),
+            _ => {
+                // Skip unknown at-rule
+                self.skip_at_rule();
+                None
+            }
+        }
+    }
+
+    fn parse_import_rule(&mut self) -> Option<CssRule> {
+        self.skip_whitespace();
+
+        let url = match self.peek() {
+            CssToken::String(s) => {
+                let s = s.clone();
+                self.pos += 1;
+                s
+            },
+            CssToken::Url(s) => {
+                let s = s.clone();
+                self.pos += 1;
+                s
+            },
+            CssToken::Function(name) if name.to_ascii_lowercase() == "url" => {
+                self.pos += 1;
+                let url = self.consume_url_function();
+                url
+            },
+            _ => return None,
+        };
+
+        // Parse optional media queries
+        let media = self.parse_media_query_list();
+
+        // Consume semicolon
+        self.skip_whitespace();
+        if matches!(self.peek(), CssToken::Semicolon) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::Import(ImportRule { url, media }))
+    }
+
+    fn parse_media_rule(&mut self) -> Option<CssRule> {
+        let queries = self.parse_media_query_list();
+
+        self.skip_whitespace();
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let rules = self.parse_rule_list();
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::Media(MediaRule { queries, rules }))
+    }
+
+    fn parse_media_query_list(&mut self) -> Vec<MediaQuery> {
+        let mut queries = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+
+            if let Some(query) = self.parse_media_query() {
+                queries.push(query);
+            }
+
+            self.skip_whitespace();
+            if !matches!(self.peek(), CssToken::Comma) {
+                break;
+            }
+            self.pos += 1;
+        }
+
+        queries
+    }
+
+    fn parse_media_query(&mut self) -> Option<MediaQuery> {
+        self.skip_whitespace();
+
+        let mut modifier = None;
+        let mut media_type = None;
+        let mut features = Vec::new();
+
+        // Check for modifier (only/not)
+        if let CssToken::Ident(name) = self.peek() {
+            let lower = name.to_ascii_lowercase();
+            match lower.as_str() {
+                "only" => {
+                    modifier = Some(MediaModifier::Only);
+                    self.pos += 1;
+                    self.skip_whitespace();
+                },
+                "not" => {
+                    modifier = Some(MediaModifier::Not);
+                    self.pos += 1;
+                    self.skip_whitespace();
+                },
+                _ => {}
+            }
+        }
+
+        // Check for media type
+        if let CssToken::Ident(name) = self.peek() {
+            let lower = name.to_ascii_lowercase();
+            if lower != "and" {
+                media_type = Some(lower);
+                self.pos += 1;
+            }
+        }
+
+        // Parse features
+        loop {
+            self.skip_whitespace();
+
+            // Check for "and"
+            if let CssToken::Ident(name) = self.peek() {
+                if name.to_ascii_lowercase() == "and" {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                }
+            }
+
+            // Check for feature (in parentheses)
+            if !matches!(self.peek(), CssToken::OpenParen) {
+                break;
+            }
+            self.pos += 1;
+
+            if let Some(feature) = self.parse_media_feature() {
+                features.push(feature);
+            }
+
+            self.skip_whitespace();
+            if matches!(self.peek(), CssToken::CloseParen) {
+                self.pos += 1;
+            }
+        }
+
+        if modifier.is_none() && media_type.is_none() && features.is_empty() {
+            return None;
+        }
+
+        Some(MediaQuery {
+            modifier,
+            media_type,
+            features,
+        })
+    }
+
+    fn parse_media_feature(&mut self) -> Option<MediaFeature> {
+        self.skip_whitespace();
+
+        let name = match self.peek() {
+            CssToken::Ident(name) => {
+                let name = name.clone().to_ascii_lowercase();
+                self.pos += 1;
+                name
+            },
+            _ => return None,
+        };
+
+        self.skip_whitespace();
+
+        let value = if matches!(self.peek(), CssToken::Colon) {
+            self.pos += 1;
+            self.skip_whitespace();
+
+            let mut parser = ValueParser::from_tokens(self.collect_until(&[
+                CssToken::CloseParen,
+                CssToken::EOF,
+            ]));
+            parser.parse_value()
+        } else {
+            None
+        };
+
+        Some(MediaFeature { name, value })
+    }
+
+    fn parse_font_face_rule(&mut self) -> Option<CssRule> {
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let declarations = self.parse_declaration_list();
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::FontFace(FontFaceRule { declarations }))
+    }
+
+    fn parse_keyframes_rule(&mut self) -> Option<CssRule> {
+        self.skip_whitespace();
+
+        let name = match self.peek() {
+            CssToken::Ident(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                name
+            },
+            CssToken::String(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                name
+            },
+            _ => return None,
+        };
+
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let mut keyframes = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+
+            if matches!(self.peek(), CssToken::CloseBrace | CssToken::EOF) {
+                break;
+            }
+
+            if let Some(keyframe) = self.parse_keyframe() {
+                keyframes.push(keyframe);
+            }
+        }
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::Keyframes(KeyframesRule { name, keyframes }))
+    }
+
+    fn parse_keyframe(&mut self) -> Option<Keyframe> {
+        let mut selectors = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+
+            match self.peek() {
+                CssToken::Ident(name) => {
+                    let lower = name.to_ascii_lowercase();
+                    self.pos += 1;
+                    match lower.as_str() {
+                        "from" => selectors.push(KeyframeSelector::From),
+                        "to" => selectors.push(KeyframeSelector::To),
+                        _ => {}
+                    }
+                },
+                CssToken::Percentage(n) => {
+                    selectors.push(KeyframeSelector::Percentage(*n));
+                    self.pos += 1;
+                },
+                CssToken::Number(n, _) if *n == 0.0 => {
+                    selectors.push(KeyframeSelector::Percentage(0.0));
+                    self.pos += 1;
+                },
+                _ => break,
+            }
+
+            self.skip_whitespace();
+            if !matches!(self.peek(), CssToken::Comma) {
+                break;
+            }
+            self.pos += 1;
+        }
+
+        if selectors.is_empty() {
+            return None;
+        }
+
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let declarations = self.parse_declaration_list();
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(Keyframe { selectors, declarations })
+    }
+
+    fn parse_supports_rule(&mut self) -> Option<CssRule> {
+        // Collect condition
+        let mut condition = String::new();
+        let mut depth = 0;
+
+        self.skip_whitespace();
+
+        loop {
+            match self.peek() {
+                CssToken::OpenParen => {
+                    depth += 1;
+                    condition.push('(');
+                    self.pos += 1;
+                },
+                CssToken::CloseParen => {
+                    depth -= 1;
+                    condition.push(')');
+                    self.pos += 1;
+                },
+                CssToken::OpenBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    condition.push('{');
+                    self.pos += 1;
+                },
+                CssToken::EOF => break,
+                _ => {
+                    condition.push_str(&self.token_to_string(self.peek()));
+                    self.pos += 1;
+                }
+            }
+        }
+
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let rules = self.parse_rule_list();
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::Supports(SupportsRule { condition, rules }))
+    }
+
+    fn parse_page_rule(&mut self) -> Option<CssRule> {
+        self.skip_whitespace();
+
+        let selector = if let CssToken::Ident(name) = self.peek() {
+            let name = name.clone();
+            self.pos += 1;
+            Some(name)
+        } else {
+            None
+        };
+
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        let declarations = self.parse_declaration_list();
+
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(CssRule::Page(PageRule { selector, declarations }))
+    }
+
+    // Parse a style rule
+    fn parse_style_rule(&mut self) -> Option<StyleRule> {
+        // Collect selector text
+        let selector_text = self.collect_selector_text();
+
+        if selector_text.is_empty() {
+            return None;
+        }
+
+        // Parse selectors
+        let mut selector_parser = SelectorParser::new(&selector_text);
+        let selector_list = selector_parser.parse_selector_list();
+
+        let selectors = match selector_list {
+            Some(Selector::List(list)) => list,
+            Some(sel) => vec![sel],
+            None => return None,
+        };
+
+        // Expect opening brace
+        self.skip_whitespace();
+        if !matches!(self.peek(), CssToken::OpenBrace) {
+            return None;
+        }
+        self.pos += 1;
+
+        // Parse declarations
+        let declarations = self.parse_declaration_list();
+
+        // Expect closing brace
+        if matches!(self.peek(), CssToken::CloseBrace) {
+            self.pos += 1;
+        }
+
+        Some(StyleRule { selectors, declarations })
+    }
+
+    fn collect_selector_text(&mut self) -> String {
+        let mut text = String::new();
+
+        loop {
+            match self.peek() {
+                CssToken::OpenBrace | CssToken::EOF => break,
+                CssToken::Whitespace => {
+                    text.push(' ');
+                    self.pos += 1;
+                },
+                _ => {
+                    text.push_str(&self.token_to_string(self.peek()));
+                    self.pos += 1;
+                }
+            }
+        }
+
+        text.trim().to_string()
+    }
+
+    fn parse_declaration_list(&mut self) -> Vec<Declaration> {
+        let mut declarations = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+
+            match self.peek() {
+                CssToken::CloseBrace | CssToken::EOF => break,
+                CssToken::Semicolon => {
+                    self.pos += 1;
+                },
+                CssToken::Ident(_) => {
+                    if let Some(decl) = self.parse_declaration() {
+                        declarations.push(decl);
+                    }
+                },
+                _ => {
+                    // Skip unexpected token
+                    self.pos += 1;
+                }
+            }
+        }
+
+        declarations
+    }
+
+    fn parse_declaration(&mut self) -> Option<Declaration> {
+        let property = match self.consume() {
+            CssToken::Ident(name) => name.to_ascii_lowercase(),
+            _ => return None,
+        };
+
+        self.skip_whitespace();
+
+        if !matches!(self.peek(), CssToken::Colon) {
+            return None;
+        }
+        self.pos += 1;
+
+        self.skip_whitespace();
+
+        // Collect value tokens
+        let value_tokens = self.collect_until(&[
+            CssToken::Semicolon,
+            CssToken::CloseBrace,
+            CssToken::EOF,
+        ]);
+
+        // Check for !important
+        let mut important = false;
+        let mut filtered_tokens = Vec::new();
+
+        let mut i = 0;
+        while i < value_tokens.len() {
+            if let CssToken::Delim('!') = &value_tokens[i] {
+                if i + 1 < value_tokens.len() {
+                    if let CssToken::Ident(name) = &value_tokens[i + 1] {
+                        if name.to_ascii_lowercase() == "important" {
+                            important = true;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            filtered_tokens.push(value_tokens[i].clone());
+            i += 1;
+        }
+
+        // Parse values
+        let mut parser = ValueParser::from_tokens(filtered_tokens);
+        let value = parser.parse_value_list();
+
+        Some(Declaration {
+            property,
+            value,
+            important,
+        })
+    }
+
+    fn parse_rule_list(&mut self) -> Vec<CssRule> {
+        let mut rules = Vec::new();
+
+        loop {
+            self.skip_whitespace_and_comments();
+
+            match self.peek() {
+                CssToken::CloseBrace | CssToken::EOF => break,
+                CssToken::AtKeyword(_) => {
+                    if let Some(rule) = self.parse_at_rule() {
+                        rules.push(rule);
+                    }
+                },
+                _ => {
+                    if let Some(rule) = self.parse_style_rule() {
+                        rules.push(CssRule::Style(rule));
+                    }
+                }
+            }
+        }
+
+        rules
+    }
+
+    fn skip_at_rule(&mut self) {
+        let mut brace_depth = 0;
+
+        loop {
+            match self.consume() {
+                CssToken::OpenBrace => brace_depth += 1,
+                CssToken::CloseBrace => {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        break;
+                    }
+                },
+                CssToken::Semicolon if brace_depth == 0 => break,
+                CssToken::EOF => break,
+                _ => {}
+            }
+        }
+    }
+
+    fn consume_url_function(&mut self) -> String {
+        let mut url = String::new();
+
+        self.skip_whitespace();
+
+        match self.peek() {
+            CssToken::String(s) => {
+                url = s.clone();
+                self.pos += 1;
+            },
+            _ => {
+                // Unquoted URL
+                loop {
+                    match self.peek() {
+                        CssToken::CloseParen | CssToken::EOF => break,
+                        CssToken::Whitespace => { self.pos += 1; },
+                        _ => {
+                            url.push_str(&self.token_to_string(self.peek()));
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.skip_whitespace();
+        if matches!(self.peek(), CssToken::CloseParen) {
+            self.pos += 1;
+        }
+
+        url
+    }
+
+    fn collect_until(&mut self, terminators: &[CssToken]) -> Vec<CssToken> {
+        let mut tokens = Vec::new();
+
+        loop {
+            let is_terminator = terminators.iter().any(|t| {
+                std::mem::discriminant(t) == std::mem::discriminant(self.peek())
+            });
+
+            if is_terminator {
+                break;
+            }
+
+            if matches!(self.peek(), CssToken::EOF) {
+                break;
+            }
+
+            tokens.push(self.consume());
+        }
+
+        tokens.push(CssToken::EOF);
+        tokens
+    }
+
+    fn token_to_string(&self, token: &CssToken) -> String {
+        match token {
+            CssToken::Ident(s) => s.clone(),
+            CssToken::Function(s) => format!("{}(", s),
+            CssToken::AtKeyword(s) => format!("@{}", s),
+            CssToken::Hash(s, _) => format!("#{}", s),
+            CssToken::String(s) => format!("\"{}\"", s),
+            CssToken::Url(s) => format!("url({})", s),
+            CssToken::Delim(c) => c.to_string(),
+            CssToken::Number(n, _) => n.to_string(),
+            CssToken::Percentage(n) => format!("{}%", n),
+            CssToken::Dimension(n, u) => format!("{}{}", n, u),
+            CssToken::Whitespace => " ".to_string(),
+            CssToken::Colon => ":".to_string(),
+            CssToken::Semicolon => ";".to_string(),
+            CssToken::Comma => ",".to_string(),
+            CssToken::OpenBracket => "[".to_string(),
+            CssToken::CloseBracket => "]".to_string(),
+            CssToken::OpenParen => "(".to_string(),
+            CssToken::CloseParen => ")".to_string(),
+            CssToken::OpenBrace => "{".to_string(),
+            CssToken::CloseBrace => "}".to_string(),
+            CssToken::CDO => "<!--".to_string(),
+            CssToken::CDC => "-->".to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+pub fn parse_stylesheet(css: &str) -> Stylesheet {
+    let mut parser = CssParser::new(css);
+    parser.parse()
+}
+
+pub fn parse_declarations(css: &str) -> Vec<Declaration> {
+    // Wrap in a rule to parse declarations
+    let wrapped = format!("x {{ {} }}", css);
+    let stylesheet = parse_stylesheet(&wrapped);
+
+    for rule in stylesheet.rules {
+        if let CssRule::Style(style) = rule {
+            return style.declarations;
+        }
+    }
+
+    Vec::new()
+}
+
+impl Stylesheet {
+    // Get all style rules (flattening media queries)
+    pub fn get_style_rules(&self) -> Vec<&StyleRule> {
+        let mut rules = Vec::new();
+        self.collect_style_rules(&self.rules, &mut rules);
+        rules
+    }
+
+    fn collect_style_rules<'a>(&'a self, rules: &'a [CssRule], result: &mut Vec<&'a StyleRule>) {
+        for rule in rules {
+            match rule {
+                CssRule::Style(style) => result.push(style),
+                CssRule::Media(media) => self.collect_style_rules(&media.rules, result),
+                CssRule::Supports(supports) => self.collect_style_rules(&supports.rules, result),
+                _ => {}
+            }
+        }
+    }
+}

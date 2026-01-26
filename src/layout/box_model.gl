@@ -1,0 +1,595 @@
+// CSS Box Model
+// Core layout box structure and dimensions
+
+use super::super::css::{ComputedStyle, Display, Position, Float, Overflow};
+use super::super::css::{Dimension, BorderStyle, Color};
+
+// ============================================================
+// Geometry Types
+// ============================================================
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Point {
+    pub fn new(x: f64, y: f64) -> Point {
+        Point { x, y }
+    }
+
+    pub fn zero() -> Point {
+        Point { x: 0.0, y: 0.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Size {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Size {
+    pub fn new(width: f64, height: f64) -> Size {
+        Size { width, height }
+    }
+
+    pub fn zero() -> Size {
+        Size { width: 0.0, height: 0.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Rect {
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect { x, y, width, height }
+    }
+
+    pub fn zero() -> Rect {
+        Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }
+    }
+
+    pub fn from_point_size(point: Point, size: Size) -> Rect {
+        Rect {
+            x: point.x,
+            y: point.y,
+            width: size.width,
+            height: size.height,
+        }
+    }
+
+    pub fn origin(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+
+    pub fn size(&self) -> Size {
+        Size::new(self.width, self.height)
+    }
+
+    pub fn right(&self) -> f64 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> f64 {
+        self.y + self.height
+    }
+
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.right() && self.right() > other.x &&
+        self.y < other.bottom() && self.bottom() > other.y
+    }
+
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Rect::new(x, y, right - x, bottom - y)
+    }
+
+    pub fn expand(&self, amount: f64) -> Rect {
+        Rect::new(
+            self.x - amount,
+            self.y - amount,
+            self.width + amount * 2.0,
+            self.height + amount * 2.0,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EdgeSizes {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+impl EdgeSizes {
+    pub fn new(top: f64, right: f64, bottom: f64, left: f64) -> EdgeSizes {
+        EdgeSizes { top, right, bottom, left }
+    }
+
+    pub fn uniform(size: f64) -> EdgeSizes {
+        EdgeSizes { top: size, right: size, bottom: size, left: size }
+    }
+
+    pub fn zero() -> EdgeSizes {
+        EdgeSizes { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 }
+    }
+
+    pub fn horizontal(&self) -> f64 {
+        self.left + self.right
+    }
+
+    pub fn vertical(&self) -> f64 {
+        self.top + self.bottom
+    }
+}
+
+// ============================================================
+// Box Dimensions
+// ============================================================
+
+#[derive(Clone, Debug, Default)]
+pub struct BoxDimensions {
+    // Content area
+    pub content: Rect,
+
+    // Edge sizes
+    pub padding: EdgeSizes,
+    pub border: EdgeSizes,
+    pub margin: EdgeSizes,
+}
+
+impl BoxDimensions {
+    pub fn new() -> BoxDimensions {
+        BoxDimensions {
+            content: Rect::zero(),
+            padding: EdgeSizes::zero(),
+            border: EdgeSizes::zero(),
+            margin: EdgeSizes::zero(),
+        }
+    }
+
+    // Padding box (content + padding)
+    pub fn padding_box(&self) -> Rect {
+        Rect::new(
+            self.content.x - self.padding.left,
+            self.content.y - self.padding.top,
+            self.content.width + self.padding.horizontal(),
+            self.content.height + self.padding.vertical(),
+        )
+    }
+
+    // Border box (content + padding + border)
+    pub fn border_box(&self) -> Rect {
+        let padding = self.padding_box();
+        Rect::new(
+            padding.x - self.border.left,
+            padding.y - self.border.top,
+            padding.width + self.border.horizontal(),
+            padding.height + self.border.vertical(),
+        )
+    }
+
+    // Margin box (content + padding + border + margin)
+    pub fn margin_box(&self) -> Rect {
+        let border = self.border_box();
+        Rect::new(
+            border.x - self.margin.left,
+            border.y - self.margin.top,
+            border.width + self.margin.horizontal(),
+            border.height + self.margin.vertical(),
+        )
+    }
+
+    // Total width including all edges
+    pub fn total_width(&self) -> f64 {
+        self.content.width +
+        self.padding.horizontal() +
+        self.border.horizontal() +
+        self.margin.horizontal()
+    }
+
+    // Total height including all edges
+    pub fn total_height(&self) -> f64 {
+        self.content.height +
+        self.padding.vertical() +
+        self.border.vertical() +
+        self.margin.vertical()
+    }
+}
+
+// ============================================================
+// Layout Box Type
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BoxType {
+    Block,
+    Inline,
+    InlineBlock,
+    Anonymous,
+    Text,
+    Flex,
+    FlexItem,
+    Grid,
+    GridItem,
+    Table,
+    TableRow,
+    TableCell,
+    ListItem,
+}
+
+impl BoxType {
+    pub fn from_display(display: Display) -> BoxType {
+        match display {
+            Display::Block | Display::ListItem => BoxType::Block,
+            Display::Inline => BoxType::Inline,
+            Display::InlineBlock => BoxType::InlineBlock,
+            Display::Flex | Display::InlineFlex => BoxType::Flex,
+            Display::Grid | Display::InlineGrid => BoxType::Grid,
+            Display::Table => BoxType::Table,
+            Display::TableRow => BoxType::TableRow,
+            Display::TableCell => BoxType::TableCell,
+            Display::None | Display::Contents => BoxType::Anonymous,
+            _ => BoxType::Block,
+        }
+    }
+
+    pub fn is_block_level(&self) -> bool {
+        matches!(self, BoxType::Block | BoxType::Flex | BoxType::Grid |
+                       BoxType::Table | BoxType::ListItem)
+    }
+
+    pub fn is_inline_level(&self) -> bool {
+        matches!(self, BoxType::Inline | BoxType::InlineBlock | BoxType::Text)
+    }
+
+    pub fn establishes_bfc(&self) -> bool {
+        matches!(self, BoxType::Block | BoxType::Flex | BoxType::Grid)
+    }
+}
+
+// ============================================================
+// Layout Box
+// ============================================================
+
+#[derive(Clone)]
+pub struct LayoutBox {
+    pub box_type: BoxType,
+    pub dimensions: BoxDimensions,
+    pub children: Vec<LayoutBox>,
+    pub style: ComputedStyle,
+    pub node_index: Option<usize>,  // Index into DOM
+
+    // Position information
+    pub position: Position,
+    pub float: Float,
+
+    // For inline boxes
+    pub line_boxes: Vec<LineBox>,
+
+    // For text boxes
+    pub text: Option<String>,
+
+    // Debug info
+    pub debug_tag: Option<String>,
+}
+
+impl LayoutBox {
+    pub fn new(box_type: BoxType, style: ComputedStyle) -> LayoutBox {
+        LayoutBox {
+            box_type,
+            dimensions: BoxDimensions::new(),
+            children: Vec::new(),
+            style,
+            node_index: None,
+            position: Position::Static,
+            float: Float::None,
+            line_boxes: Vec::new(),
+            text: None,
+            debug_tag: None,
+        }
+    }
+
+    pub fn anonymous(box_type: BoxType) -> LayoutBox {
+        LayoutBox::new(box_type, ComputedStyle::default())
+    }
+
+    pub fn text_box(text: String, style: ComputedStyle) -> LayoutBox {
+        let mut b = LayoutBox::new(BoxType::Text, style);
+        b.text = Some(text);
+        b
+    }
+
+    // Get inline container for mixed content
+    pub fn get_inline_container(&mut self) -> &mut LayoutBox {
+        match self.box_type {
+            BoxType::Inline | BoxType::Text => self,
+            _ => {
+                // Check if last child is an anonymous inline container
+                let needs_new = match self.children.last() {
+                    Some(child) => child.box_type != BoxType::Anonymous,
+                    None => true,
+                };
+
+                if needs_new {
+                    let anon = LayoutBox::anonymous(BoxType::Anonymous);
+                    self.children.push(anon);
+                }
+
+                self.children.last_mut().unwrap()
+            }
+        }
+    }
+
+    // Add a child box
+    pub fn add_child(&mut self, child: LayoutBox) {
+        self.children.push(child);
+    }
+
+    // Check if box is positioned (not static)
+    pub fn is_positioned(&self) -> bool {
+        self.position != Position::Static
+    }
+
+    // Check if box is absolutely positioned
+    pub fn is_absolutely_positioned(&self) -> bool {
+        matches!(self.position, Position::Absolute | Position::Fixed)
+    }
+
+    // Check if box is a containing block
+    pub fn is_containing_block(&self) -> bool {
+        self.is_positioned() ||
+        self.box_type == BoxType::Block ||
+        self.box_type == BoxType::Flex
+    }
+
+    // Get content area position
+    pub fn content_position(&self) -> Point {
+        self.dimensions.content.origin()
+    }
+
+    // Get border box position
+    pub fn border_position(&self) -> Point {
+        self.dimensions.border_box().origin()
+    }
+
+    // Get the computed width, resolving 'auto' and percentages
+    pub fn resolve_width(&self, containing_width: f64) -> f64 {
+        match self.style.width {
+            Dimension::Length(w) => w,
+            Dimension::Percentage(p) => containing_width * p / 100.0,
+            Dimension::Auto => {
+                // For block boxes, auto means fill available space
+                if self.box_type.is_block_level() {
+                    containing_width -
+                    self.dimensions.margin.horizontal() -
+                    self.dimensions.border.horizontal() -
+                    self.dimensions.padding.horizontal()
+                } else {
+                    0.0 // Will be determined by content
+                }
+            },
+            _ => 0.0,
+        }
+    }
+
+    // Get the computed height, resolving 'auto' and percentages
+    pub fn resolve_height(&self, containing_height: f64) -> f64 {
+        match self.style.height {
+            Dimension::Length(h) => h,
+            Dimension::Percentage(p) => containing_height * p / 100.0,
+            Dimension::Auto => 0.0, // Will be determined by content
+            _ => 0.0,
+        }
+    }
+}
+
+// ============================================================
+// Line Box (for inline layout)
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct LineBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub baseline: f64,
+    pub fragments: Vec<LineFragment>,
+}
+
+impl LineBox {
+    pub fn new(x: f64, y: f64) -> LineBox {
+        LineBox {
+            x,
+            y,
+            width: 0.0,
+            height: 0.0,
+            baseline: 0.0,
+            fragments: Vec::new(),
+        }
+    }
+
+    pub fn add_fragment(&mut self, fragment: LineFragment) {
+        self.width += fragment.width;
+        if fragment.height > self.height {
+            self.height = fragment.height;
+        }
+        if fragment.baseline > self.baseline {
+            self.baseline = fragment.baseline;
+        }
+        self.fragments.push(fragment);
+    }
+
+    pub fn remaining_width(&self, max_width: f64) -> f64 {
+        max_width - self.width
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LineFragment {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub baseline: f64,
+    pub content: FragmentContent,
+}
+
+#[derive(Clone, Debug)]
+pub enum FragmentContent {
+    Text {
+        text: String,
+        font_size: f64,
+        color: Color,
+    },
+    InlineBox {
+        box_index: usize,
+    },
+    ReplacedContent {
+        width: f64,
+        height: f64,
+    },
+}
+
+// ============================================================
+// Layout Context
+// ============================================================
+
+pub struct LayoutContext {
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+    pub root_font_size: f64,
+    pub current_font_size: f64,
+}
+
+impl LayoutContext {
+    pub fn new(viewport_width: f64, viewport_height: f64) -> LayoutContext {
+        LayoutContext {
+            viewport_width,
+            viewport_height,
+            root_font_size: 16.0,
+            current_font_size: 16.0,
+        }
+    }
+
+    // Resolve a CSS dimension to pixels
+    pub fn resolve_length(&self, dim: &Dimension, containing: f64) -> f64 {
+        match dim {
+            Dimension::Length(px) => *px,
+            Dimension::Percentage(p) => containing * p / 100.0,
+            Dimension::Auto => 0.0,
+            _ => 0.0,
+        }
+    }
+}
+
+// ============================================================
+// Containing Block
+// ============================================================
+
+#[derive(Clone, Copy, Debug)]
+pub struct ContainingBlock {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ContainingBlock {
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> ContainingBlock {
+        ContainingBlock { x, y, width, height }
+    }
+
+    pub fn from_rect(rect: &Rect) -> ContainingBlock {
+        ContainingBlock {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+
+    pub fn from_dimensions(dims: &BoxDimensions) -> ContainingBlock {
+        let content = &dims.content;
+        ContainingBlock {
+            x: content.x,
+            y: content.y,
+            width: content.width,
+            height: content.height,
+        }
+    }
+}
+
+// ============================================================
+// Used Values
+// ============================================================
+
+// Resolve 'auto' margins for block-level elements
+pub fn resolve_auto_margins(
+    width: f64,
+    containing_width: f64,
+    margin_left: Dimension,
+    margin_right: Dimension,
+) -> (f64, f64) {
+    let available = containing_width - width;
+
+    match (margin_left, margin_right) {
+        (Dimension::Auto, Dimension::Auto) => {
+            // Center the element
+            let margin = available / 2.0;
+            (margin, margin)
+        },
+        (Dimension::Auto, Dimension::Length(mr)) => {
+            // Left margin takes remaining space
+            let ml = available - mr;
+            (ml.max(0.0), mr)
+        },
+        (Dimension::Length(ml), Dimension::Auto) => {
+            // Right margin takes remaining space
+            let mr = available - ml;
+            (ml, mr.max(0.0))
+        },
+        (Dimension::Length(ml), Dimension::Length(mr)) => {
+            // Both specified
+            (ml, mr)
+        },
+        _ => (0.0, 0.0),
+    }
+}
+
+// Calculate intrinsic size of content
+pub fn calculate_intrinsic_width(_children: &[LayoutBox], _ctx: &LayoutContext) -> f64 {
+    // Simplified: sum of children's widths
+    // In a full implementation, this would handle min/max content
+    0.0
+}
+
+pub fn calculate_intrinsic_height(children: &[LayoutBox], _ctx: &LayoutContext) -> f64 {
+    // Sum of children's heights for block layout
+    let mut height = 0.0;
+    for child in children {
+        height += child.dimensions.margin_box().height;
+    }
+    height
+}

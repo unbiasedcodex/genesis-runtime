@@ -397,6 +397,21 @@ pub fn cmd_help() {
     print_str(32, 32, 99, 117, 114, 108, 32, 60);  // "  curl <"
     print_str(117, 114, 108, 62, 0, 0, 0, 0);       // "url>"
     putchar(10);
+
+    // Graphics/Browser commands
+    putchar(10);
+    print_str(71, 114, 97, 112, 104, 105, 99, 115);  // "Graphics"
+    putchar(58);  // ":"
+    putchar(10);
+
+    // "  browser - Geb browser"
+    print_str(32, 32, 98, 114, 111, 119, 115, 101);  // "  browse"
+    print_str(114, 0, 0, 0, 0, 0, 0, 0);             // "r"
+    putchar(10);
+
+    // "  geb - alias for browser"
+    print_str(32, 32, 103, 101, 98, 0, 0, 0);  // "  geb"
+    putchar(10);
 }
 
 // Command: ps - show processes
@@ -2295,4 +2310,179 @@ fn http_write_u16_at(addr: i64, val: i64) {
             options(nostack, att_syntax)
         );
     }
+}
+
+// ============================================================================
+// Command: browser - Genesis Browser (Geb) Demo
+// Demonstrates browser UI using framebuffer graphics
+// ============================================================================
+
+pub fn cmd_browser() {
+    // Print to serial for debugging
+    runtime::print_str8(91, 71, 69, 66, 93, 32, 0, 0);  // "[GEB] "
+    runtime::print_str8(83, 84, 65, 82, 84, 10, 0, 0);  // "START\n"
+
+    // Get framebuffer info
+    // Query 0 returns width, query 1 returns height
+    let fb_width = runtime::fb_info(0);
+    let fb_height = runtime::fb_info(1);
+
+    runtime::print_str8(70, 66, 58, 0, 0, 0, 0, 0);  // "FB:"
+    runtime::print_num(fb_width);
+    runtime::print_char(120);  // 'x'
+    runtime::print_num(fb_height);
+    runtime::print_newline();
+
+    // Check if framebuffer is available
+    if fb_width <= 0 || fb_height <= 0 {
+        print_str(78, 79, 32, 70, 66, 0, 0, 0);  // "NO FB"
+        putchar(10);
+        return;
+    }
+
+    // Colors (ARGB format: 0xAARRGGBB)
+    let COLOR_BG: i64 = 0xFF2D2D2D;         // Dark gray background
+    let COLOR_TOOLBAR: i64 = 0xFF3C3C3C;    // Toolbar gray
+    let COLOR_TAB_BG: i64 = 0xFF4A4A4A;     // Tab background
+    let COLOR_TAB_ACTIVE: i64 = 0xFF5A5A5A; // Active tab
+    let COLOR_WHITE: i64 = 0xFFFFFFFF;      // White text
+    let COLOR_BLUE: i64 = 0xFF4285F4;       // Google blue
+    let COLOR_GREEN: i64 = 0xFF34A853;      // Green
+    let COLOR_ADDR_BG: i64 = 0xFF202020;    // Address bar background
+    let COLOR_CONTENT: i64 = 0xFFF5F5F5;    // Content area (light)
+
+    // Clear screen with background color
+    runtime::fb_clear(COLOR_BG);
+
+    // Draw tab bar (top 30 pixels)
+    runtime::fb_rect(0, 0, fb_width, 30, COLOR_TOOLBAR);
+
+    // Draw active tab
+    runtime::fb_rect(5, 5, 150, 25, COLOR_TAB_ACTIVE);
+
+    // Draw tab text "New Tab" at position (15, 12)
+    // N=78, e=101, w=119, space=32, T=84, a=97, b=98
+    runtime::fb_char(15, 12, 78, COLOR_WHITE);   // N
+    runtime::fb_char(23, 12, 101, COLOR_WHITE);  // e
+    runtime::fb_char(31, 12, 119, COLOR_WHITE);  // w
+    runtime::fb_char(39, 12, 32, COLOR_WHITE);   // space
+    runtime::fb_char(47, 12, 84, COLOR_WHITE);   // T
+    runtime::fb_char(55, 12, 97, COLOR_WHITE);   // a
+    runtime::fb_char(63, 12, 98, COLOR_WHITE);   // b
+
+    // Draw + button for new tab
+    runtime::fb_rect(160, 5, 25, 25, COLOR_TAB_BG);
+    runtime::fb_char(168, 12, 43, COLOR_WHITE);  // +
+
+    // Draw toolbar (below tabs, 40 pixels)
+    runtime::fb_rect(0, 30, fb_width, 40, COLOR_TOOLBAR);
+
+    // Draw back button
+    runtime::fb_rect(10, 38, 24, 24, COLOR_TAB_BG);
+    runtime::fb_char(17, 45, 60, COLOR_WHITE);   // <
+
+    // Draw forward button
+    runtime::fb_rect(40, 38, 24, 24, COLOR_TAB_BG);
+    runtime::fb_char(47, 45, 62, COLOR_WHITE);   // >
+
+    // Draw refresh button
+    runtime::fb_rect(70, 38, 24, 24, COLOR_TAB_BG);
+    runtime::fb_char(77, 45, 82, COLOR_WHITE);   // R (for Refresh)
+
+    // Draw address bar
+    let addr_x: i64 = 100;
+    let addr_w: i64 = fb_width - 120;
+    runtime::fb_rect(addr_x, 38, addr_w, 24, COLOR_ADDR_BG);
+
+    // Draw URL text "about:newtab"
+    // a=97, b=98, o=111, u=117, t=116, :=58, n=110, e=101, w=119
+    let mut cx: i64 = addr_x + 10;
+    runtime::fb_char(cx, 45, 97, COLOR_WHITE);  cx = cx + 8;  // a
+    runtime::fb_char(cx, 45, 98, COLOR_WHITE);  cx = cx + 8;  // b
+    runtime::fb_char(cx, 45, 111, COLOR_WHITE); cx = cx + 8;  // o
+    runtime::fb_char(cx, 45, 117, COLOR_WHITE); cx = cx + 8;  // u
+    runtime::fb_char(cx, 45, 116, COLOR_WHITE); cx = cx + 8;  // t
+    runtime::fb_char(cx, 45, 58, COLOR_WHITE);  cx = cx + 8;  // :
+    runtime::fb_char(cx, 45, 110, COLOR_WHITE); cx = cx + 8;  // n
+    runtime::fb_char(cx, 45, 101, COLOR_WHITE); cx = cx + 8;  // e
+    runtime::fb_char(cx, 45, 119, COLOR_WHITE); cx = cx + 8;  // w
+    runtime::fb_char(cx, 45, 116, COLOR_WHITE); cx = cx + 8;  // t
+    runtime::fb_char(cx, 45, 97, COLOR_WHITE);  cx = cx + 8;  // a
+    runtime::fb_char(cx, 45, 98, COLOR_WHITE);                // b
+
+    // Draw content area
+    runtime::fb_rect(0, 70, fb_width, fb_height - 70, COLOR_CONTENT);
+
+    // Draw browser title "Geb" centered
+    let title_x: i64 = (fb_width / 2) - 40;
+    let title_y: i64 = 150;
+    // Draw large "Geb" text
+    // G=71, e=101, b=98
+    runtime::fb_char(title_x, title_y, 71, COLOR_BLUE);
+    runtime::fb_char(title_x + 16, title_y, 101, COLOR_BLUE);
+    runtime::fb_char(title_x + 32, title_y, 98, COLOR_BLUE);
+
+    // Draw subtitle "Genesis Browser"
+    let sub_x: i64 = (fb_width / 2) - 60;
+    let sub_y: i64 = 180;
+    // G=71, e=101, n=110, e=101, s=115, i=105, s=115, space=32
+    // B=66, r=114, o=111, w=119, s=115, e=101, r=114
+    cx = sub_x;
+    runtime::fb_char(cx, sub_y, 71, COLOR_TAB_BG);  cx = cx + 8;  // G
+    runtime::fb_char(cx, sub_y, 101, COLOR_TAB_BG); cx = cx + 8;  // e
+    runtime::fb_char(cx, sub_y, 110, COLOR_TAB_BG); cx = cx + 8;  // n
+    runtime::fb_char(cx, sub_y, 101, COLOR_TAB_BG); cx = cx + 8;  // e
+    runtime::fb_char(cx, sub_y, 115, COLOR_TAB_BG); cx = cx + 8;  // s
+    runtime::fb_char(cx, sub_y, 105, COLOR_TAB_BG); cx = cx + 8;  // i
+    runtime::fb_char(cx, sub_y, 115, COLOR_TAB_BG); cx = cx + 8;  // s
+    runtime::fb_char(cx, sub_y, 32, COLOR_TAB_BG);  cx = cx + 8;  // space
+    runtime::fb_char(cx, sub_y, 66, COLOR_TAB_BG);  cx = cx + 8;  // B
+    runtime::fb_char(cx, sub_y, 114, COLOR_TAB_BG); cx = cx + 8;  // r
+    runtime::fb_char(cx, sub_y, 111, COLOR_TAB_BG); cx = cx + 8;  // o
+    runtime::fb_char(cx, sub_y, 119, COLOR_TAB_BG); cx = cx + 8;  // w
+    runtime::fb_char(cx, sub_y, 115, COLOR_TAB_BG); cx = cx + 8;  // s
+    runtime::fb_char(cx, sub_y, 101, COLOR_TAB_BG); cx = cx + 8;  // e
+    runtime::fb_char(cx, sub_y, 114, COLOR_TAB_BG);              // r
+
+    // Draw search box
+    let search_x: i64 = (fb_width / 2) - 150;
+    let search_y: i64 = 220;
+    runtime::fb_rect(search_x, search_y, 300, 30, COLOR_ADDR_BG);
+
+    // Draw placeholder text "Search or enter URL"
+    cx = search_x + 10;
+    // S=83, e=101, a=97, r=114, c=99, h=104
+    runtime::fb_char(cx, search_y + 10, 83, COLOR_TAB_BG);  cx = cx + 8;  // S
+    runtime::fb_char(cx, search_y + 10, 101, COLOR_TAB_BG); cx = cx + 8;  // e
+    runtime::fb_char(cx, search_y + 10, 97, COLOR_TAB_BG);  cx = cx + 8;  // a
+    runtime::fb_char(cx, search_y + 10, 114, COLOR_TAB_BG); cx = cx + 8;  // r
+    runtime::fb_char(cx, search_y + 10, 99, COLOR_TAB_BG);  cx = cx + 8;  // c
+    runtime::fb_char(cx, search_y + 10, 104, COLOR_TAB_BG); cx = cx + 8;  // h
+    runtime::fb_char(cx, search_y + 10, 46, COLOR_TAB_BG);  cx = cx + 8;  // .
+    runtime::fb_char(cx, search_y + 10, 46, COLOR_TAB_BG);  cx = cx + 8;  // .
+    runtime::fb_char(cx, search_y + 10, 46, COLOR_TAB_BG);               // .
+
+    // Draw status bar at bottom
+    let status_y: i64 = fb_height - 20;
+    runtime::fb_rect(0, status_y, fb_width, 20, COLOR_TOOLBAR);
+
+    // Status text "Ready"
+    // R=82, e=101, a=97, d=100, y=121
+    runtime::fb_char(10, status_y + 5, 82, COLOR_GREEN);   // R
+    runtime::fb_char(18, status_y + 5, 101, COLOR_GREEN);  // e
+    runtime::fb_char(26, status_y + 5, 97, COLOR_GREEN);   // a
+    runtime::fb_char(34, status_y + 5, 100, COLOR_GREEN);  // d
+    runtime::fb_char(42, status_y + 5, 121, COLOR_GREEN);  // y
+
+    // Swap buffers to display
+    runtime::fb_swap();
+
+    // Print success to serial
+    runtime::print_str8(91, 71, 69, 66, 93, 32, 0, 0);  // "[GEB] "
+    runtime::print_str8(68, 79, 78, 69, 10, 0, 0, 0);   // "DONE\n"
+
+    // Print message to VGA console
+    print_str(66, 114, 111, 119, 115, 101, 114, 32);  // "Browser "
+    print_str(85, 73, 32, 100, 114, 97, 119, 110);    // "UI drawn"
+    putchar(10);
 }

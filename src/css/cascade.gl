@@ -1,0 +1,1369 @@
+// CSS Cascade and Style Resolution
+// Implements the CSS cascade algorithm
+
+use super::selectors::{Selector, Specificity, AttributeSelector, AttributeMatcher, PseudoClass, NthExpr};
+use super::parser::{StyleRule, Declaration, Stylesheet};
+use super::values::{CssValue, Color, LengthUnit};
+
+// ============================================================
+// Computed Style
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct ComputedStyle {
+    // Display
+    pub display: Display,
+    pub position: Position,
+    pub float: Float,
+    pub clear: Clear,
+    pub visibility: Visibility,
+    pub overflow: Overflow,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    pub z_index: ZIndex,
+    pub opacity: f32,
+
+    // Box Model
+    pub width: Dimension,
+    pub height: Dimension,
+    pub min_width: Dimension,
+    pub min_height: Dimension,
+    pub max_width: Dimension,
+    pub max_height: Dimension,
+    pub margin_top: Dimension,
+    pub margin_right: Dimension,
+    pub margin_bottom: Dimension,
+    pub margin_left: Dimension,
+    pub padding_top: Dimension,
+    pub padding_right: Dimension,
+    pub padding_bottom: Dimension,
+    pub padding_left: Dimension,
+    pub border_top_width: f64,
+    pub border_right_width: f64,
+    pub border_bottom_width: f64,
+    pub border_left_width: f64,
+    pub border_top_style: BorderStyle,
+    pub border_right_style: BorderStyle,
+    pub border_bottom_style: BorderStyle,
+    pub border_left_style: BorderStyle,
+    pub border_top_color: Color,
+    pub border_right_color: Color,
+    pub border_bottom_color: Color,
+    pub border_left_color: Color,
+    pub border_radius_top_left: f64,
+    pub border_radius_top_right: f64,
+    pub border_radius_bottom_right: f64,
+    pub border_radius_bottom_left: f64,
+
+    // Positioning
+    pub top: Dimension,
+    pub right: Dimension,
+    pub bottom: Dimension,
+    pub left: Dimension,
+
+    // Background
+    pub background_color: Color,
+    pub background_image: Option<String>,
+    pub background_repeat: BackgroundRepeat,
+    pub background_position_x: Dimension,
+    pub background_position_y: Dimension,
+    pub background_size: BackgroundSize,
+
+    // Typography
+    pub color: Color,
+    pub font_family: Vec<String>,
+    pub font_size: f64,
+    pub font_weight: FontWeight,
+    pub font_style: FontStyle,
+    pub line_height: LineHeight,
+    pub text_align: TextAlign,
+    pub text_decoration: TextDecoration,
+    pub text_transform: TextTransform,
+    pub letter_spacing: f64,
+    pub word_spacing: f64,
+    pub white_space: WhiteSpace,
+    pub vertical_align: VerticalAlign,
+
+    // Flexbox
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    pub align_content: AlignContent,
+    pub align_self: AlignSelf,
+    pub flex_grow: f64,
+    pub flex_shrink: f64,
+    pub flex_basis: Dimension,
+    pub order: i32,
+
+    // Grid
+    pub grid_template_columns: Vec<GridTrack>,
+    pub grid_template_rows: Vec<GridTrack>,
+    pub grid_column_start: GridLine,
+    pub grid_column_end: GridLine,
+    pub grid_row_start: GridLine,
+    pub grid_row_end: GridLine,
+    pub grid_gap: f64,
+
+    // List
+    pub list_style_type: ListStyleType,
+    pub list_style_position: ListStylePosition,
+
+    // Table
+    pub table_layout: TableLayout,
+    pub border_collapse: BorderCollapse,
+    pub border_spacing: f64,
+
+    // Cursor
+    pub cursor: Cursor,
+    pub pointer_events: PointerEvents,
+
+    // Transform
+    pub transform: Option<String>,
+    pub transform_origin_x: Dimension,
+    pub transform_origin_y: Dimension,
+
+    // Transition
+    pub transition_property: Vec<String>,
+    pub transition_duration: Vec<f64>,
+    pub transition_timing_function: Vec<TimingFunction>,
+    pub transition_delay: Vec<f64>,
+
+    // Outline
+    pub outline_width: f64,
+    pub outline_style: BorderStyle,
+    pub outline_color: Color,
+    pub outline_offset: f64,
+
+    // Box shadow
+    pub box_shadow: Vec<BoxShadow>,
+
+    // Content
+    pub content: Option<String>,
+}
+
+// ============================================================
+// Style Value Types
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Display {
+    None,
+    Block,
+    Inline,
+    InlineBlock,
+    Flex,
+    InlineFlex,
+    Grid,
+    InlineGrid,
+    Table,
+    TableRow,
+    TableCell,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableColumn,
+    TableColumnGroup,
+    TableCaption,
+    ListItem,
+    Contents,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Float {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Clear {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Visibility {
+    Visible,
+    Hidden,
+    Collapse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Overflow {
+    Visible,
+    Hidden,
+    Scroll,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZIndex {
+    Auto,
+    Number(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dimension {
+    Auto,
+    Length(f64),
+    Percentage(f64),
+    MaxContent,
+    MinContent,
+    FitContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BorderStyle {
+    None,
+    Solid,
+    Dotted,
+    Dashed,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BackgroundRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+    Space,
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BackgroundSize {
+    Auto,
+    Cover,
+    Contain,
+    Size(Dimension, Dimension),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FontWeight {
+    Normal,
+    Bold,
+    Bolder,
+    Lighter,
+    Number(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FontStyle {
+    Normal,
+    Italic,
+    Oblique,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LineHeight {
+    Normal,
+    Number(f64),
+    Length(f64),
+    Percentage(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextAlign {
+    Left,
+    Right,
+    Center,
+    Justify,
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextDecoration {
+    None,
+    Underline,
+    Overline,
+    LineThrough,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextTransform {
+    None,
+    Capitalize,
+    Uppercase,
+    Lowercase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WhiteSpace {
+    Normal,
+    Nowrap,
+    Pre,
+    PreWrap,
+    PreLine,
+    BreakSpaces,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VerticalAlign {
+    Baseline,
+    Sub,
+    Super,
+    TextTop,
+    TextBottom,
+    Middle,
+    Top,
+    Bottom,
+    Length(f64),
+    Percentage(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FlexWrap {
+    Nowrap,
+    Wrap,
+    WrapReverse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JustifyContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlignItems {
+    FlexStart,
+    FlexEnd,
+    Center,
+    Baseline,
+    Stretch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlignContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    Stretch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlignSelf {
+    Auto,
+    FlexStart,
+    FlexEnd,
+    Center,
+    Baseline,
+    Stretch,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum GridTrack {
+    Auto,
+    Length(f64),
+    Percentage(f64),
+    Fr(f64),
+    MinContent,
+    MaxContent,
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GridLine {
+    Auto,
+    Number(i32),
+    Span(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListStyleType {
+    None,
+    Disc,
+    Circle,
+    Square,
+    Decimal,
+    DecimalLeadingZero,
+    LowerRoman,
+    UpperRoman,
+    LowerAlpha,
+    UpperAlpha,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListStylePosition {
+    Inside,
+    Outside,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TableLayout {
+    Auto,
+    Fixed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BorderCollapse {
+    Separate,
+    Collapse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cursor {
+    Auto,
+    Default,
+    Pointer,
+    Text,
+    Move,
+    Wait,
+    Help,
+    Crosshair,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    EResize,
+    NResize,
+    NeResize,
+    NwResize,
+    SResize,
+    SeResize,
+    SwResize,
+    WResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    ZoomIn,
+    ZoomOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerEvents {
+    Auto,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimingFunction {
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    Linear,
+    StepStart,
+    StepEnd,
+    CubicBezier(f64, f64, f64, f64),
+    Steps(u32, bool),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub blur: f64,
+    pub spread: f64,
+    pub color: Color,
+    pub inset: bool,
+}
+
+// ============================================================
+// Default Style
+// ============================================================
+
+impl ComputedStyle {
+    pub fn default() -> ComputedStyle {
+        ComputedStyle {
+            display: Display::Inline,
+            position: Position::Static,
+            float: Float::None,
+            clear: Clear::None,
+            visibility: Visibility::Visible,
+            overflow: Overflow::Visible,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
+            z_index: ZIndex::Auto,
+            opacity: 1.0,
+
+            width: Dimension::Auto,
+            height: Dimension::Auto,
+            min_width: Dimension::Auto,
+            min_height: Dimension::Auto,
+            max_width: Dimension::Auto,
+            max_height: Dimension::Auto,
+            margin_top: Dimension::Length(0.0),
+            margin_right: Dimension::Length(0.0),
+            margin_bottom: Dimension::Length(0.0),
+            margin_left: Dimension::Length(0.0),
+            padding_top: Dimension::Length(0.0),
+            padding_right: Dimension::Length(0.0),
+            padding_bottom: Dimension::Length(0.0),
+            padding_left: Dimension::Length(0.0),
+            border_top_width: 0.0,
+            border_right_width: 0.0,
+            border_bottom_width: 0.0,
+            border_left_width: 0.0,
+            border_top_style: BorderStyle::None,
+            border_right_style: BorderStyle::None,
+            border_bottom_style: BorderStyle::None,
+            border_left_style: BorderStyle::None,
+            border_top_color: Color::black(),
+            border_right_color: Color::black(),
+            border_bottom_color: Color::black(),
+            border_left_color: Color::black(),
+            border_radius_top_left: 0.0,
+            border_radius_top_right: 0.0,
+            border_radius_bottom_right: 0.0,
+            border_radius_bottom_left: 0.0,
+
+            top: Dimension::Auto,
+            right: Dimension::Auto,
+            bottom: Dimension::Auto,
+            left: Dimension::Auto,
+
+            background_color: Color::transparent(),
+            background_image: None,
+            background_repeat: BackgroundRepeat::Repeat,
+            background_position_x: Dimension::Percentage(0.0),
+            background_position_y: Dimension::Percentage(0.0),
+            background_size: BackgroundSize::Auto,
+
+            color: Color::black(),
+            font_family: vec!["sans-serif".to_string()],
+            font_size: 16.0,
+            font_weight: FontWeight::Normal,
+            font_style: FontStyle::Normal,
+            line_height: LineHeight::Normal,
+            text_align: TextAlign::Start,
+            text_decoration: TextDecoration::None,
+            text_transform: TextTransform::None,
+            letter_spacing: 0.0,
+            word_spacing: 0.0,
+            white_space: WhiteSpace::Normal,
+            vertical_align: VerticalAlign::Baseline,
+
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Nowrap,
+            justify_content: JustifyContent::FlexStart,
+            align_items: AlignItems::Stretch,
+            align_content: AlignContent::Stretch,
+            align_self: AlignSelf::Auto,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Auto,
+            order: 0,
+
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_column_start: GridLine::Auto,
+            grid_column_end: GridLine::Auto,
+            grid_row_start: GridLine::Auto,
+            grid_row_end: GridLine::Auto,
+            grid_gap: 0.0,
+
+            list_style_type: ListStyleType::Disc,
+            list_style_position: ListStylePosition::Outside,
+
+            table_layout: TableLayout::Auto,
+            border_collapse: BorderCollapse::Separate,
+            border_spacing: 0.0,
+
+            cursor: Cursor::Auto,
+            pointer_events: PointerEvents::Auto,
+
+            transform: None,
+            transform_origin_x: Dimension::Percentage(50.0),
+            transform_origin_y: Dimension::Percentage(50.0),
+
+            transition_property: Vec::new(),
+            transition_duration: Vec::new(),
+            transition_timing_function: Vec::new(),
+            transition_delay: Vec::new(),
+
+            outline_width: 0.0,
+            outline_style: BorderStyle::None,
+            outline_color: Color::black(),
+            outline_offset: 0.0,
+
+            box_shadow: Vec::new(),
+
+            content: None,
+        }
+    }
+}
+
+// ============================================================
+// Matched Rule
+// ============================================================
+
+#[derive(Clone)]
+pub struct MatchedRule {
+    pub specificity: Specificity,
+    pub declarations: Vec<Declaration>,
+    pub source_order: usize,
+}
+
+// ============================================================
+// Style Resolver
+// ============================================================
+
+pub struct StyleResolver {
+    stylesheets: Vec<Stylesheet>,
+    source_counter: usize,
+}
+
+impl StyleResolver {
+    pub fn new() -> StyleResolver {
+        StyleResolver {
+            stylesheets: Vec::new(),
+            source_counter: 0,
+        }
+    }
+
+    pub fn add_stylesheet(&mut self, stylesheet: Stylesheet) {
+        self.stylesheets.push(stylesheet);
+    }
+
+    // Resolve style for an element (simplified - needs DOM context)
+    pub fn resolve_style(&mut self, matched_rules: &[MatchedRule]) -> ComputedStyle {
+        let mut style = ComputedStyle::default();
+
+        // Sort rules by specificity and source order
+        let mut sorted_rules = matched_rules.to_vec();
+        sorted_rules.sort_by(|a, b| {
+            match a.specificity.compare(&b.specificity) {
+                std::cmp::Ordering::Equal => a.source_order.cmp(&b.source_order),
+                other => other,
+            }
+        });
+
+        // Apply declarations in order (later declarations win)
+        for rule in sorted_rules {
+            for decl in &rule.declarations {
+                self.apply_declaration(&mut style, decl);
+            }
+        }
+
+        style
+    }
+
+    fn apply_declaration(&self, style: &mut ComputedStyle, decl: &Declaration) {
+        let value = &decl.value;
+        if value.is_empty() {
+            return;
+        }
+
+        match decl.property.as_str() {
+            "display" => {
+                if let Some(d) = parse_display(&value[0]) {
+                    style.display = d;
+                }
+            },
+            "position" => {
+                if let Some(p) = parse_position(&value[0]) {
+                    style.position = p;
+                }
+            },
+            "float" => {
+                if let Some(f) = parse_float(&value[0]) {
+                    style.float = f;
+                }
+            },
+            "clear" => {
+                if let Some(c) = parse_clear(&value[0]) {
+                    style.clear = c;
+                }
+            },
+            "visibility" => {
+                if let Some(v) = parse_visibility(&value[0]) {
+                    style.visibility = v;
+                }
+            },
+            "overflow" => {
+                if let Some(o) = parse_overflow(&value[0]) {
+                    style.overflow = o;
+                    style.overflow_x = o;
+                    style.overflow_y = o;
+                }
+            },
+            "overflow-x" => {
+                if let Some(o) = parse_overflow(&value[0]) {
+                    style.overflow_x = o;
+                }
+            },
+            "overflow-y" => {
+                if let Some(o) = parse_overflow(&value[0]) {
+                    style.overflow_y = o;
+                }
+            },
+            "z-index" => {
+                style.z_index = parse_z_index(&value[0]);
+            },
+            "opacity" => {
+                if let CssValue::Number(n) = &value[0] {
+                    style.opacity = (*n as f32).max(0.0).min(1.0);
+                }
+            },
+            "width" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.width = d;
+                }
+            },
+            "height" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.height = d;
+                }
+            },
+            "min-width" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.min_width = d;
+                }
+            },
+            "min-height" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.min_height = d;
+                }
+            },
+            "max-width" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.max_width = d;
+                }
+            },
+            "max-height" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.max_height = d;
+                }
+            },
+            "margin" => {
+                apply_box_shorthand(value, |t, r, b, l| {
+                    style.margin_top = t;
+                    style.margin_right = r;
+                    style.margin_bottom = b;
+                    style.margin_left = l;
+                });
+            },
+            "margin-top" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.margin_top = d;
+                }
+            },
+            "margin-right" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.margin_right = d;
+                }
+            },
+            "margin-bottom" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.margin_bottom = d;
+                }
+            },
+            "margin-left" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.margin_left = d;
+                }
+            },
+            "padding" => {
+                apply_box_shorthand(value, |t, r, b, l| {
+                    style.padding_top = t;
+                    style.padding_right = r;
+                    style.padding_bottom = b;
+                    style.padding_left = l;
+                });
+            },
+            "padding-top" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.padding_top = d;
+                }
+            },
+            "padding-right" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.padding_right = d;
+                }
+            },
+            "padding-bottom" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.padding_bottom = d;
+                }
+            },
+            "padding-left" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.padding_left = d;
+                }
+            },
+            "border-width" => {
+                if let Some(w) = parse_border_width(&value[0]) {
+                    style.border_top_width = w;
+                    style.border_right_width = w;
+                    style.border_bottom_width = w;
+                    style.border_left_width = w;
+                }
+            },
+            "border-top-width" => {
+                if let Some(w) = parse_border_width(&value[0]) {
+                    style.border_top_width = w;
+                }
+            },
+            "border-style" => {
+                if let Some(s) = parse_border_style(&value[0]) {
+                    style.border_top_style = s;
+                    style.border_right_style = s;
+                    style.border_bottom_style = s;
+                    style.border_left_style = s;
+                }
+            },
+            "border-color" => {
+                if let CssValue::Color(c) = &value[0] {
+                    style.border_top_color = *c;
+                    style.border_right_color = *c;
+                    style.border_bottom_color = *c;
+                    style.border_left_color = *c;
+                }
+            },
+            "border-radius" => {
+                if let Some(r) = parse_length(&value[0]) {
+                    style.border_radius_top_left = r;
+                    style.border_radius_top_right = r;
+                    style.border_radius_bottom_right = r;
+                    style.border_radius_bottom_left = r;
+                }
+            },
+            "top" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.top = d;
+                }
+            },
+            "right" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.right = d;
+                }
+            },
+            "bottom" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.bottom = d;
+                }
+            },
+            "left" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.left = d;
+                }
+            },
+            "background-color" => {
+                if let CssValue::Color(c) = &value[0] {
+                    style.background_color = *c;
+                }
+            },
+            "background-image" => {
+                if let CssValue::Url(url) = &value[0] {
+                    style.background_image = Some(url.clone());
+                } else if matches!(&value[0], CssValue::None) {
+                    style.background_image = None;
+                }
+            },
+            "color" => {
+                if let CssValue::Color(c) = &value[0] {
+                    style.color = *c;
+                }
+            },
+            "font-family" => {
+                style.font_family = parse_font_family(value);
+            },
+            "font-size" => {
+                if let Some(s) = parse_font_size(&value[0]) {
+                    style.font_size = s;
+                }
+            },
+            "font-weight" => {
+                if let Some(w) = parse_font_weight(&value[0]) {
+                    style.font_weight = w;
+                }
+            },
+            "font-style" => {
+                if let Some(s) = parse_font_style(&value[0]) {
+                    style.font_style = s;
+                }
+            },
+            "line-height" => {
+                if let Some(lh) = parse_line_height(&value[0]) {
+                    style.line_height = lh;
+                }
+            },
+            "text-align" => {
+                if let Some(ta) = parse_text_align(&value[0]) {
+                    style.text_align = ta;
+                }
+            },
+            "text-decoration" => {
+                if let Some(td) = parse_text_decoration(&value[0]) {
+                    style.text_decoration = td;
+                }
+            },
+            "text-transform" => {
+                if let Some(tt) = parse_text_transform(&value[0]) {
+                    style.text_transform = tt;
+                }
+            },
+            "white-space" => {
+                if let Some(ws) = parse_white_space(&value[0]) {
+                    style.white_space = ws;
+                }
+            },
+            "flex-direction" => {
+                if let Some(fd) = parse_flex_direction(&value[0]) {
+                    style.flex_direction = fd;
+                }
+            },
+            "flex-wrap" => {
+                if let Some(fw) = parse_flex_wrap(&value[0]) {
+                    style.flex_wrap = fw;
+                }
+            },
+            "justify-content" => {
+                if let Some(jc) = parse_justify_content(&value[0]) {
+                    style.justify_content = jc;
+                }
+            },
+            "align-items" => {
+                if let Some(ai) = parse_align_items(&value[0]) {
+                    style.align_items = ai;
+                }
+            },
+            "flex-grow" => {
+                if let CssValue::Number(n) = &value[0] {
+                    style.flex_grow = *n;
+                }
+            },
+            "flex-shrink" => {
+                if let CssValue::Number(n) = &value[0] {
+                    style.flex_shrink = *n;
+                }
+            },
+            "flex-basis" => {
+                if let Some(d) = parse_dimension(&value[0]) {
+                    style.flex_basis = d;
+                }
+            },
+            "order" => {
+                if let CssValue::Number(n) = &value[0] {
+                    style.order = *n as i32;
+                }
+            },
+            "cursor" => {
+                if let Some(c) = parse_cursor(&value[0]) {
+                    style.cursor = c;
+                }
+            },
+            "pointer-events" => {
+                if let CssValue::Keyword(k) = &value[0] {
+                    style.pointer_events = match k.as_str() {
+                        "none" => PointerEvents::None,
+                        _ => PointerEvents::Auto,
+                    };
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+// ============================================================
+// Value Parsing Helpers
+// ============================================================
+
+fn parse_display(value: &CssValue) -> Option<Display> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "none" => Some(Display::None),
+            "block" => Some(Display::Block),
+            "inline" => Some(Display::Inline),
+            "inline-block" => Some(Display::InlineBlock),
+            "flex" => Some(Display::Flex),
+            "inline-flex" => Some(Display::InlineFlex),
+            "grid" => Some(Display::Grid),
+            "inline-grid" => Some(Display::InlineGrid),
+            "table" => Some(Display::Table),
+            "table-row" => Some(Display::TableRow),
+            "table-cell" => Some(Display::TableCell),
+            "list-item" => Some(Display::ListItem),
+            "contents" => Some(Display::Contents),
+            _ => None,
+        },
+        CssValue::None => Some(Display::None),
+        _ => None,
+    }
+}
+
+fn parse_position(value: &CssValue) -> Option<Position> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "static" => Some(Position::Static),
+            "relative" => Some(Position::Relative),
+            "absolute" => Some(Position::Absolute),
+            "fixed" => Some(Position::Fixed),
+            "sticky" => Some(Position::Sticky),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_float(value: &CssValue) -> Option<Float> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "left" => Some(Float::Left),
+            "right" => Some(Float::Right),
+            _ => Some(Float::None),
+        },
+        CssValue::None => Some(Float::None),
+        _ => None,
+    }
+}
+
+fn parse_clear(value: &CssValue) -> Option<Clear> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "left" => Some(Clear::Left),
+            "right" => Some(Clear::Right),
+            "both" => Some(Clear::Both),
+            _ => Some(Clear::None),
+        },
+        CssValue::None => Some(Clear::None),
+        _ => None,
+    }
+}
+
+fn parse_visibility(value: &CssValue) -> Option<Visibility> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "visible" => Some(Visibility::Visible),
+            "hidden" => Some(Visibility::Hidden),
+            "collapse" => Some(Visibility::Collapse),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_overflow(value: &CssValue) -> Option<Overflow> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "visible" => Some(Overflow::Visible),
+            "hidden" => Some(Overflow::Hidden),
+            "scroll" => Some(Overflow::Scroll),
+            "auto" => Some(Overflow::Auto),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_z_index(value: &CssValue) -> ZIndex {
+    match value {
+        CssValue::Number(n) => ZIndex::Number(*n as i32),
+        CssValue::Auto => ZIndex::Auto,
+        _ => ZIndex::Auto,
+    }
+}
+
+fn parse_dimension(value: &CssValue) -> Option<Dimension> {
+    match value {
+        CssValue::Auto => Some(Dimension::Auto),
+        CssValue::Length(n, _) => Some(Dimension::Length(*n)),
+        CssValue::Percentage(n) => Some(Dimension::Percentage(*n)),
+        CssValue::Number(n) if *n == 0.0 => Some(Dimension::Length(0.0)),
+        CssValue::Keyword(k) => match k.as_str() {
+            "max-content" => Some(Dimension::MaxContent),
+            "min-content" => Some(Dimension::MinContent),
+            "fit-content" => Some(Dimension::FitContent),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_length(value: &CssValue) -> Option<f64> {
+    match value {
+        CssValue::Length(n, _) => Some(*n),
+        CssValue::Number(n) if *n == 0.0 => Some(0.0),
+        _ => None,
+    }
+}
+
+fn parse_border_width(value: &CssValue) -> Option<f64> {
+    match value {
+        CssValue::Length(n, _) => Some(*n),
+        CssValue::Number(n) if *n == 0.0 => Some(0.0),
+        CssValue::Keyword(k) => match k.as_str() {
+            "thin" => Some(1.0),
+            "medium" => Some(3.0),
+            "thick" => Some(5.0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_border_style(value: &CssValue) -> Option<BorderStyle> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "none" => Some(BorderStyle::None),
+            "solid" => Some(BorderStyle::Solid),
+            "dotted" => Some(BorderStyle::Dotted),
+            "dashed" => Some(BorderStyle::Dashed),
+            "double" => Some(BorderStyle::Double),
+            "groove" => Some(BorderStyle::Groove),
+            "ridge" => Some(BorderStyle::Ridge),
+            "inset" => Some(BorderStyle::Inset),
+            "outset" => Some(BorderStyle::Outset),
+            "hidden" => Some(BorderStyle::Hidden),
+            _ => None,
+        },
+        CssValue::None => Some(BorderStyle::None),
+        _ => None,
+    }
+}
+
+fn parse_font_family(values: &[CssValue]) -> Vec<String> {
+    let mut families = Vec::new();
+    for v in values {
+        match v {
+            CssValue::String(s) | CssValue::Keyword(s) => {
+                families.push(s.clone());
+            },
+            _ => {}
+        }
+    }
+    if families.is_empty() {
+        families.push("sans-serif".to_string());
+    }
+    families
+}
+
+fn parse_font_size(value: &CssValue) -> Option<f64> {
+    match value {
+        CssValue::Length(n, _) => Some(*n),
+        CssValue::Percentage(n) => Some(*n * 16.0 / 100.0), // Relative to 16px default
+        CssValue::Keyword(k) => match k.as_str() {
+            "xx-small" => Some(9.0),
+            "x-small" => Some(10.0),
+            "small" => Some(13.0),
+            "medium" => Some(16.0),
+            "large" => Some(18.0),
+            "x-large" => Some(24.0),
+            "xx-large" => Some(32.0),
+            "smaller" => Some(13.0),
+            "larger" => Some(19.0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_font_weight(value: &CssValue) -> Option<FontWeight> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "normal" => Some(FontWeight::Normal),
+            "bold" => Some(FontWeight::Bold),
+            "bolder" => Some(FontWeight::Bolder),
+            "lighter" => Some(FontWeight::Lighter),
+            _ => None,
+        },
+        CssValue::Number(n) => Some(FontWeight::Number(*n as u32)),
+        _ => None,
+    }
+}
+
+fn parse_font_style(value: &CssValue) -> Option<FontStyle> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "normal" => Some(FontStyle::Normal),
+            "italic" => Some(FontStyle::Italic),
+            "oblique" => Some(FontStyle::Oblique),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_line_height(value: &CssValue) -> Option<LineHeight> {
+    match value {
+        CssValue::Keyword(k) if k == "normal" => Some(LineHeight::Normal),
+        CssValue::Number(n) => Some(LineHeight::Number(*n)),
+        CssValue::Length(n, _) => Some(LineHeight::Length(*n)),
+        CssValue::Percentage(n) => Some(LineHeight::Percentage(*n)),
+        _ => None,
+    }
+}
+
+fn parse_text_align(value: &CssValue) -> Option<TextAlign> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "left" => Some(TextAlign::Left),
+            "right" => Some(TextAlign::Right),
+            "center" => Some(TextAlign::Center),
+            "justify" => Some(TextAlign::Justify),
+            "start" => Some(TextAlign::Start),
+            "end" => Some(TextAlign::End),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_text_decoration(value: &CssValue) -> Option<TextDecoration> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "underline" => Some(TextDecoration::Underline),
+            "overline" => Some(TextDecoration::Overline),
+            "line-through" => Some(TextDecoration::LineThrough),
+            _ => Some(TextDecoration::None),
+        },
+        CssValue::None => Some(TextDecoration::None),
+        _ => None,
+    }
+}
+
+fn parse_text_transform(value: &CssValue) -> Option<TextTransform> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "capitalize" => Some(TextTransform::Capitalize),
+            "uppercase" => Some(TextTransform::Uppercase),
+            "lowercase" => Some(TextTransform::Lowercase),
+            _ => Some(TextTransform::None),
+        },
+        CssValue::None => Some(TextTransform::None),
+        _ => None,
+    }
+}
+
+fn parse_white_space(value: &CssValue) -> Option<WhiteSpace> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "normal" => Some(WhiteSpace::Normal),
+            "nowrap" => Some(WhiteSpace::Nowrap),
+            "pre" => Some(WhiteSpace::Pre),
+            "pre-wrap" => Some(WhiteSpace::PreWrap),
+            "pre-line" => Some(WhiteSpace::PreLine),
+            "break-spaces" => Some(WhiteSpace::BreakSpaces),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_flex_direction(value: &CssValue) -> Option<FlexDirection> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "row" => Some(FlexDirection::Row),
+            "row-reverse" => Some(FlexDirection::RowReverse),
+            "column" => Some(FlexDirection::Column),
+            "column-reverse" => Some(FlexDirection::ColumnReverse),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_flex_wrap(value: &CssValue) -> Option<FlexWrap> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "nowrap" => Some(FlexWrap::Nowrap),
+            "wrap" => Some(FlexWrap::Wrap),
+            "wrap-reverse" => Some(FlexWrap::WrapReverse),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_justify_content(value: &CssValue) -> Option<JustifyContent> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "flex-start" | "start" => Some(JustifyContent::FlexStart),
+            "flex-end" | "end" => Some(JustifyContent::FlexEnd),
+            "center" => Some(JustifyContent::Center),
+            "space-between" => Some(JustifyContent::SpaceBetween),
+            "space-around" => Some(JustifyContent::SpaceAround),
+            "space-evenly" => Some(JustifyContent::SpaceEvenly),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_align_items(value: &CssValue) -> Option<AlignItems> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "flex-start" | "start" => Some(AlignItems::FlexStart),
+            "flex-end" | "end" => Some(AlignItems::FlexEnd),
+            "center" => Some(AlignItems::Center),
+            "baseline" => Some(AlignItems::Baseline),
+            "stretch" => Some(AlignItems::Stretch),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_cursor(value: &CssValue) -> Option<Cursor> {
+    match value {
+        CssValue::Keyword(k) => match k.as_str() {
+            "auto" => Some(Cursor::Auto),
+            "default" => Some(Cursor::Default),
+            "pointer" => Some(Cursor::Pointer),
+            "text" => Some(Cursor::Text),
+            "move" => Some(Cursor::Move),
+            "wait" => Some(Cursor::Wait),
+            "help" => Some(Cursor::Help),
+            "crosshair" => Some(Cursor::Crosshair),
+            "not-allowed" => Some(Cursor::NotAllowed),
+            "grab" => Some(Cursor::Grab),
+            "grabbing" => Some(Cursor::Grabbing),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn apply_box_shorthand<F>(values: &[CssValue], mut apply: F)
+where
+    F: FnMut(Dimension, Dimension, Dimension, Dimension),
+{
+    let dims: Vec<Dimension> = values.iter()
+        .filter_map(|v| parse_dimension(v))
+        .collect();
+
+    match dims.len() {
+        1 => apply(dims[0], dims[0], dims[0], dims[0]),
+        2 => apply(dims[0], dims[1], dims[0], dims[1]),
+        3 => apply(dims[0], dims[1], dims[2], dims[1]),
+        4 => apply(dims[0], dims[1], dims[2], dims[3]),
+        _ => {}
+    }
+}

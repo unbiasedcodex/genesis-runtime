@@ -1,0 +1,1767 @@
+// JavaScript DOM Bindings
+// Bridge between JavaScript runtime and HTML DOM
+
+use super::interpreter::{
+    Interpreter, JsValue, JsObject, JsFunction, JsError, PropertyDescriptor,
+    ObjectInternal, FunctionBody, ThisMode, Scope,
+};
+use super::parser::Pattern;
+use super::super::html::{Document, Node, NodeType, NodeData};
+use super::super::css::Stylesheet;
+
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// ============================================================
+// DOM Bridge
+// ============================================================
+
+pub struct DomBridge {
+    pub document: Rc<RefCell<Document>>,
+    pub stylesheets: Vec<Stylesheet>,
+    pub event_listeners: HashMap<usize, Vec<EventListener>>,
+    pub timers: Vec<Timer>,
+    pub next_timer_id: u64,
+}
+
+pub struct EventListener {
+    pub event_type: String,
+    pub callback: Rc<JsFunction>,
+    pub capture: bool,
+}
+
+pub struct Timer {
+    pub id: u64,
+    pub callback: Rc<JsFunction>,
+    pub interval_ms: u64,
+    pub is_interval: bool,
+    pub next_fire: u64,
+}
+
+impl DomBridge {
+    pub fn new(document: Document) -> DomBridge {
+        DomBridge {
+            document: Rc::new(RefCell::new(document)),
+            stylesheets: Vec::new(),
+            event_listeners: HashMap::new(),
+            timers: Vec::new(),
+            next_timer_id: 1,
+        }
+    }
+
+    pub fn add_stylesheet(&mut self, stylesheet: Stylesheet) {
+        self.stylesheets.push(stylesheet);
+    }
+}
+
+// ============================================================
+// DOM Registration
+// ============================================================
+
+pub fn register_dom_apis(interp: &mut Interpreter, bridge: Rc<RefCell<DomBridge>>) {
+    // Create document object
+    let document = create_document_object(interp, bridge.clone());
+    interp.define_global("document", document);
+
+    // Create window object (alias for global + DOM APIs)
+    let window = create_window_object(interp, bridge.clone());
+    interp.define_global("window", window.clone());
+
+    // Also set window as global 'self'
+    interp.define_global("self", window);
+
+    // Register DOM constructors
+    register_dom_constructors(interp, bridge);
+}
+
+// ============================================================
+// Document Object
+// ============================================================
+
+fn create_document_object(interp: &Interpreter, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut doc_obj = JsObject::new();
+
+    // document.getElementById
+    let bridge_clone = bridge.clone();
+    doc_obj.set("getElementById".to_string(), create_native_dom_function(
+        "getElementById",
+        move |_interp, _this, args| {
+            let id = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            if let Some(node_idx) = find_element_by_id(&document, &id) {
+                Ok(create_element_object(node_idx, bridge_clone.clone()))
+            } else {
+                Ok(JsValue::Null)
+            }
+        },
+    ));
+
+    // document.getElementsByTagName
+    let bridge_clone = bridge.clone();
+    doc_obj.set("getElementsByTagName".to_string(), create_native_dom_function(
+        "getElementsByTagName",
+        move |_interp, _this, args| {
+            let tag_name = args.get(0).map(|v| v.to_string().to_lowercase()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            let elements = find_elements_by_tag_name(&document, &tag_name);
+            let js_elements: Vec<JsValue> = elements.iter()
+                .map(|&idx| create_element_object(idx, bridge_clone.clone()))
+                .collect();
+
+            Ok(JsValue::Array(Rc::new(RefCell::new(js_elements))))
+        },
+    ));
+
+    // document.getElementsByClassName
+    let bridge_clone = bridge.clone();
+    doc_obj.set("getElementsByClassName".to_string(), create_native_dom_function(
+        "getElementsByClassName",
+        move |_interp, _this, args| {
+            let class_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            let elements = find_elements_by_class_name(&document, &class_name);
+            let js_elements: Vec<JsValue> = elements.iter()
+                .map(|&idx| create_element_object(idx, bridge_clone.clone()))
+                .collect();
+
+            Ok(JsValue::Array(Rc::new(RefCell::new(js_elements))))
+        },
+    ));
+
+    // document.querySelector
+    let bridge_clone = bridge.clone();
+    doc_obj.set("querySelector".to_string(), create_native_dom_function(
+        "querySelector",
+        move |_interp, _this, args| {
+            let selector = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            if let Some(node_idx) = query_selector(&document, &selector) {
+                Ok(create_element_object(node_idx, bridge_clone.clone()))
+            } else {
+                Ok(JsValue::Null)
+            }
+        },
+    ));
+
+    // document.querySelectorAll
+    let bridge_clone = bridge.clone();
+    doc_obj.set("querySelectorAll".to_string(), create_native_dom_function(
+        "querySelectorAll",
+        move |_interp, _this, args| {
+            let selector = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            let elements = query_selector_all(&document, &selector);
+            let js_elements: Vec<JsValue> = elements.iter()
+                .map(|&idx| create_element_object(idx, bridge_clone.clone()))
+                .collect();
+
+            Ok(create_node_list(js_elements))
+        },
+    ));
+
+    // document.createElement
+    let bridge_clone = bridge.clone();
+    doc_obj.set("createElement".to_string(), create_native_dom_function(
+        "createElement",
+        move |_interp, _this, args| {
+            let tag_name = args.get(0).map(|v| v.to_string().to_lowercase()).unwrap_or_default();
+            let mut doc = bridge_clone.borrow_mut();
+            let mut document = doc.document.borrow_mut();
+
+            let node_idx = document.create_element(&tag_name);
+            Ok(create_element_object(node_idx, bridge_clone.clone()))
+        },
+    ));
+
+    // document.createTextNode
+    let bridge_clone = bridge.clone();
+    doc_obj.set("createTextNode".to_string(), create_native_dom_function(
+        "createTextNode",
+        move |_interp, _this, args| {
+            let text = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let mut doc = bridge_clone.borrow_mut();
+            let mut document = doc.document.borrow_mut();
+
+            let node_idx = document.create_text_node(&text);
+            Ok(create_text_node_object(node_idx, bridge_clone.clone()))
+        },
+    ));
+
+    // document.createDocumentFragment
+    let bridge_clone = bridge.clone();
+    doc_obj.set("createDocumentFragment".to_string(), create_native_dom_function(
+        "createDocumentFragment",
+        move |_interp, _this, _args| {
+            let mut doc = bridge_clone.borrow_mut();
+            let mut document = doc.document.borrow_mut();
+
+            let node_idx = document.create_document_fragment();
+            Ok(create_element_object(node_idx, bridge_clone.clone()))
+        },
+    ));
+
+    // document.body
+    let bridge_clone = bridge.clone();
+    doc_obj.properties.insert("body".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined, // Will be computed
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(body_idx) = find_element_by_tag_name(&document, "body") {
+                Ok(create_element_object(body_idx, bridge_clone.clone()))
+            } else {
+                Ok(JsValue::Null)
+            }
+        }))),
+        setter: None,
+    });
+
+    // document.head
+    let bridge_clone = bridge.clone();
+    doc_obj.properties.insert("head".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(head_idx) = find_element_by_tag_name(&document, "head") {
+                Ok(create_element_object(head_idx, bridge_clone.clone()))
+            } else {
+                Ok(JsValue::Null)
+            }
+        }))),
+        setter: None,
+    });
+
+    // document.documentElement
+    let bridge_clone = bridge.clone();
+    doc_obj.properties.insert("documentElement".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(root_idx) = document.document_element {
+                Ok(create_element_object(root_idx, bridge_clone.clone()))
+            } else {
+                Ok(JsValue::Null)
+            }
+        }))),
+        setter: None,
+    });
+
+    // document.title
+    let bridge_clone = bridge.clone();
+    doc_obj.properties.insert("title".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            Ok(JsValue::String(get_document_title(&document)))
+        }))),
+        setter: None,
+    });
+
+    // document.cookie
+    doc_obj.set("cookie".to_string(), JsValue::String(String::new()));
+
+    // document.readyState
+    doc_obj.set("readyState".to_string(), JsValue::String("complete".to_string()));
+
+    // document.location
+    let bridge_clone = bridge.clone();
+    doc_obj.set("location".to_string(), create_location_object(bridge_clone));
+
+    JsValue::Object(Rc::new(RefCell::new(doc_obj)))
+}
+
+// ============================================================
+// Window Object
+// ============================================================
+
+fn create_window_object(interp: &Interpreter, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut window_obj = JsObject::new();
+
+    // window.alert
+    window_obj.set("alert".to_string(), create_native_dom_function(
+        "alert",
+        |_interp, _this, args| {
+            let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            println!("Alert: {}", message);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // window.confirm
+    window_obj.set("confirm".to_string(), create_native_dom_function(
+        "confirm",
+        |_interp, _this, args| {
+            let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            println!("Confirm: {}", message);
+            // In a real implementation, would wait for user input
+            Ok(JsValue::Boolean(true))
+        },
+    ));
+
+    // window.prompt
+    window_obj.set("prompt".to_string(), create_native_dom_function(
+        "prompt",
+        |_interp, _this, args| {
+            let message = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let default = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            println!("Prompt: {} (default: {})", message, default);
+            // Would return user input
+            Ok(JsValue::String(default))
+        },
+    ));
+
+    // window.setTimeout
+    let bridge_clone = bridge.clone();
+    window_obj.set("setTimeout".to_string(), create_native_dom_function(
+        "setTimeout",
+        move |_interp, _this, args| {
+            let callback = match args.get(0) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Number(0.0)),
+            };
+            let delay_ms = args.get(1).map(|v| v.to_number() as u64).unwrap_or(0);
+
+            let mut bridge = bridge_clone.borrow_mut();
+            let id = bridge.next_timer_id;
+            bridge.next_timer_id += 1;
+
+            bridge.timers.push(Timer {
+                id,
+                callback,
+                interval_ms: delay_ms,
+                is_interval: false,
+                next_fire: get_current_time_ms() + delay_ms,
+            });
+
+            Ok(JsValue::Number(id as f64))
+        },
+    ));
+
+    // window.setInterval
+    let bridge_clone = bridge.clone();
+    window_obj.set("setInterval".to_string(), create_native_dom_function(
+        "setInterval",
+        move |_interp, _this, args| {
+            let callback = match args.get(0) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Number(0.0)),
+            };
+            let interval_ms = args.get(1).map(|v| v.to_number() as u64).unwrap_or(0);
+
+            let mut bridge = bridge_clone.borrow_mut();
+            let id = bridge.next_timer_id;
+            bridge.next_timer_id += 1;
+
+            bridge.timers.push(Timer {
+                id,
+                callback,
+                interval_ms,
+                is_interval: true,
+                next_fire: get_current_time_ms() + interval_ms,
+            });
+
+            Ok(JsValue::Number(id as f64))
+        },
+    ));
+
+    // window.clearTimeout / window.clearInterval
+    let bridge_clone = bridge.clone();
+    window_obj.set("clearTimeout".to_string(), create_native_dom_function(
+        "clearTimeout",
+        move |_interp, _this, args| {
+            let id = args.get(0).map(|v| v.to_number() as u64).unwrap_or(0);
+            let mut bridge = bridge_clone.borrow_mut();
+            bridge.timers.retain(|t| t.id != id);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    let bridge_clone = bridge.clone();
+    window_obj.set("clearInterval".to_string(), create_native_dom_function(
+        "clearInterval",
+        move |_interp, _this, args| {
+            let id = args.get(0).map(|v| v.to_number() as u64).unwrap_or(0);
+            let mut bridge = bridge_clone.borrow_mut();
+            bridge.timers.retain(|t| t.id != id);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // window.requestAnimationFrame
+    let bridge_clone = bridge.clone();
+    window_obj.set("requestAnimationFrame".to_string(), create_native_dom_function(
+        "requestAnimationFrame",
+        move |_interp, _this, args| {
+            let callback = match args.get(0) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Number(0.0)),
+            };
+
+            let mut bridge = bridge_clone.borrow_mut();
+            let id = bridge.next_timer_id;
+            bridge.next_timer_id += 1;
+
+            // ~16ms for 60fps
+            bridge.timers.push(Timer {
+                id,
+                callback,
+                interval_ms: 16,
+                is_interval: false,
+                next_fire: get_current_time_ms() + 16,
+            });
+
+            Ok(JsValue::Number(id as f64))
+        },
+    ));
+
+    // window.cancelAnimationFrame
+    let bridge_clone = bridge.clone();
+    window_obj.set("cancelAnimationFrame".to_string(), create_native_dom_function(
+        "cancelAnimationFrame",
+        move |_interp, _this, args| {
+            let id = args.get(0).map(|v| v.to_number() as u64).unwrap_or(0);
+            let mut bridge = bridge_clone.borrow_mut();
+            bridge.timers.retain(|t| t.id != id);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // window.addEventListener
+    let bridge_clone = bridge.clone();
+    window_obj.set("addEventListener".to_string(), create_native_dom_function(
+        "addEventListener",
+        move |_interp, _this, args| {
+            let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let callback = match args.get(1) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Undefined),
+            };
+
+            let mut bridge = bridge_clone.borrow_mut();
+            bridge.event_listeners
+                .entry(0) // 0 = window
+                .or_insert_with(Vec::new)
+                .push(EventListener {
+                    event_type,
+                    callback,
+                    capture: false,
+                });
+
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // window.removeEventListener
+    let bridge_clone = bridge.clone();
+    window_obj.set("removeEventListener".to_string(), create_native_dom_function(
+        "removeEventListener",
+        move |_interp, _this, args| {
+            let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+
+            let mut bridge = bridge_clone.borrow_mut();
+            if let Some(listeners) = bridge.event_listeners.get_mut(&0) {
+                listeners.retain(|l| l.event_type != event_type);
+            }
+
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // window.innerWidth / window.innerHeight
+    window_obj.set("innerWidth".to_string(), JsValue::Number(1024.0));
+    window_obj.set("innerHeight".to_string(), JsValue::Number(768.0));
+
+    // window.outerWidth / window.outerHeight
+    window_obj.set("outerWidth".to_string(), JsValue::Number(1024.0));
+    window_obj.set("outerHeight".to_string(), JsValue::Number(768.0));
+
+    // window.screenX / window.screenY
+    window_obj.set("screenX".to_string(), JsValue::Number(0.0));
+    window_obj.set("screenY".to_string(), JsValue::Number(0.0));
+
+    // window.devicePixelRatio
+    window_obj.set("devicePixelRatio".to_string(), JsValue::Number(1.0));
+
+    // window.navigator
+    window_obj.set("navigator".to_string(), create_navigator_object());
+
+    // window.location
+    let bridge_clone = bridge.clone();
+    window_obj.set("location".to_string(), create_location_object(bridge_clone));
+
+    // window.history
+    window_obj.set("history".to_string(), create_history_object());
+
+    // window.localStorage
+    window_obj.set("localStorage".to_string(), create_storage_object());
+
+    // window.sessionStorage
+    window_obj.set("sessionStorage".to_string(), create_storage_object());
+
+    // window.screen
+    window_obj.set("screen".to_string(), create_screen_object());
+
+    // window.getComputedStyle
+    let bridge_clone = bridge.clone();
+    window_obj.set("getComputedStyle".to_string(), create_native_dom_function(
+        "getComputedStyle",
+        move |_interp, _this, args| {
+            // Would return computed styles for element
+            let element = args.get(0).cloned().unwrap_or(JsValue::Null);
+            Ok(create_computed_style_object(bridge_clone.clone(), &element))
+        },
+    ));
+
+    // window.fetch
+    window_obj.set("fetch".to_string(), create_native_dom_function(
+        "fetch",
+        |_interp, _this, args| {
+            let url = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            // Would return Promise - simplified for now
+            let mut response = JsObject::new();
+            response.set("ok".to_string(), JsValue::Boolean(true));
+            response.set("status".to_string(), JsValue::Number(200.0));
+            response.set("url".to_string(), JsValue::String(url));
+
+            // Promise wrapper (simplified)
+            let mut promise = JsObject::new();
+            promise.internal = ObjectInternal::Promise {
+                state: super::interpreter::PromiseState::Fulfilled,
+                result: Some(JsValue::Object(Rc::new(RefCell::new(response)))),
+            };
+            Ok(JsValue::Object(Rc::new(RefCell::new(promise))))
+        },
+    ));
+
+    // window.atob / window.btoa
+    window_obj.set("atob".to_string(), create_native_dom_function(
+        "atob",
+        |_interp, _this, args| {
+            let encoded = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            // Base64 decode (simplified)
+            Ok(JsValue::String(encoded)) // Would actually decode
+        },
+    ));
+
+    window_obj.set("btoa".to_string(), create_native_dom_function(
+        "btoa",
+        |_interp, _this, args| {
+            let data = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            // Base64 encode (simplified)
+            Ok(JsValue::String(data)) // Would actually encode
+        },
+    ));
+
+    // window.scrollTo / window.scrollBy
+    window_obj.set("scrollTo".to_string(), create_native_dom_function(
+        "scrollTo",
+        |_interp, _this, _args| {
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    window_obj.set("scrollBy".to_string(), create_native_dom_function(
+        "scrollBy",
+        |_interp, _this, _args| {
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    JsValue::Object(Rc::new(RefCell::new(window_obj)))
+}
+
+// ============================================================
+// Element Object
+// ============================================================
+
+fn create_element_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut elem_obj = JsObject::new();
+
+    // Store node index
+    elem_obj.set("__nodeIndex".to_string(), JsValue::Number(node_idx as f64));
+
+    // element.tagName
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("tagName".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(tag) = node.tag_name() {
+                    return Ok(JsValue::String(tag.to_uppercase()));
+                }
+            }
+            Ok(JsValue::Undefined)
+        }))),
+        setter: None,
+    });
+
+    // element.id
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("id".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(id) = node.get_attribute("id") {
+                    return Ok(JsValue::String(id.to_string()));
+                }
+            }
+            Ok(JsValue::String(String::new()))
+        }))),
+        setter: None, // Would need setter for modifications
+    });
+
+    // element.className
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("className".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(class) = node.get_attribute("class") {
+                    return Ok(JsValue::String(class.to_string()));
+                }
+            }
+            Ok(JsValue::String(String::new()))
+        }))),
+        setter: None,
+    });
+
+    // element.innerHTML
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("innerHTML".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            let html = super::super::html::get_inner_html(&document, node_idx);
+            Ok(JsValue::String(html))
+        }))),
+        setter: None, // Would parse and replace children
+    });
+
+    // element.outerHTML
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("outerHTML".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            let html = super::super::html::get_outer_html(&document, node_idx);
+            Ok(JsValue::String(html))
+        }))),
+        setter: None,
+    });
+
+    // element.textContent
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("textContent".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            let text = get_text_content(&document, node_idx);
+            Ok(JsValue::String(text))
+        }))),
+        setter: None,
+    });
+
+    // element.children
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("children".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                let children: Vec<JsValue> = node.children.iter()
+                    .filter(|&&idx| {
+                        document.get_node(idx)
+                            .map(|n| n.node_type == NodeType::Element)
+                            .unwrap_or(false)
+                    })
+                    .map(|&idx| create_element_object(idx, bridge_clone.clone()))
+                    .collect();
+                return Ok(create_html_collection(children));
+            }
+            Ok(create_html_collection(Vec::new()))
+        }))),
+        setter: None,
+    });
+
+    // element.childNodes
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("childNodes".to_string(), PropertyDescriptor {
+        value: JsValue::Undefined,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                let children: Vec<JsValue> = node.children.iter()
+                    .map(|&idx| create_node_object(idx, bridge_clone.clone()))
+                    .collect();
+                return Ok(create_node_list(children));
+            }
+            Ok(create_node_list(Vec::new()))
+        }))),
+        setter: None,
+    });
+
+    // element.parentNode / element.parentElement
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("parentNode".to_string(), PropertyDescriptor {
+        value: JsValue::Null,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(parent_idx) = node.parent {
+                    return Ok(create_element_object(parent_idx, bridge_clone.clone()));
+                }
+            }
+            Ok(JsValue::Null)
+        }))),
+        setter: None,
+    });
+
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("parentElement".to_string(), PropertyDescriptor {
+        value: JsValue::Null,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(parent_idx) = node.parent {
+                    if let Some(parent) = document.get_node(parent_idx) {
+                        if parent.node_type == NodeType::Element {
+                            return Ok(create_element_object(parent_idx, bridge_clone.clone()));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Null)
+        }))),
+        setter: None,
+    });
+
+    // element.firstChild / element.lastChild
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("firstChild".to_string(), PropertyDescriptor {
+        value: JsValue::Null,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(&first) = node.children.first() {
+                    return Ok(create_node_object(first, bridge_clone.clone()));
+                }
+            }
+            Ok(JsValue::Null)
+        }))),
+        setter: None,
+    });
+
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("lastChild".to_string(), PropertyDescriptor {
+        value: JsValue::Null,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(&last) = node.children.last() {
+                    return Ok(create_node_object(last, bridge_clone.clone()));
+                }
+            }
+            Ok(JsValue::Null)
+        }))),
+        setter: None,
+    });
+
+    // element.nextSibling / element.previousSibling
+    let bridge_clone = bridge.clone();
+    elem_obj.properties.insert("nextSibling".to_string(), PropertyDescriptor {
+        value: JsValue::Null,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(sibling_idx) = get_next_sibling(&document, node_idx) {
+                return Ok(create_node_object(sibling_idx, bridge_clone.clone()));
+            }
+            Ok(JsValue::Null)
+        }))),
+        setter: None,
+    });
+
+    // element.getAttribute
+    let bridge_clone = bridge.clone();
+    elem_obj.set("getAttribute".to_string(), create_native_dom_function(
+        "getAttribute",
+        move |_interp, _this, args| {
+            let attr_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(value) = node.get_attribute(&attr_name) {
+                    return Ok(JsValue::String(value.to_string()));
+                }
+            }
+            Ok(JsValue::Null)
+        },
+    ));
+
+    // element.setAttribute
+    let bridge_clone = bridge.clone();
+    elem_obj.set("setAttribute".to_string(), create_native_dom_function(
+        "setAttribute",
+        move |_interp, _this, args| {
+            let attr_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let attr_value = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+            if let Some(node) = document.get_node_mut(node_idx) {
+                node.set_attribute(&attr_name, &attr_value);
+            }
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // element.removeAttribute
+    let bridge_clone = bridge.clone();
+    elem_obj.set("removeAttribute".to_string(), create_native_dom_function(
+        "removeAttribute",
+        move |_interp, _this, args| {
+            let attr_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+            if let Some(node) = document.get_node_mut(node_idx) {
+                node.remove_attribute(&attr_name);
+            }
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // element.hasAttribute
+    let bridge_clone = bridge.clone();
+    elem_obj.set("hasAttribute".to_string(), create_native_dom_function(
+        "hasAttribute",
+        move |_interp, _this, args| {
+            let attr_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                return Ok(JsValue::Boolean(node.get_attribute(&attr_name).is_some()));
+            }
+            Ok(JsValue::Boolean(false))
+        },
+    ));
+
+    // element.appendChild
+    let bridge_clone = bridge.clone();
+    elem_obj.set("appendChild".to_string(), create_native_dom_function(
+        "appendChild",
+        move |_interp, _this, args| {
+            let child = args.get(0).cloned().unwrap_or(JsValue::Null);
+            if let JsValue::Object(child_obj) = child {
+                if let JsValue::Number(child_idx) = child_obj.borrow().get("__nodeIndex") {
+                    let child_idx = child_idx as usize;
+                    let doc = bridge_clone.borrow();
+                    let mut document = doc.document.borrow_mut();
+                    document.append_child(node_idx, child_idx);
+                }
+            }
+            Ok(args.get(0).cloned().unwrap_or(JsValue::Null))
+        },
+    ));
+
+    // element.removeChild
+    let bridge_clone = bridge.clone();
+    elem_obj.set("removeChild".to_string(), create_native_dom_function(
+        "removeChild",
+        move |_interp, _this, args| {
+            let child = args.get(0).cloned().unwrap_or(JsValue::Null);
+            if let JsValue::Object(child_obj) = &child {
+                if let JsValue::Number(child_idx) = child_obj.borrow().get("__nodeIndex") {
+                    let child_idx = child_idx as usize;
+                    let doc = bridge_clone.borrow();
+                    let mut document = doc.document.borrow_mut();
+                    document.remove_child(node_idx, child_idx);
+                }
+            }
+            Ok(child)
+        },
+    ));
+
+    // element.insertBefore
+    let bridge_clone = bridge.clone();
+    elem_obj.set("insertBefore".to_string(), create_native_dom_function(
+        "insertBefore",
+        move |_interp, _this, args| {
+            let new_node = args.get(0).cloned().unwrap_or(JsValue::Null);
+            let reference = args.get(1).cloned().unwrap_or(JsValue::Null);
+
+            if let JsValue::Object(new_obj) = &new_node {
+                if let JsValue::Number(new_idx) = new_obj.borrow().get("__nodeIndex") {
+                    let new_idx = new_idx as usize;
+                    let ref_idx = if let JsValue::Object(ref_obj) = reference {
+                        if let JsValue::Number(idx) = ref_obj.borrow().get("__nodeIndex") {
+                            Some(idx as usize)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let doc = bridge_clone.borrow();
+                    let mut document = doc.document.borrow_mut();
+                    document.insert_before(node_idx, new_idx, ref_idx);
+                }
+            }
+
+            Ok(new_node)
+        },
+    ));
+
+    // element.replaceChild
+    let bridge_clone = bridge.clone();
+    elem_obj.set("replaceChild".to_string(), create_native_dom_function(
+        "replaceChild",
+        move |_interp, _this, args| {
+            let new_child = args.get(0).cloned().unwrap_or(JsValue::Null);
+            let old_child = args.get(1).cloned().unwrap_or(JsValue::Null);
+
+            if let (JsValue::Object(new_obj), JsValue::Object(old_obj)) = (&new_child, &old_child) {
+                if let (JsValue::Number(new_idx), JsValue::Number(old_idx)) =
+                    (new_obj.borrow().get("__nodeIndex"), old_obj.borrow().get("__nodeIndex"))
+                {
+                    let doc = bridge_clone.borrow();
+                    let mut document = doc.document.borrow_mut();
+                    document.replace_child(node_idx, new_idx as usize, old_idx as usize);
+                }
+            }
+
+            Ok(old_child)
+        },
+    ));
+
+    // element.cloneNode
+    let bridge_clone = bridge.clone();
+    elem_obj.set("cloneNode".to_string(), create_native_dom_function(
+        "cloneNode",
+        move |_interp, _this, args| {
+            let deep = args.get(0).map(|v| v.is_truthy()).unwrap_or(false);
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+            let cloned_idx = document.clone_node(node_idx, deep);
+            Ok(create_element_object(cloned_idx, bridge_clone.clone()))
+        },
+    ));
+
+    // element.contains
+    let bridge_clone = bridge.clone();
+    elem_obj.set("contains".to_string(), create_native_dom_function(
+        "contains",
+        move |_interp, _this, args| {
+            let other = args.get(0).cloned().unwrap_or(JsValue::Null);
+            if let JsValue::Object(other_obj) = other {
+                if let JsValue::Number(other_idx) = other_obj.borrow().get("__nodeIndex") {
+                    let doc = bridge_clone.borrow();
+                    let document = doc.document.borrow();
+                    return Ok(JsValue::Boolean(document.contains(node_idx, other_idx as usize)));
+                }
+            }
+            Ok(JsValue::Boolean(false))
+        },
+    ));
+
+    // element.querySelector
+    let bridge_clone = bridge.clone();
+    elem_obj.set("querySelector".to_string(), create_native_dom_function(
+        "querySelector",
+        move |_interp, _this, args| {
+            let selector = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(found_idx) = query_selector_within(&document, node_idx, &selector) {
+                return Ok(create_element_object(found_idx, bridge_clone.clone()));
+            }
+            Ok(JsValue::Null)
+        },
+    ));
+
+    // element.querySelectorAll
+    let bridge_clone = bridge.clone();
+    elem_obj.set("querySelectorAll".to_string(), create_native_dom_function(
+        "querySelectorAll",
+        move |_interp, _this, args| {
+            let selector = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            let elements = query_selector_all_within(&document, node_idx, &selector);
+            let js_elements: Vec<JsValue> = elements.iter()
+                .map(|&idx| create_element_object(idx, bridge_clone.clone()))
+                .collect();
+            Ok(create_node_list(js_elements))
+        },
+    ));
+
+    // element.addEventListener
+    let bridge_clone = bridge.clone();
+    elem_obj.set("addEventListener".to_string(), create_native_dom_function(
+        "addEventListener",
+        move |_interp, _this, args| {
+            let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let callback = match args.get(1) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Undefined),
+            };
+            let capture = args.get(2).map(|v| v.is_truthy()).unwrap_or(false);
+
+            let mut bridge = bridge_clone.borrow_mut();
+            bridge.event_listeners
+                .entry(node_idx)
+                .or_insert_with(Vec::new)
+                .push(EventListener { event_type, callback, capture });
+
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // element.removeEventListener
+    let bridge_clone = bridge.clone();
+    elem_obj.set("removeEventListener".to_string(), create_native_dom_function(
+        "removeEventListener",
+        move |_interp, _this, args| {
+            let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+
+            let mut bridge = bridge_clone.borrow_mut();
+            if let Some(listeners) = bridge.event_listeners.get_mut(&node_idx) {
+                listeners.retain(|l| l.event_type != event_type);
+            }
+
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // element.classList
+    let bridge_clone = bridge.clone();
+    elem_obj.set("classList".to_string(), create_class_list_object(node_idx, bridge_clone));
+
+    // element.style
+    let bridge_clone = bridge.clone();
+    elem_obj.set("style".to_string(), create_style_object(node_idx, bridge_clone));
+
+    // element.getBoundingClientRect
+    elem_obj.set("getBoundingClientRect".to_string(), create_native_dom_function(
+        "getBoundingClientRect",
+        |_interp, _this, _args| {
+            // Would compute actual layout bounds
+            let mut rect = JsObject::new();
+            rect.set("x".to_string(), JsValue::Number(0.0));
+            rect.set("y".to_string(), JsValue::Number(0.0));
+            rect.set("width".to_string(), JsValue::Number(0.0));
+            rect.set("height".to_string(), JsValue::Number(0.0));
+            rect.set("top".to_string(), JsValue::Number(0.0));
+            rect.set("right".to_string(), JsValue::Number(0.0));
+            rect.set("bottom".to_string(), JsValue::Number(0.0));
+            rect.set("left".to_string(), JsValue::Number(0.0));
+            Ok(JsValue::Object(Rc::new(RefCell::new(rect))))
+        },
+    ));
+
+    // element.scrollIntoView
+    elem_obj.set("scrollIntoView".to_string(), create_native_dom_function(
+        "scrollIntoView",
+        |_interp, _this, _args| {
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // element.focus / element.blur
+    elem_obj.set("focus".to_string(), create_native_dom_function("focus", |_i, _t, _a| Ok(JsValue::Undefined)));
+    elem_obj.set("blur".to_string(), create_native_dom_function("blur", |_i, _t, _a| Ok(JsValue::Undefined)));
+
+    // element.click
+    elem_obj.set("click".to_string(), create_native_dom_function("click", |_i, _t, _a| Ok(JsValue::Undefined)));
+
+    // nodeType
+    elem_obj.set("nodeType".to_string(), JsValue::Number(1.0)); // ELEMENT_NODE
+
+    JsValue::Object(Rc::new(RefCell::new(elem_obj)))
+}
+
+fn create_node_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let doc = bridge.borrow();
+    let document = doc.document.borrow();
+
+    if let Some(node) = document.get_node(node_idx) {
+        match node.node_type {
+            NodeType::Element => {
+                drop(document);
+                drop(doc);
+                return create_element_object(node_idx, bridge);
+            },
+            NodeType::Text => {
+                drop(document);
+                drop(doc);
+                return create_text_node_object(node_idx, bridge);
+            },
+            NodeType::Comment => {
+                drop(document);
+                drop(doc);
+                return create_comment_node_object(node_idx, bridge);
+            },
+            _ => {
+                drop(document);
+                drop(doc);
+                return create_element_object(node_idx, bridge);
+            }
+        }
+    }
+
+    JsValue::Null
+}
+
+fn create_text_node_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut text_obj = JsObject::new();
+
+    text_obj.set("__nodeIndex".to_string(), JsValue::Number(node_idx as f64));
+    text_obj.set("nodeType".to_string(), JsValue::Number(3.0)); // TEXT_NODE
+    text_obj.set("nodeName".to_string(), JsValue::String("#text".to_string()));
+
+    let bridge_clone = bridge.clone();
+    text_obj.properties.insert("nodeValue".to_string(), PropertyDescriptor {
+        value: JsValue::String(String::new()),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        getter: Some(Rc::new(create_getter_function(move |_| {
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+            if let Some(node) = document.get_node(node_idx) {
+                if let Some(text) = node.text_content() {
+                    return Ok(JsValue::String(text.to_string()));
+                }
+            }
+            Ok(JsValue::String(String::new()))
+        }))),
+        setter: None,
+    });
+
+    // Also expose as textContent and data
+    text_obj.properties.insert("textContent".to_string(), text_obj.properties.get("nodeValue").unwrap().clone());
+    text_obj.properties.insert("data".to_string(), text_obj.properties.get("nodeValue").unwrap().clone());
+
+    JsValue::Object(Rc::new(RefCell::new(text_obj)))
+}
+
+fn create_comment_node_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut comment_obj = JsObject::new();
+
+    comment_obj.set("__nodeIndex".to_string(), JsValue::Number(node_idx as f64));
+    comment_obj.set("nodeType".to_string(), JsValue::Number(8.0)); // COMMENT_NODE
+    comment_obj.set("nodeName".to_string(), JsValue::String("#comment".to_string()));
+
+    JsValue::Object(Rc::new(RefCell::new(comment_obj)))
+}
+
+// ============================================================
+// Helper Objects
+// ============================================================
+
+fn create_class_list_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut class_list = JsObject::new();
+
+    // classList.add
+    let bridge_clone = bridge.clone();
+    class_list.set("add".to_string(), create_native_dom_function(
+        "add",
+        move |_interp, _this, args| {
+            let class_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+
+            if let Some(node) = document.get_node_mut(node_idx) {
+                let current = node.get_attribute("class").unwrap_or("");
+                let classes: Vec<&str> = current.split_whitespace().collect();
+                if !classes.contains(&class_name.as_str()) {
+                    let new_class = if current.is_empty() {
+                        class_name
+                    } else {
+                        format!("{} {}", current, class_name)
+                    };
+                    node.set_attribute("class", &new_class);
+                }
+            }
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // classList.remove
+    let bridge_clone = bridge.clone();
+    class_list.set("remove".to_string(), create_native_dom_function(
+        "remove",
+        move |_interp, _this, args| {
+            let class_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+
+            if let Some(node) = document.get_node_mut(node_idx) {
+                let current = node.get_attribute("class").unwrap_or("");
+                let classes: Vec<&str> = current.split_whitespace()
+                    .filter(|c| *c != class_name)
+                    .collect();
+                node.set_attribute("class", &classes.join(" "));
+            }
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    // classList.toggle
+    let bridge_clone = bridge.clone();
+    class_list.set("toggle".to_string(), create_native_dom_function(
+        "toggle",
+        move |_interp, _this, args| {
+            let class_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let mut document = doc.document.borrow_mut();
+
+            if let Some(node) = document.get_node_mut(node_idx) {
+                let current = node.get_attribute("class").unwrap_or("");
+                let classes: Vec<&str> = current.split_whitespace().collect();
+
+                let has_class = classes.contains(&class_name.as_str());
+                if has_class {
+                    let new_classes: Vec<&str> = classes.into_iter()
+                        .filter(|c| *c != class_name)
+                        .collect();
+                    node.set_attribute("class", &new_classes.join(" "));
+                } else {
+                    let new_class = if current.is_empty() {
+                        class_name
+                    } else {
+                        format!("{} {}", current, class_name)
+                    };
+                    node.set_attribute("class", &new_class);
+                }
+                return Ok(JsValue::Boolean(!has_class));
+            }
+            Ok(JsValue::Boolean(false))
+        },
+    ));
+
+    // classList.contains
+    let bridge_clone = bridge.clone();
+    class_list.set("contains".to_string(), create_native_dom_function(
+        "contains",
+        move |_interp, _this, args| {
+            let class_name = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let doc = bridge_clone.borrow();
+            let document = doc.document.borrow();
+
+            if let Some(node) = document.get_node(node_idx) {
+                let current = node.get_attribute("class").unwrap_or("");
+                let classes: Vec<&str> = current.split_whitespace().collect();
+                return Ok(JsValue::Boolean(classes.contains(&class_name.as_str())));
+            }
+            Ok(JsValue::Boolean(false))
+        },
+    ));
+
+    JsValue::Object(Rc::new(RefCell::new(class_list)))
+}
+
+fn create_style_object(node_idx: usize, bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    // Would have getters/setters for each CSS property
+    let style_obj = JsObject::new();
+    JsValue::Object(Rc::new(RefCell::new(style_obj)))
+}
+
+fn create_node_list(elements: Vec<JsValue>) -> JsValue {
+    let mut node_list = JsObject::new();
+
+    node_list.set("length".to_string(), JsValue::Number(elements.len() as f64));
+
+    for (i, elem) in elements.iter().enumerate() {
+        node_list.set(i.to_string(), elem.clone());
+    }
+
+    // item method
+    let elems = elements.clone();
+    node_list.set("item".to_string(), create_native_dom_function(
+        "item",
+        move |_interp, _this, args| {
+            let index = args.get(0).map(|v| v.to_number() as usize).unwrap_or(0);
+            Ok(elems.get(index).cloned().unwrap_or(JsValue::Null))
+        },
+    ));
+
+    // forEach method
+    node_list.set("forEach".to_string(), create_native_dom_function(
+        "forEach",
+        move |interp, this, args| {
+            let callback = match args.get(0) {
+                Some(JsValue::Function(f)) => f.clone(),
+                _ => return Ok(JsValue::Undefined),
+            };
+
+            if let JsValue::Object(obj) = this {
+                let obj = obj.borrow();
+                if let JsValue::Number(len) = obj.get("length") {
+                    for i in 0..len as usize {
+                        let item = obj.get(&i.to_string());
+                        interp.call_function(&callback, JsValue::Undefined, vec![
+                            item,
+                            JsValue::Number(i as f64),
+                        ])?;
+                    }
+                }
+            }
+
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    JsValue::Object(Rc::new(RefCell::new(node_list)))
+}
+
+fn create_html_collection(elements: Vec<JsValue>) -> JsValue {
+    // HTMLCollection is similar to NodeList
+    create_node_list(elements)
+}
+
+fn create_navigator_object() -> JsValue {
+    let mut nav = JsObject::new();
+    nav.set("userAgent".to_string(), JsValue::String("GenesisOS/1.0 GenesisLang/1.0".to_string()));
+    nav.set("language".to_string(), JsValue::String("en-US".to_string()));
+    nav.set("languages".to_string(), JsValue::Array(Rc::new(RefCell::new(vec![
+        JsValue::String("en-US".to_string()),
+        JsValue::String("en".to_string()),
+    ]))));
+    nav.set("platform".to_string(), JsValue::String("GenesisOS".to_string()));
+    nav.set("cookieEnabled".to_string(), JsValue::Boolean(true));
+    nav.set("onLine".to_string(), JsValue::Boolean(true));
+    JsValue::Object(Rc::new(RefCell::new(nav)))
+}
+
+fn create_location_object(bridge: Rc<RefCell<DomBridge>>) -> JsValue {
+    let mut loc = JsObject::new();
+    loc.set("href".to_string(), JsValue::String("about:blank".to_string()));
+    loc.set("origin".to_string(), JsValue::String("null".to_string()));
+    loc.set("protocol".to_string(), JsValue::String("about:".to_string()));
+    loc.set("host".to_string(), JsValue::String(String::new()));
+    loc.set("hostname".to_string(), JsValue::String(String::new()));
+    loc.set("port".to_string(), JsValue::String(String::new()));
+    loc.set("pathname".to_string(), JsValue::String("blank".to_string()));
+    loc.set("search".to_string(), JsValue::String(String::new()));
+    loc.set("hash".to_string(), JsValue::String(String::new()));
+
+    loc.set("reload".to_string(), create_native_dom_function("reload", |_i, _t, _a| Ok(JsValue::Undefined)));
+    loc.set("assign".to_string(), create_native_dom_function("assign", |_i, _t, _a| Ok(JsValue::Undefined)));
+    loc.set("replace".to_string(), create_native_dom_function("replace", |_i, _t, _a| Ok(JsValue::Undefined)));
+
+    JsValue::Object(Rc::new(RefCell::new(loc)))
+}
+
+fn create_history_object() -> JsValue {
+    let mut hist = JsObject::new();
+    hist.set("length".to_string(), JsValue::Number(1.0));
+    hist.set("state".to_string(), JsValue::Null);
+
+    hist.set("back".to_string(), create_native_dom_function("back", |_i, _t, _a| Ok(JsValue::Undefined)));
+    hist.set("forward".to_string(), create_native_dom_function("forward", |_i, _t, _a| Ok(JsValue::Undefined)));
+    hist.set("go".to_string(), create_native_dom_function("go", |_i, _t, _a| Ok(JsValue::Undefined)));
+    hist.set("pushState".to_string(), create_native_dom_function("pushState", |_i, _t, _a| Ok(JsValue::Undefined)));
+    hist.set("replaceState".to_string(), create_native_dom_function("replaceState", |_i, _t, _a| Ok(JsValue::Undefined)));
+
+    JsValue::Object(Rc::new(RefCell::new(hist)))
+}
+
+fn create_storage_object() -> JsValue {
+    let mut storage = JsObject::new();
+    let data: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    let data_clone = data.clone();
+    storage.set("getItem".to_string(), create_native_dom_function(
+        "getItem",
+        move |_interp, _this, args| {
+            let key = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let data = data_clone.borrow();
+            Ok(data.get(&key)
+                .map(|v| JsValue::String(v.clone()))
+                .unwrap_or(JsValue::Null))
+        },
+    ));
+
+    let data_clone = data.clone();
+    storage.set("setItem".to_string(), create_native_dom_function(
+        "setItem",
+        move |_interp, _this, args| {
+            let key = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            let value = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            data_clone.borrow_mut().insert(key, value);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    let data_clone = data.clone();
+    storage.set("removeItem".to_string(), create_native_dom_function(
+        "removeItem",
+        move |_interp, _this, args| {
+            let key = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            data_clone.borrow_mut().remove(&key);
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    let data_clone = data.clone();
+    storage.set("clear".to_string(), create_native_dom_function(
+        "clear",
+        move |_interp, _this, _args| {
+            data_clone.borrow_mut().clear();
+            Ok(JsValue::Undefined)
+        },
+    ));
+
+    storage.set("length".to_string(), JsValue::Number(0.0));
+
+    JsValue::Object(Rc::new(RefCell::new(storage)))
+}
+
+fn create_screen_object() -> JsValue {
+    let mut screen = JsObject::new();
+    screen.set("width".to_string(), JsValue::Number(1920.0));
+    screen.set("height".to_string(), JsValue::Number(1080.0));
+    screen.set("availWidth".to_string(), JsValue::Number(1920.0));
+    screen.set("availHeight".to_string(), JsValue::Number(1040.0));
+    screen.set("colorDepth".to_string(), JsValue::Number(24.0));
+    screen.set("pixelDepth".to_string(), JsValue::Number(24.0));
+    JsValue::Object(Rc::new(RefCell::new(screen)))
+}
+
+fn create_computed_style_object(bridge: Rc<RefCell<DomBridge>>, element: &JsValue) -> JsValue {
+    let mut style = JsObject::new();
+
+    // Would compute actual styles for the element
+    // For now, return empty strings for all properties
+
+    style.set("getPropertyValue".to_string(), create_native_dom_function(
+        "getPropertyValue",
+        |_interp, _this, args| {
+            let _property = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+            Ok(JsValue::String(String::new()))
+        },
+    ));
+
+    JsValue::Object(Rc::new(RefCell::new(style)))
+}
+
+fn register_dom_constructors(interp: &mut Interpreter, bridge: Rc<RefCell<DomBridge>>) {
+    // Event constructor
+    let event_constructor = create_native_dom_function("Event", |_interp, _this, args| {
+        let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let mut event = JsObject::new();
+        event.set("type".to_string(), JsValue::String(event_type));
+        event.set("bubbles".to_string(), JsValue::Boolean(false));
+        event.set("cancelable".to_string(), JsValue::Boolean(false));
+        event.set("defaultPrevented".to_string(), JsValue::Boolean(false));
+        event.set("target".to_string(), JsValue::Null);
+        event.set("currentTarget".to_string(), JsValue::Null);
+        event.set("eventPhase".to_string(), JsValue::Number(0.0));
+        event.set("timeStamp".to_string(), JsValue::Number(get_current_time_ms() as f64));
+
+        event.set("preventDefault".to_string(), create_native_dom_function("preventDefault", |_i, _t, _a| Ok(JsValue::Undefined)));
+        event.set("stopPropagation".to_string(), create_native_dom_function("stopPropagation", |_i, _t, _a| Ok(JsValue::Undefined)));
+        event.set("stopImmediatePropagation".to_string(), create_native_dom_function("stopImmediatePropagation", |_i, _t, _a| Ok(JsValue::Undefined)));
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(event))))
+    });
+    interp.define_global("Event", event_constructor);
+
+    // CustomEvent constructor
+    let custom_event_constructor = create_native_dom_function("CustomEvent", |_interp, _this, args| {
+        let event_type = args.get(0).map(|v| v.to_string()).unwrap_or_default();
+        let detail = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+
+        let mut event = JsObject::new();
+        event.set("type".to_string(), JsValue::String(event_type));
+        event.set("detail".to_string(), detail);
+        event.set("bubbles".to_string(), JsValue::Boolean(false));
+        event.set("cancelable".to_string(), JsValue::Boolean(false));
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(event))))
+    });
+    interp.define_global("CustomEvent", custom_event_constructor);
+
+    // XMLHttpRequest constructor
+    let xhr_constructor = create_native_dom_function("XMLHttpRequest", |_interp, _this, _args| {
+        let mut xhr = JsObject::new();
+        xhr.set("readyState".to_string(), JsValue::Number(0.0));
+        xhr.set("status".to_string(), JsValue::Number(0.0));
+        xhr.set("statusText".to_string(), JsValue::String(String::new()));
+        xhr.set("responseText".to_string(), JsValue::String(String::new()));
+        xhr.set("response".to_string(), JsValue::Null);
+        xhr.set("responseType".to_string(), JsValue::String(String::new()));
+
+        xhr.set("open".to_string(), create_native_dom_function("open", |_i, _t, _a| Ok(JsValue::Undefined)));
+        xhr.set("send".to_string(), create_native_dom_function("send", |_i, _t, _a| Ok(JsValue::Undefined)));
+        xhr.set("abort".to_string(), create_native_dom_function("abort", |_i, _t, _a| Ok(JsValue::Undefined)));
+        xhr.set("setRequestHeader".to_string(), create_native_dom_function("setRequestHeader", |_i, _t, _a| Ok(JsValue::Undefined)));
+        xhr.set("getResponseHeader".to_string(), create_native_dom_function("getResponseHeader", |_i, _t, _a| Ok(JsValue::Null)));
+        xhr.set("getAllResponseHeaders".to_string(), create_native_dom_function("getAllResponseHeaders", |_i, _t, _a| Ok(JsValue::String(String::new()))));
+
+        Ok(JsValue::Object(Rc::new(RefCell::new(xhr))))
+    });
+    interp.define_global("XMLHttpRequest", xhr_constructor);
+}
+
+// ============================================================
+// DOM Query Helpers
+// ============================================================
+
+fn find_element_by_id(document: &Document, id: &str) -> Option<usize> {
+    for (idx, node) in document.nodes.iter().enumerate() {
+        if let Some(attr_id) = node.get_attribute("id") {
+            if attr_id == id {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn find_element_by_tag_name(document: &Document, tag: &str) -> Option<usize> {
+    for (idx, node) in document.nodes.iter().enumerate() {
+        if let Some(node_tag) = node.tag_name() {
+            if node_tag.eq_ignore_ascii_case(tag) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn find_elements_by_tag_name(document: &Document, tag: &str) -> Vec<usize> {
+    let mut result = Vec::new();
+    for (idx, node) in document.nodes.iter().enumerate() {
+        if let Some(node_tag) = node.tag_name() {
+            if tag == "*" || node_tag.eq_ignore_ascii_case(tag) {
+                result.push(idx);
+            }
+        }
+    }
+    result
+}
+
+fn find_elements_by_class_name(document: &Document, class_name: &str) -> Vec<usize> {
+    let mut result = Vec::new();
+    for (idx, node) in document.nodes.iter().enumerate() {
+        if let Some(class) = node.get_attribute("class") {
+            let classes: Vec<&str> = class.split_whitespace().collect();
+            if classes.contains(&class_name) {
+                result.push(idx);
+            }
+        }
+    }
+    result
+}
+
+fn query_selector(document: &Document, selector: &str) -> Option<usize> {
+    // Simplified selector matching
+    let selector = selector.trim();
+
+    if selector.starts_with('#') {
+        return find_element_by_id(document, &selector[1..]);
+    }
+
+    if selector.starts_with('.') {
+        let elements = find_elements_by_class_name(document, &selector[1..]);
+        return elements.first().copied();
+    }
+
+    let elements = find_elements_by_tag_name(document, selector);
+    elements.first().copied()
+}
+
+fn query_selector_all(document: &Document, selector: &str) -> Vec<usize> {
+    let selector = selector.trim();
+
+    if selector.starts_with('#') {
+        find_element_by_id(document, &selector[1..])
+            .map(|idx| vec![idx])
+            .unwrap_or_default()
+    } else if selector.starts_with('.') {
+        find_elements_by_class_name(document, &selector[1..])
+    } else {
+        find_elements_by_tag_name(document, selector)
+    }
+}
+
+fn query_selector_within(document: &Document, root_idx: usize, selector: &str) -> Option<usize> {
+    // Would search only within root element's subtree
+    query_selector(document, selector)
+}
+
+fn query_selector_all_within(document: &Document, root_idx: usize, selector: &str) -> Vec<usize> {
+    query_selector_all(document, selector)
+}
+
+fn get_text_content(document: &Document, node_idx: usize) -> String {
+    fn collect_text(document: &Document, idx: usize, result: &mut String) {
+        if let Some(node) = document.get_node(idx) {
+            if let Some(text) = node.text_content() {
+                result.push_str(text);
+            }
+            for &child_idx in &node.children {
+                collect_text(document, child_idx, result);
+            }
+        }
+    }
+
+    let mut result = String::new();
+    collect_text(document, node_idx, &mut result);
+    result
+}
+
+fn get_document_title(document: &Document) -> String {
+    if let Some(title_idx) = find_element_by_tag_name(document, "title") {
+        return get_text_content(document, title_idx);
+    }
+    String::new()
+}
+
+fn get_next_sibling(document: &Document, node_idx: usize) -> Option<usize> {
+    if let Some(node) = document.get_node(node_idx) {
+        if let Some(parent_idx) = node.parent {
+            if let Some(parent) = document.get_node(parent_idx) {
+                let mut found = false;
+                for &child_idx in &parent.children {
+                    if found {
+                        return Some(child_idx);
+                    }
+                    if child_idx == node_idx {
+                        found = true;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// ============================================================
+// Utility Functions
+// ============================================================
+
+fn create_native_dom_function(
+    name: &str,
+    func: fn(&mut Interpreter, JsValue, Vec<JsValue>) -> Result<JsValue, JsError>,
+) -> JsValue {
+    let js_func = JsFunction {
+        name: Some(name.to_string()),
+        params: vec![],
+        body: FunctionBody::Native(func),
+        scope: Rc::new(RefCell::new(Scope::new())),
+        this_mode: ThisMode::Global,
+        is_async: false,
+        is_generator: false,
+        prototype: None,
+    };
+    JsValue::Function(Rc::new(js_func))
+}
+
+fn create_getter_function(
+    func: impl Fn(&JsValue) -> Result<JsValue, JsError> + 'static,
+) -> JsFunction {
+    JsFunction {
+        name: Some("get".to_string()),
+        params: vec![],
+        body: FunctionBody::Native(move |_interp, this, _args| {
+            func(&this)
+        }),
+        scope: Rc::new(RefCell::new(Scope::new())),
+        this_mode: ThisMode::Global,
+        is_async: false,
+        is_generator: false,
+        prototype: None,
+    }
+}
+
+fn get_current_time_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

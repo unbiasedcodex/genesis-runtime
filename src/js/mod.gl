@@ -1,0 +1,521 @@
+// JavaScript Engine Module
+// Native ECMAScript implementation for Genesis OS
+
+pub mod lexer;
+pub mod parser;
+pub mod interpreter;
+pub mod builtins;
+pub mod dom;
+
+// Re-export commonly used items
+pub use lexer::{Lexer, Token, Keyword};
+pub use parser::{Parser, Program, Stmt, Expr, Literal, Pattern, parse, parse_expression};
+pub use interpreter::{Interpreter, JsValue, JsObject, JsFunction, JsError, Scope};
+pub use builtins::register_builtins;
+pub use dom::{DomBridge, register_dom_apis, EventListener, Timer};
+
+use super::html::Document;
+use super::css::Stylesheet;
+
+use std::rc::Rc;
+use std::cell::RefCell;
+
+// ============================================================
+// JavaScript Runtime
+// ============================================================
+
+pub struct JsRuntime {
+    interpreter: Interpreter,
+    dom_bridge: Option<Rc<RefCell<DomBridge>>>,
+}
+
+impl JsRuntime {
+    /// Create a new JavaScript runtime without DOM
+    pub fn new() -> JsRuntime {
+        let mut interpreter = Interpreter::new();
+        register_builtins(&mut interpreter);
+
+        JsRuntime {
+            interpreter,
+            dom_bridge: None,
+        }
+    }
+
+    /// Create a new JavaScript runtime with DOM support
+    pub fn with_document(document: Document) -> JsRuntime {
+        let mut interpreter = Interpreter::new();
+        register_builtins(&mut interpreter);
+
+        let bridge = Rc::new(RefCell::new(DomBridge::new(document)));
+        register_dom_apis(&mut interpreter, bridge.clone());
+
+        JsRuntime {
+            interpreter,
+            dom_bridge: Some(bridge),
+        }
+    }
+
+    /// Execute JavaScript code
+    pub fn execute(&mut self, code: &str) -> Result<JsValue, JsError> {
+        let program = parse(code).map_err(|e| JsError {
+            name: "SyntaxError".to_string(),
+            message: format!("{:?}", e),
+            stack: Vec::new(),
+        })?;
+
+        self.interpreter.run(&program)
+    }
+
+    /// Evaluate a JavaScript expression
+    pub fn eval_expression(&mut self, code: &str) -> Result<JsValue, JsError> {
+        let expr = parse_expression(code).map_err(|e| JsError {
+            name: "SyntaxError".to_string(),
+            message: format!("{:?}", e),
+            stack: Vec::new(),
+        })?;
+
+        self.interpreter.evaluate_expression(&expr)
+    }
+
+    /// Define a global variable
+    pub fn define_global(&mut self, name: &str, value: JsValue) {
+        self.interpreter.define_global(name, value);
+    }
+
+    /// Get a global variable
+    pub fn get_global(&self, name: &str) -> Option<JsValue> {
+        self.interpreter.scope.borrow().get(name)
+    }
+
+    /// Call a JavaScript function
+    pub fn call_function(&mut self, name: &str, args: Vec<JsValue>) -> Result<JsValue, JsError> {
+        let func = self.get_global(name)
+            .ok_or_else(|| JsError::reference_error(&format!("{} is not defined", name)))?;
+
+        if let JsValue::Function(f) = func {
+            self.interpreter.call_function(&f, JsValue::Undefined, args)
+        } else {
+            Err(JsError::type_error(&format!("{} is not a function", name)))
+        }
+    }
+
+    /// Add a stylesheet for CSS processing
+    pub fn add_stylesheet(&mut self, stylesheet: Stylesheet) {
+        if let Some(ref bridge) = self.dom_bridge {
+            bridge.borrow_mut().add_stylesheet(stylesheet);
+        }
+    }
+
+    /// Process pending timers (setTimeout, setInterval)
+    pub fn process_timers(&mut self) -> Result<(), JsError> {
+        if let Some(ref bridge) = self.dom_bridge {
+            let current_time = get_current_time_ms();
+            let mut callbacks_to_run = Vec::new();
+            let mut timers_to_remove = Vec::new();
+
+            {
+                let bridge_ref = bridge.borrow();
+                for timer in &bridge_ref.timers {
+                    if current_time >= timer.next_fire {
+                        callbacks_to_run.push((timer.id, timer.callback.clone(), timer.is_interval, timer.interval_ms));
+                        if !timer.is_interval {
+                            timers_to_remove.push(timer.id);
+                        }
+                    }
+                }
+            }
+
+            // Execute callbacks
+            for (id, callback, is_interval, interval_ms) in callbacks_to_run {
+                self.interpreter.call_function(&callback, JsValue::Undefined, vec![])?;
+
+                if is_interval {
+                    // Update next fire time
+                    let mut bridge_ref = bridge.borrow_mut();
+                    if let Some(timer) = bridge_ref.timers.iter_mut().find(|t| t.id == id) {
+                        timer.next_fire = current_time + interval_ms;
+                    }
+                }
+            }
+
+            // Remove one-shot timers
+            {
+                let mut bridge_ref = bridge.borrow_mut();
+                bridge_ref.timers.retain(|t| !timers_to_remove.contains(&t.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch a DOM event
+    pub fn dispatch_event(&mut self, node_idx: usize, event_type: &str, event_data: JsValue) -> Result<bool, JsError> {
+        if let Some(ref bridge) = self.dom_bridge {
+            let listeners: Vec<Rc<JsFunction>> = {
+                let bridge_ref = bridge.borrow();
+                bridge_ref.event_listeners
+                    .get(&node_idx)
+                    .map(|listeners| {
+                        listeners.iter()
+                            .filter(|l| l.event_type == event_type)
+                            .map(|l| l.callback.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            for callback in listeners {
+                self.interpreter.call_function(&callback, JsValue::Undefined, vec![event_data.clone()])?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Get the DOM bridge for direct DOM manipulation
+    pub fn dom_bridge(&self) -> Option<&Rc<RefCell<DomBridge>>> {
+        self.dom_bridge.as_ref()
+    }
+
+    /// Get mutable reference to interpreter
+    pub fn interpreter_mut(&mut self) -> &mut Interpreter {
+        &mut self.interpreter
+    }
+
+    /// Check if there are pending timers
+    pub fn has_pending_timers(&self) -> bool {
+        if let Some(ref bridge) = self.dom_bridge {
+            !bridge.borrow().timers.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Get next timer fire time
+    pub fn next_timer_time(&self) -> Option<u64> {
+        if let Some(ref bridge) = self.dom_bridge {
+            bridge.borrow().timers.iter()
+                .map(|t| t.next_fire)
+                .min()
+        } else {
+            None
+        }
+    }
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+/// Execute JavaScript code and return the result
+pub fn execute_js(code: &str) -> Result<JsValue, JsError> {
+    let mut runtime = JsRuntime::new();
+    runtime.execute(code)
+}
+
+/// Execute JavaScript code with a DOM document
+pub fn execute_js_with_document(code: &str, document: Document) -> Result<JsValue, JsError> {
+    let mut runtime = JsRuntime::with_document(document);
+    runtime.execute(code)
+}
+
+/// Parse JavaScript code into an AST
+pub fn parse_js(code: &str) -> Result<Program, parser::ParseError> {
+    parse(code)
+}
+
+/// Tokenize JavaScript code
+pub fn tokenize_js(code: &str) -> Vec<Token> {
+    let mut lexer = Lexer::new(code);
+    lexer.tokenize()
+}
+
+// ============================================================
+// Value Conversion Helpers
+// ============================================================
+
+/// Convert a Rust string to JsValue
+pub fn js_string(s: &str) -> JsValue {
+    JsValue::String(s.to_string())
+}
+
+/// Convert a Rust number to JsValue
+pub fn js_number(n: f64) -> JsValue {
+    JsValue::Number(n)
+}
+
+/// Convert a Rust bool to JsValue
+pub fn js_bool(b: bool) -> JsValue {
+    JsValue::Boolean(b)
+}
+
+/// Create a JsValue array from a Vec
+pub fn js_array(values: Vec<JsValue>) -> JsValue {
+    JsValue::Array(Rc::new(RefCell::new(values)))
+}
+
+/// Create a JsValue object from key-value pairs
+pub fn js_object(pairs: Vec<(&str, JsValue)>) -> JsValue {
+    let mut obj = JsObject::new();
+    for (key, value) in pairs {
+        obj.set(key.to_string(), value);
+    }
+    JsValue::Object(Rc::new(RefCell::new(obj)))
+}
+
+/// Extract a string from JsValue
+pub fn extract_string(value: &JsValue) -> Option<String> {
+    match value {
+        JsValue::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a number from JsValue
+pub fn extract_number(value: &JsValue) -> Option<f64> {
+    match value {
+        JsValue::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// Extract a boolean from JsValue
+pub fn extract_bool(value: &JsValue) -> Option<bool> {
+    match value {
+        JsValue::Boolean(b) => Some(*b),
+        _ => None,
+    }
+}
+
+// ============================================================
+// Event Loop
+// ============================================================
+
+/// Run an event loop for the JavaScript runtime
+pub struct EventLoop {
+    runtime: JsRuntime,
+    running: bool,
+}
+
+impl EventLoop {
+    pub fn new(runtime: JsRuntime) -> EventLoop {
+        EventLoop {
+            runtime,
+            running: false,
+        }
+    }
+
+    /// Start the event loop
+    pub fn run(&mut self) -> Result<(), JsError> {
+        self.running = true;
+
+        while self.running {
+            // Process timers
+            self.runtime.process_timers()?;
+
+            // Check if we should continue
+            if !self.runtime.has_pending_timers() {
+                break;
+            }
+
+            // Calculate sleep time until next timer
+            if let Some(next_time) = self.runtime.next_timer_time() {
+                let current = get_current_time_ms();
+                if next_time > current {
+                    let sleep_ms = (next_time - current).min(100);
+                    // In a real implementation, would sleep here
+                    // For now, just continue (busy loop)
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run one iteration of the event loop
+    pub fn tick(&mut self) -> Result<bool, JsError> {
+        self.runtime.process_timers()?;
+        Ok(self.runtime.has_pending_timers())
+    }
+
+    /// Stop the event loop
+    pub fn stop(&mut self) {
+        self.running = false;
+    }
+
+    /// Get mutable reference to the runtime
+    pub fn runtime_mut(&mut self) -> &mut JsRuntime {
+        &mut self.runtime
+    }
+
+    /// Get reference to the runtime
+    pub fn runtime(&self) -> &JsRuntime {
+        &self.runtime
+    }
+}
+
+// ============================================================
+// Script Execution Context
+// ============================================================
+
+/// Context for executing multiple scripts
+pub struct ScriptContext {
+    runtime: JsRuntime,
+    scripts: Vec<String>,
+}
+
+impl ScriptContext {
+    pub fn new() -> ScriptContext {
+        ScriptContext {
+            runtime: JsRuntime::new(),
+            scripts: Vec::new(),
+        }
+    }
+
+    pub fn with_document(document: Document) -> ScriptContext {
+        ScriptContext {
+            runtime: JsRuntime::with_document(document),
+            scripts: Vec::new(),
+        }
+    }
+
+    /// Add a script to be executed
+    pub fn add_script(&mut self, script: String) {
+        self.scripts.push(script);
+    }
+
+    /// Execute all scripts in order
+    pub fn execute_all(&mut self) -> Result<(), JsError> {
+        for script in &self.scripts.clone() {
+            self.runtime.execute(script)?;
+        }
+        Ok(())
+    }
+
+    /// Execute a single script
+    pub fn execute(&mut self, code: &str) -> Result<JsValue, JsError> {
+        self.runtime.execute(code)
+    }
+
+    /// Get the runtime
+    pub fn runtime(&self) -> &JsRuntime {
+        &self.runtime
+    }
+
+    /// Get mutable runtime
+    pub fn runtime_mut(&mut self) -> &mut JsRuntime {
+        &mut self.runtime
+    }
+}
+
+// ============================================================
+// Utilities
+// ============================================================
+
+fn get_current_time_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_execution() {
+        let result = execute_js("1 + 2").unwrap();
+        assert_eq!(result, JsValue::Number(3.0));
+    }
+
+    #[test]
+    fn test_variable_declaration() {
+        let result = execute_js("let x = 5; x * 2").unwrap();
+        assert_eq!(result, JsValue::Number(10.0));
+    }
+
+    #[test]
+    fn test_function_declaration() {
+        let result = execute_js("
+            function add(a, b) {
+                return a + b;
+            }
+            add(3, 4)
+        ").unwrap();
+        assert_eq!(result, JsValue::Number(7.0));
+    }
+
+    #[test]
+    fn test_arrow_function() {
+        let result = execute_js("
+            const multiply = (a, b) => a * b;
+            multiply(3, 4)
+        ").unwrap();
+        assert_eq!(result, JsValue::Number(12.0));
+    }
+
+    #[test]
+    fn test_array_methods() {
+        let result = execute_js("
+            const arr = [1, 2, 3];
+            arr.length
+        ").unwrap();
+        assert_eq!(result, JsValue::Number(3.0));
+    }
+
+    #[test]
+    fn test_object_creation() {
+        let result = execute_js("
+            const obj = { a: 1, b: 2 };
+            obj.a + obj.b
+        ").unwrap();
+        assert_eq!(result, JsValue::Number(3.0));
+    }
+
+    #[test]
+    fn test_for_loop() {
+        let result = execute_js("
+            let sum = 0;
+            for (let i = 0; i < 5; i++) {
+                sum += i;
+            }
+            sum
+        ").unwrap();
+        assert_eq!(result, JsValue::Number(10.0));
+    }
+
+    #[test]
+    fn test_conditional() {
+        let result = execute_js("
+            const x = 5;
+            x > 3 ? 'yes' : 'no'
+        ").unwrap();
+        assert_eq!(result, JsValue::String("yes".to_string()));
+    }
+
+    #[test]
+    fn test_string_concat() {
+        let result = execute_js("'Hello, ' + 'World!'").unwrap();
+        assert_eq!(result, JsValue::String("Hello, World!".to_string()));
+    }
+
+    #[test]
+    fn test_math_object() {
+        let result = execute_js("Math.floor(3.7)").unwrap();
+        assert_eq!(result, JsValue::Number(3.0));
+    }
+
+    #[test]
+    fn test_json_stringify() {
+        let result = execute_js("JSON.stringify({ a: 1 })").unwrap();
+        if let JsValue::String(s) = result {
+            assert!(s.contains("a") && s.contains("1"));
+        } else {
+            panic!("Expected string");
+        }
+    }
+}

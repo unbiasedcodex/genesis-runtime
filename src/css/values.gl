@@ -1,0 +1,747 @@
+// CSS Value Types
+// Represents parsed CSS property values
+
+use super::tokenizer::{CssToken, CssTokenizer, NumericType};
+
+// ============================================================
+// CSS Value Types
+// ============================================================
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CssValue {
+    // Keywords
+    Keyword(String),
+    Inherit,
+    Initial,
+    Unset,
+    Revert,
+
+    // Numeric
+    Number(f64),
+    Percentage(f64),
+    Length(f64, LengthUnit),
+    Angle(f64, AngleUnit),
+    Time(f64, TimeUnit),
+    Frequency(f64, FrequencyUnit),
+    Resolution(f64, ResolutionUnit),
+    Flex(f64),
+
+    // Colors
+    Color(Color),
+
+    // Strings and URLs
+    String(String),
+    Url(String),
+
+    // Functions
+    Function(String, Vec<CssValue>),
+
+    // Lists
+    List(Vec<CssValue>),
+    CommaSeparated(Vec<CssValue>),
+
+    // Special
+    Auto,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LengthUnit {
+    // Absolute
+    Px,
+    Cm,
+    Mm,
+    In,
+    Pt,
+    Pc,
+
+    // Relative
+    Em,
+    Ex,
+    Ch,
+    Rem,
+    Vw,
+    Vh,
+    Vmin,
+    Vmax,
+
+    // Zero (unitless)
+    Zero,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AngleUnit {
+    Deg,
+    Grad,
+    Rad,
+    Turn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimeUnit {
+    S,
+    Ms,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrequencyUnit {
+    Hz,
+    Khz,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResolutionUnit {
+    Dpi,
+    Dpcm,
+    Dppx,
+}
+
+// ============================================================
+// Color Type
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: f32,
+}
+
+impl Color {
+    pub fn new(r: u8, g: u8, b: u8, a: f32) -> Color {
+        Color { r, g, b, a }
+    }
+
+    pub fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 1.0 }
+    }
+
+    pub fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color {
+        Color { r, g, b, a }
+    }
+
+    pub fn transparent() -> Color {
+        Color { r: 0, g: 0, b: 0, a: 0.0 }
+    }
+
+    pub fn black() -> Color {
+        Color::rgb(0, 0, 0)
+    }
+
+    pub fn white() -> Color {
+        Color::rgb(255, 255, 255)
+    }
+
+    // Convert to u32 ARGB format
+    pub fn to_argb(&self) -> u32 {
+        let a = (self.a * 255.0) as u32;
+        ((a & 0xFF) << 24) |
+        ((self.r as u32) << 16) |
+        ((self.g as u32) << 8) |
+        (self.b as u32)
+    }
+
+    // Convert to u32 RGBA format
+    pub fn to_rgba(&self) -> u32 {
+        let a = (self.a * 255.0) as u32;
+        ((self.r as u32) << 24) |
+        ((self.g as u32) << 16) |
+        ((self.b as u32) << 8) |
+        (a & 0xFF)
+    }
+
+    // Parse from hex string (#RGB, #RRGGBB, #RGBA, #RRGGBBAA)
+    pub fn from_hex(hex: &str) -> Option<Color> {
+        let hex = hex.trim_start_matches('#');
+        let len = hex.len();
+
+        match len {
+            3 => {
+                // #RGB
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                Some(Color::rgb(r * 17, g * 17, b * 17))
+            },
+            4 => {
+                // #RGBA
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+                let a = u8::from_str_radix(&hex[3..4], 16).ok()?;
+                Some(Color::rgba(r * 17, g * 17, b * 17, (a * 17) as f32 / 255.0))
+            },
+            6 => {
+                // #RRGGBB
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                Some(Color::rgb(r, g, b))
+            },
+            8 => {
+                // #RRGGBBAA
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+                Some(Color::rgba(r, g, b, a as f32 / 255.0))
+            },
+            _ => None,
+        }
+    }
+
+    // Parse named color
+    pub fn from_name(name: &str) -> Option<Color> {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "transparent" => Some(Color::transparent()),
+            "black" => Some(Color::rgb(0, 0, 0)),
+            "white" => Some(Color::rgb(255, 255, 255)),
+            "red" => Some(Color::rgb(255, 0, 0)),
+            "green" => Some(Color::rgb(0, 128, 0)),
+            "blue" => Some(Color::rgb(0, 0, 255)),
+            "yellow" => Some(Color::rgb(255, 255, 0)),
+            "cyan" | "aqua" => Some(Color::rgb(0, 255, 255)),
+            "magenta" | "fuchsia" => Some(Color::rgb(255, 0, 255)),
+            "gray" | "grey" => Some(Color::rgb(128, 128, 128)),
+            "silver" => Some(Color::rgb(192, 192, 192)),
+            "maroon" => Some(Color::rgb(128, 0, 0)),
+            "olive" => Some(Color::rgb(128, 128, 0)),
+            "lime" => Some(Color::rgb(0, 255, 0)),
+            "teal" => Some(Color::rgb(0, 128, 128)),
+            "navy" => Some(Color::rgb(0, 0, 128)),
+            "purple" => Some(Color::rgb(128, 0, 128)),
+            "orange" => Some(Color::rgb(255, 165, 0)),
+            "pink" => Some(Color::rgb(255, 192, 203)),
+            "brown" => Some(Color::rgb(165, 42, 42)),
+            "coral" => Some(Color::rgb(255, 127, 80)),
+            "crimson" => Some(Color::rgb(220, 20, 60)),
+            "darkblue" => Some(Color::rgb(0, 0, 139)),
+            "darkgray" | "darkgrey" => Some(Color::rgb(169, 169, 169)),
+            "darkgreen" => Some(Color::rgb(0, 100, 0)),
+            "darkred" => Some(Color::rgb(139, 0, 0)),
+            "gold" => Some(Color::rgb(255, 215, 0)),
+            "indigo" => Some(Color::rgb(75, 0, 130)),
+            "ivory" => Some(Color::rgb(255, 255, 240)),
+            "khaki" => Some(Color::rgb(240, 230, 140)),
+            "lavender" => Some(Color::rgb(230, 230, 250)),
+            "lightblue" => Some(Color::rgb(173, 216, 230)),
+            "lightgray" | "lightgrey" => Some(Color::rgb(211, 211, 211)),
+            "lightgreen" => Some(Color::rgb(144, 238, 144)),
+            "lightyellow" => Some(Color::rgb(255, 255, 224)),
+            "salmon" => Some(Color::rgb(250, 128, 114)),
+            "skyblue" => Some(Color::rgb(135, 206, 235)),
+            "tan" => Some(Color::rgb(210, 180, 140)),
+            "tomato" => Some(Color::rgb(255, 99, 71)),
+            "turquoise" => Some(Color::rgb(64, 224, 208)),
+            "violet" => Some(Color::rgb(238, 130, 238)),
+            "wheat" => Some(Color::rgb(245, 222, 179)),
+            // Current color keyword
+            "currentcolor" => None, // Special handling needed
+            _ => None,
+        }
+    }
+
+    // Convert HSL to RGB
+    pub fn from_hsl(h: f64, s: f64, l: f64) -> Color {
+        let h = h % 360.0;
+        let s = s.max(0.0).min(1.0);
+        let l = l.max(0.0).min(1.0);
+
+        let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = l - c / 2.0;
+
+        let (r1, g1, b1) = if h < 60.0 {
+            (c, x, 0.0)
+        } else if h < 120.0 {
+            (x, c, 0.0)
+        } else if h < 180.0 {
+            (0.0, c, x)
+        } else if h < 240.0 {
+            (0.0, x, c)
+        } else if h < 300.0 {
+            (x, 0.0, c)
+        } else {
+            (c, 0.0, x)
+        };
+
+        Color::rgb(
+            ((r1 + m) * 255.0) as u8,
+            ((g1 + m) * 255.0) as u8,
+            ((b1 + m) * 255.0) as u8,
+        )
+    }
+
+    pub fn from_hsla(h: f64, s: f64, l: f64, a: f32) -> Color {
+        let mut c = Color::from_hsl(h, s, l);
+        c.a = a;
+        c
+    }
+}
+
+// ============================================================
+// Value Parser
+// ============================================================
+
+pub struct ValueParser {
+    tokens: Vec<CssToken>,
+    pos: usize,
+}
+
+impl ValueParser {
+    pub fn new(css: &str) -> ValueParser {
+        let mut tokenizer = CssTokenizer::new(css);
+        ValueParser {
+            tokens: tokenizer.tokenize_all(),
+            pos: 0,
+        }
+    }
+
+    pub fn from_tokens(tokens: Vec<CssToken>) -> ValueParser {
+        ValueParser { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> &CssToken {
+        self.tokens.get(self.pos).unwrap_or(&CssToken::EOF)
+    }
+
+    fn consume(&mut self) -> CssToken {
+        let token = self.tokens.get(self.pos).cloned().unwrap_or(CssToken::EOF);
+        self.pos += 1;
+        token
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), CssToken::Whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    // Parse a single value
+    pub fn parse_value(&mut self) -> Option<CssValue> {
+        self.skip_whitespace();
+
+        match self.peek().clone() {
+            CssToken::Ident(name) => {
+                self.pos += 1;
+                let lower = name.to_ascii_lowercase();
+
+                // Check for keywords
+                match lower.as_str() {
+                    "inherit" => return Some(CssValue::Inherit),
+                    "initial" => return Some(CssValue::Initial),
+                    "unset" => return Some(CssValue::Unset),
+                    "revert" => return Some(CssValue::Revert),
+                    "auto" => return Some(CssValue::Auto),
+                    "none" => return Some(CssValue::None),
+                    _ => {}
+                }
+
+                // Check for named color
+                if let Some(color) = Color::from_name(&lower) {
+                    return Some(CssValue::Color(color));
+                }
+
+                Some(CssValue::Keyword(lower))
+            },
+
+            CssToken::Hash(value, _) => {
+                self.pos += 1;
+                if let Some(color) = Color::from_hex(&value) {
+                    Some(CssValue::Color(color))
+                } else {
+                    Some(CssValue::Keyword(format!("#{}", value)))
+                }
+            },
+
+            CssToken::String(s) => {
+                self.pos += 1;
+                Some(CssValue::String(s))
+            },
+
+            CssToken::Number(n, _) => {
+                self.pos += 1;
+                if n == 0.0 {
+                    Some(CssValue::Length(0.0, LengthUnit::Zero))
+                } else {
+                    Some(CssValue::Number(n))
+                }
+            },
+
+            CssToken::Percentage(n) => {
+                self.pos += 1;
+                Some(CssValue::Percentage(n))
+            },
+
+            CssToken::Dimension(n, unit) => {
+                self.pos += 1;
+                let unit_lower = unit.to_ascii_lowercase();
+
+                // Length units
+                if let Some(length_unit) = parse_length_unit(&unit_lower) {
+                    return Some(CssValue::Length(n, length_unit));
+                }
+
+                // Angle units
+                if let Some(angle_unit) = parse_angle_unit(&unit_lower) {
+                    return Some(CssValue::Angle(n, angle_unit));
+                }
+
+                // Time units
+                if let Some(time_unit) = parse_time_unit(&unit_lower) {
+                    return Some(CssValue::Time(n, time_unit));
+                }
+
+                // Frequency units
+                if let Some(freq_unit) = parse_frequency_unit(&unit_lower) {
+                    return Some(CssValue::Frequency(n, freq_unit));
+                }
+
+                // Resolution units
+                if let Some(res_unit) = parse_resolution_unit(&unit_lower) {
+                    return Some(CssValue::Resolution(n, res_unit));
+                }
+
+                // Flex unit
+                if unit_lower == "fr" {
+                    return Some(CssValue::Flex(n));
+                }
+
+                None
+            },
+
+            CssToken::Url(url) => {
+                self.pos += 1;
+                Some(CssValue::Url(url))
+            },
+
+            CssToken::Function(name) => {
+                self.pos += 1;
+                let args = self.parse_function_args();
+                let lower = name.to_ascii_lowercase();
+
+                // Handle color functions
+                match lower.as_str() {
+                    "rgb" | "rgba" => {
+                        if let Some(color) = self.parse_rgb_function(&args) {
+                            return Some(CssValue::Color(color));
+                        }
+                    },
+                    "hsl" | "hsla" => {
+                        if let Some(color) = self.parse_hsl_function(&args) {
+                            return Some(CssValue::Color(color));
+                        }
+                    },
+                    _ => {}
+                }
+
+                Some(CssValue::Function(lower, args))
+            },
+
+            _ => None,
+        }
+    }
+
+    // Parse all values (space-separated list)
+    pub fn parse_value_list(&mut self) -> Vec<CssValue> {
+        let mut values = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            if matches!(self.peek(), CssToken::EOF | CssToken::Semicolon | CssToken::CloseBrace) {
+                break;
+            }
+
+            // Check for comma (comma-separated values)
+            if matches!(self.peek(), CssToken::Comma) {
+                self.pos += 1;
+                // Create comma-separated wrapper if needed
+                if let Some(last) = values.last_mut() {
+                    // Continue parsing
+                }
+                continue;
+            }
+
+            if let Some(value) = self.parse_value() {
+                values.push(value);
+            } else {
+                // Skip unknown token
+                self.pos += 1;
+            }
+        }
+
+        values
+    }
+
+    fn parse_function_args(&mut self) -> Vec<CssValue> {
+        let mut args = Vec::new();
+        let mut depth = 1;
+
+        while depth > 0 {
+            self.skip_whitespace();
+
+            match self.peek() {
+                CssToken::EOF => break,
+                CssToken::CloseParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.pos += 1;
+                        break;
+                    }
+                    self.pos += 1;
+                },
+                CssToken::Comma => {
+                    self.pos += 1;
+                },
+                CssToken::Function(_) => {
+                    if let Some(val) = self.parse_value() {
+                        args.push(val);
+                    }
+                },
+                _ => {
+                    if let Some(val) = self.parse_value() {
+                        args.push(val);
+                    }
+                }
+            }
+        }
+
+        args
+    }
+
+    fn parse_rgb_function(&self, args: &[CssValue]) -> Option<Color> {
+        if args.len() < 3 {
+            return None;
+        }
+
+        let r = self.value_to_color_component(&args[0])?;
+        let g = self.value_to_color_component(&args[1])?;
+        let b = self.value_to_color_component(&args[2])?;
+
+        let a = if args.len() > 3 {
+            self.value_to_alpha(&args[3])?
+        } else {
+            1.0
+        };
+
+        Some(Color::rgba(r, g, b, a))
+    }
+
+    fn parse_hsl_function(&self, args: &[CssValue]) -> Option<Color> {
+        if args.len() < 3 {
+            return None;
+        }
+
+        let h = match &args[0] {
+            CssValue::Number(n) => *n,
+            CssValue::Angle(n, _) => *n,
+            _ => return None,
+        };
+
+        let s = match &args[1] {
+            CssValue::Percentage(n) => *n / 100.0,
+            CssValue::Number(n) => *n,
+            _ => return None,
+        };
+
+        let l = match &args[2] {
+            CssValue::Percentage(n) => *n / 100.0,
+            CssValue::Number(n) => *n,
+            _ => return None,
+        };
+
+        let a = if args.len() > 3 {
+            self.value_to_alpha(&args[3])?
+        } else {
+            1.0
+        };
+
+        Some(Color::from_hsla(h, s, l, a))
+    }
+
+    fn value_to_color_component(&self, value: &CssValue) -> Option<u8> {
+        match value {
+            CssValue::Number(n) => Some((*n as u8).min(255)),
+            CssValue::Percentage(n) => Some(((*n / 100.0 * 255.0) as u8).min(255)),
+            _ => None,
+        }
+    }
+
+    fn value_to_alpha(&self, value: &CssValue) -> Option<f32> {
+        match value {
+            CssValue::Number(n) => Some((*n as f32).max(0.0).min(1.0)),
+            CssValue::Percentage(n) => Some(((*n / 100.0) as f32).max(0.0).min(1.0)),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================
+// Unit Parsing Helpers
+// ============================================================
+
+fn parse_length_unit(unit: &str) -> Option<LengthUnit> {
+    match unit {
+        "px" => Some(LengthUnit::Px),
+        "cm" => Some(LengthUnit::Cm),
+        "mm" => Some(LengthUnit::Mm),
+        "in" => Some(LengthUnit::In),
+        "pt" => Some(LengthUnit::Pt),
+        "pc" => Some(LengthUnit::Pc),
+        "em" => Some(LengthUnit::Em),
+        "ex" => Some(LengthUnit::Ex),
+        "ch" => Some(LengthUnit::Ch),
+        "rem" => Some(LengthUnit::Rem),
+        "vw" => Some(LengthUnit::Vw),
+        "vh" => Some(LengthUnit::Vh),
+        "vmin" => Some(LengthUnit::Vmin),
+        "vmax" => Some(LengthUnit::Vmax),
+        _ => None,
+    }
+}
+
+fn parse_angle_unit(unit: &str) -> Option<AngleUnit> {
+    match unit {
+        "deg" => Some(AngleUnit::Deg),
+        "grad" => Some(AngleUnit::Grad),
+        "rad" => Some(AngleUnit::Rad),
+        "turn" => Some(AngleUnit::Turn),
+        _ => None,
+    }
+}
+
+fn parse_time_unit(unit: &str) -> Option<TimeUnit> {
+    match unit {
+        "s" => Some(TimeUnit::S),
+        "ms" => Some(TimeUnit::Ms),
+        _ => None,
+    }
+}
+
+fn parse_frequency_unit(unit: &str) -> Option<FrequencyUnit> {
+    match unit {
+        "hz" => Some(FrequencyUnit::Hz),
+        "khz" => Some(FrequencyUnit::Khz),
+        _ => None,
+    }
+}
+
+fn parse_resolution_unit(unit: &str) -> Option<ResolutionUnit> {
+    match unit {
+        "dpi" => Some(ResolutionUnit::Dpi),
+        "dpcm" => Some(ResolutionUnit::Dpcm),
+        "dppx" | "x" => Some(ResolutionUnit::Dppx),
+        _ => None,
+    }
+}
+
+// ============================================================
+// Value Conversion
+// ============================================================
+
+impl CssValue {
+    // Convert length to pixels (given context)
+    pub fn to_px(&self, font_size: f64, viewport_width: f64, viewport_height: f64) -> Option<f64> {
+        match self {
+            CssValue::Length(n, unit) => {
+                let px = match unit {
+                    LengthUnit::Px | LengthUnit::Zero => *n,
+                    LengthUnit::Cm => *n * 96.0 / 2.54,
+                    LengthUnit::Mm => *n * 96.0 / 25.4,
+                    LengthUnit::In => *n * 96.0,
+                    LengthUnit::Pt => *n * 96.0 / 72.0,
+                    LengthUnit::Pc => *n * 96.0 / 6.0,
+                    LengthUnit::Em => *n * font_size,
+                    LengthUnit::Ex => *n * font_size * 0.5, // Approximate
+                    LengthUnit::Ch => *n * font_size * 0.5, // Approximate
+                    LengthUnit::Rem => *n * 16.0, // Assume root font size is 16px
+                    LengthUnit::Vw => *n * viewport_width / 100.0,
+                    LengthUnit::Vh => *n * viewport_height / 100.0,
+                    LengthUnit::Vmin => *n * viewport_width.min(viewport_height) / 100.0,
+                    LengthUnit::Vmax => *n * viewport_width.max(viewport_height) / 100.0,
+                };
+                Some(px)
+            },
+            CssValue::Number(n) if *n == 0.0 => Some(0.0),
+            CssValue::Percentage(n) => Some(*n), // Context dependent
+            _ => None,
+        }
+    }
+
+    // Convert angle to degrees
+    pub fn to_degrees(&self) -> Option<f64> {
+        match self {
+            CssValue::Angle(n, unit) => {
+                let deg = match unit {
+                    AngleUnit::Deg => *n,
+                    AngleUnit::Grad => *n * 360.0 / 400.0,
+                    AngleUnit::Rad => *n * 180.0 / std::f64::consts::PI,
+                    AngleUnit::Turn => *n * 360.0,
+                };
+                Some(deg)
+            },
+            CssValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    // Convert time to milliseconds
+    pub fn to_ms(&self) -> Option<f64> {
+        match self {
+            CssValue::Time(n, unit) => {
+                let ms = match unit {
+                    TimeUnit::S => *n * 1000.0,
+                    TimeUnit::Ms => *n,
+                };
+                Some(ms)
+            },
+            _ => None,
+        }
+    }
+
+    // Check if value is zero
+    pub fn is_zero(&self) -> bool {
+        match self {
+            CssValue::Number(n) => *n == 0.0,
+            CssValue::Length(n, _) => *n == 0.0,
+            CssValue::Percentage(n) => *n == 0.0,
+            _ => false,
+        }
+    }
+
+    // Check if value is auto
+    pub fn is_auto(&self) -> bool {
+        matches!(self, CssValue::Auto)
+    }
+
+    // Check if value is none
+    pub fn is_none(&self) -> bool {
+        matches!(self, CssValue::None)
+    }
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+pub fn parse_value(css: &str) -> Option<CssValue> {
+    let mut parser = ValueParser::new(css);
+    parser.parse_value()
+}
+
+pub fn parse_value_list(css: &str) -> Vec<CssValue> {
+    let mut parser = ValueParser::new(css);
+    parser.parse_value_list()
+}
+
+pub fn parse_color(css: &str) -> Option<Color> {
+    match parse_value(css) {
+        Some(CssValue::Color(c)) => Some(c),
+        _ => {
+            // Try hex color directly
+            Color::from_hex(css).or_else(|| Color::from_name(css))
+        }
+    }
+}

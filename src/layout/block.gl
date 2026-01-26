@@ -1,0 +1,508 @@
+// Block Layout Algorithm
+// CSS 2.1 Visual Formatting Model for block-level boxes
+
+use super::box_model::{LayoutBox, BoxType, BoxDimensions, EdgeSizes, Rect, ContainingBlock, LayoutContext};
+use super::box_model::{resolve_auto_margins};
+use super::super::css::{ComputedStyle, Display, Position, Float, Overflow, Dimension};
+
+// ============================================================
+// Block Formatting Context
+// ============================================================
+
+pub struct BlockFormattingContext {
+    // Current vertical position
+    pub y: f64,
+
+    // Collapsed margins
+    pub margin_collapse: MarginCollapse,
+
+    // Float positions
+    pub float_left: Vec<FloatBox>,
+    pub float_right: Vec<FloatBox>,
+
+    // Containing block
+    pub containing_block: ContainingBlock,
+}
+
+#[derive(Clone, Debug)]
+pub struct FloatBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub float_type: Float,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MarginCollapse {
+    pub positive: f64,
+    pub negative: f64,
+}
+
+impl MarginCollapse {
+    pub fn new() -> MarginCollapse {
+        MarginCollapse { positive: 0.0, negative: 0.0 }
+    }
+
+    pub fn add(&mut self, margin: f64) {
+        if margin >= 0.0 {
+            self.positive = self.positive.max(margin);
+        } else {
+            self.negative = self.negative.min(margin);
+        }
+    }
+
+    pub fn value(&self) -> f64 {
+        self.positive + self.negative
+    }
+
+    pub fn reset(&mut self) {
+        self.positive = 0.0;
+        self.negative = 0.0;
+    }
+}
+
+impl BlockFormattingContext {
+    pub fn new(containing_block: ContainingBlock) -> BlockFormattingContext {
+        BlockFormattingContext {
+            y: containing_block.y,
+            margin_collapse: MarginCollapse::new(),
+            float_left: Vec::new(),
+            float_right: Vec::new(),
+            containing_block,
+        }
+    }
+
+    // Get available width at a given Y position (accounting for floats)
+    pub fn available_width(&self, y: f64, height: f64) -> (f64, f64, f64) {
+        let mut left = self.containing_block.x;
+        let mut right = self.containing_block.x + self.containing_block.width;
+
+        // Check left floats
+        for float in &self.float_left {
+            if y < float.y + float.height && y + height > float.y {
+                left = left.max(float.x + float.width);
+            }
+        }
+
+        // Check right floats
+        for float in &self.float_right {
+            if y < float.y + float.height && y + height > float.y {
+                right = right.min(float.x);
+            }
+        }
+
+        (left, right - left, right)
+    }
+
+    // Find Y position that clears floats
+    pub fn clear_floats(&self, clear: super::super::css::Clear) -> f64 {
+        let mut y = self.y;
+
+        match clear {
+            super::super::css::Clear::Left | super::super::css::Clear::Both => {
+                for float in &self.float_left {
+                    y = y.max(float.y + float.height);
+                }
+            },
+            _ => {}
+        }
+
+        match clear {
+            super::super::css::Clear::Right | super::super::css::Clear::Both => {
+                for float in &self.float_right {
+                    y = y.max(float.y + float.height);
+                }
+            },
+            _ => {}
+        }
+
+        y
+    }
+
+    // Add a float to the context
+    pub fn add_float(&mut self, float_box: FloatBox) {
+        match float_box.float_type {
+            Float::Left => self.float_left.push(float_box),
+            Float::Right => self.float_right.push(float_box),
+            _ => {}
+        }
+    }
+
+    // Place a float at the current position
+    pub fn place_float(&mut self, layout_box: &mut LayoutBox) {
+        let width = layout_box.dimensions.margin_box().width;
+        let height = layout_box.dimensions.margin_box().height;
+
+        let (left, available, right) = self.available_width(self.y, height);
+
+        let x = match layout_box.float {
+            Float::Left => left,
+            Float::Right => right - width,
+            _ => left,
+        };
+
+        // Position the box
+        layout_box.dimensions.content.x = x + layout_box.dimensions.margin.left +
+                                          layout_box.dimensions.border.left +
+                                          layout_box.dimensions.padding.left;
+        layout_box.dimensions.content.y = self.y + layout_box.dimensions.margin.top +
+                                          layout_box.dimensions.border.top +
+                                          layout_box.dimensions.padding.top;
+
+        // Add to float list
+        self.add_float(FloatBox {
+            x,
+            y: self.y,
+            width,
+            height,
+            float_type: layout_box.float,
+        });
+    }
+}
+
+// ============================================================
+// Block Layout
+// ============================================================
+
+pub fn layout_block(
+    layout_box: &mut LayoutBox,
+    containing: ContainingBlock,
+    ctx: &LayoutContext,
+) {
+    // Calculate width
+    calculate_block_width(layout_box, containing.width);
+
+    // Calculate position
+    calculate_block_position(layout_box, containing);
+
+    // Layout children
+    layout_block_children(layout_box, ctx);
+
+    // Calculate height
+    calculate_block_height(layout_box, containing.height);
+}
+
+fn calculate_block_width(layout_box: &mut LayoutBox, containing_width: f64) {
+    let style = &layout_box.style;
+
+    // Get specified values
+    let width = style.width;
+    let margin_left = style.margin_left;
+    let margin_right = style.margin_right;
+
+    // Border and padding don't have 'auto'
+    let border_left = style.border_left_width;
+    let border_right = style.border_right_width;
+    let padding_left = resolve_dimension(&style.padding_left, containing_width);
+    let padding_right = resolve_dimension(&style.padding_right, containing_width);
+
+    layout_box.dimensions.border.left = border_left;
+    layout_box.dimensions.border.right = border_right;
+    layout_box.dimensions.padding.left = padding_left;
+    layout_box.dimensions.padding.right = padding_right;
+
+    // Calculate total width excluding margins
+    let non_margin_width = border_left + padding_left + border_right + padding_right;
+
+    // Resolve width
+    let content_width = match width {
+        Dimension::Auto => {
+            // Auto width: fill available space
+            let margin_l = resolve_dimension(&margin_left, containing_width);
+            let margin_r = resolve_dimension(&margin_right, containing_width);
+            (containing_width - non_margin_width - margin_l - margin_r).max(0.0)
+        },
+        Dimension::Length(w) => w,
+        Dimension::Percentage(p) => containing_width * p / 100.0,
+        _ => 0.0,
+    };
+
+    layout_box.dimensions.content.width = content_width;
+
+    // Resolve auto margins
+    let total_width = content_width + non_margin_width;
+    let (ml, mr) = resolve_auto_margins(total_width, containing_width, margin_left, margin_right);
+
+    layout_box.dimensions.margin.left = ml;
+    layout_box.dimensions.margin.right = mr;
+
+    // Handle overflow (if width + margins > containing width)
+    if matches!(width, Dimension::Length(_) | Dimension::Percentage(_)) {
+        let total = content_width + non_margin_width + ml + mr;
+        if total > containing_width {
+            // Adjust right margin to fit
+            layout_box.dimensions.margin.right = containing_width - content_width - non_margin_width - ml;
+        }
+    }
+}
+
+fn calculate_block_position(layout_box: &mut LayoutBox, containing: ContainingBlock) {
+    let style = &layout_box.style;
+    let d = &mut layout_box.dimensions;
+
+    // Vertical margins, borders, padding
+    d.margin.top = resolve_dimension(&style.margin_top, containing.width);
+    d.margin.bottom = resolve_dimension(&style.margin_bottom, containing.width);
+    d.border.top = style.border_top_width;
+    d.border.bottom = style.border_bottom_width;
+    d.padding.top = resolve_dimension(&style.padding_top, containing.width);
+    d.padding.bottom = resolve_dimension(&style.padding_bottom, containing.width);
+
+    // Calculate X position
+    d.content.x = containing.x +
+                  d.margin.left +
+                  d.border.left +
+                  d.padding.left;
+
+    // Y position will be set by parent
+}
+
+fn layout_block_children(layout_box: &mut LayoutBox, ctx: &LayoutContext) {
+    let d = &mut layout_box.dimensions;
+
+    // Create containing block for children
+    let child_containing = ContainingBlock {
+        x: d.content.x,
+        y: d.content.y,
+        width: d.content.width,
+        height: 0.0, // Will be calculated
+    };
+
+    let mut bfc = BlockFormattingContext::new(child_containing);
+    let mut current_y = d.content.y;
+
+    for child in &mut layout_box.children {
+        // Handle clear
+        if child.style.clear != super::super::css::Clear::None {
+            current_y = bfc.clear_floats(child.style.clear);
+        }
+
+        // Handle floats
+        if child.float != Float::None {
+            layout_float(child, &mut bfc, ctx);
+            continue;
+        }
+
+        // Handle positioned elements
+        if child.is_absolutely_positioned() {
+            // Absolutely positioned elements don't affect flow
+            layout_absolutely_positioned(child, &child_containing, ctx);
+            continue;
+        }
+
+        // Position the child
+        child.dimensions.content.y = current_y +
+                                     child.dimensions.margin.top +
+                                     child.dimensions.border.top +
+                                     child.dimensions.padding.top;
+
+        // Layout based on box type
+        match child.box_type {
+            BoxType::Block | BoxType::ListItem => {
+                layout_block(child, child_containing, ctx);
+            },
+            BoxType::Inline | BoxType::InlineBlock | BoxType::Text | BoxType::Anonymous => {
+                super::inline::layout_inline_container(child, &child_containing, ctx);
+            },
+            BoxType::Flex => {
+                super::flex::layout_flex(child, child_containing, ctx);
+            },
+            _ => {
+                layout_block(child, child_containing, ctx);
+            }
+        }
+
+        // Update Y position
+        current_y = child.dimensions.margin_box().bottom();
+        bfc.y = current_y;
+    }
+
+    // Set content height based on children
+    d.content.height = current_y - d.content.y;
+}
+
+fn calculate_block_height(layout_box: &mut LayoutBox, containing_height: f64) {
+    let style = &layout_box.style;
+
+    // Check for explicit height
+    match style.height {
+        Dimension::Length(h) => {
+            layout_box.dimensions.content.height = h;
+        },
+        Dimension::Percentage(p) => {
+            // Percentage height only works if containing block has definite height
+            if containing_height > 0.0 {
+                layout_box.dimensions.content.height = containing_height * p / 100.0;
+            }
+        },
+        _ => {
+            // Auto height is already calculated from children
+        }
+    }
+
+    // Apply min/max height constraints
+    if let Dimension::Length(min) = style.min_height {
+        if layout_box.dimensions.content.height < min {
+            layout_box.dimensions.content.height = min;
+        }
+    }
+
+    if let Dimension::Length(max) = style.max_height {
+        if layout_box.dimensions.content.height > max {
+            layout_box.dimensions.content.height = max;
+        }
+    }
+}
+
+fn layout_float(layout_box: &mut LayoutBox, bfc: &mut BlockFormattingContext, ctx: &LayoutContext) {
+    // Calculate float dimensions
+    let width = match layout_box.style.width {
+        Dimension::Length(w) => w,
+        Dimension::Percentage(p) => bfc.containing_block.width * p / 100.0,
+        Dimension::Auto => {
+            // Shrink to fit for floats
+            calculate_shrink_to_fit_width(layout_box, bfc.containing_block.width)
+        },
+        _ => 0.0,
+    };
+
+    layout_box.dimensions.content.width = width;
+
+    // Layout children to determine height
+    let child_containing = ContainingBlock {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height: 0.0,
+    };
+
+    layout_block_children(layout_box, ctx);
+
+    // Calculate height
+    calculate_block_height(layout_box, 0.0);
+
+    // Place the float
+    bfc.place_float(layout_box);
+}
+
+fn layout_absolutely_positioned(
+    layout_box: &mut LayoutBox,
+    containing: &ContainingBlock,
+    ctx: &LayoutContext,
+) {
+    let style = &layout_box.style;
+    let d = &mut layout_box.dimensions;
+
+    // Resolve width
+    let width = match style.width {
+        Dimension::Length(w) => w,
+        Dimension::Percentage(p) => containing.width * p / 100.0,
+        Dimension::Auto => {
+            // Calculate from left/right if both specified
+            match (style.left, style.right) {
+                (Dimension::Length(l), Dimension::Length(r)) => {
+                    (containing.width - l - r).max(0.0)
+                },
+                _ => calculate_shrink_to_fit_width(layout_box, containing.width),
+            }
+        },
+        _ => 0.0,
+    };
+
+    d.content.width = width;
+
+    // Set borders and padding
+    d.border.left = style.border_left_width;
+    d.border.right = style.border_right_width;
+    d.border.top = style.border_top_width;
+    d.border.bottom = style.border_bottom_width;
+    d.padding.left = resolve_dimension(&style.padding_left, containing.width);
+    d.padding.right = resolve_dimension(&style.padding_right, containing.width);
+    d.padding.top = resolve_dimension(&style.padding_top, containing.width);
+    d.padding.bottom = resolve_dimension(&style.padding_bottom, containing.width);
+
+    // Calculate X position
+    let left = resolve_dimension_or_auto(&style.left, containing.width);
+    let right = resolve_dimension_or_auto(&style.right, containing.width);
+
+    d.content.x = if let Some(l) = left {
+        containing.x + l + d.margin.left + d.border.left + d.padding.left
+    } else if let Some(r) = right {
+        containing.x + containing.width - r - d.margin.right - d.border.right -
+        d.padding.right - width
+    } else {
+        containing.x + d.margin.left + d.border.left + d.padding.left
+    };
+
+    // Calculate Y position
+    let top = resolve_dimension_or_auto(&style.top, containing.height);
+    let bottom = resolve_dimension_or_auto(&style.bottom, containing.height);
+
+    d.content.y = if let Some(t) = top {
+        containing.y + t + d.margin.top + d.border.top + d.padding.top
+    } else if let Some(b) = bottom {
+        // Need height first
+        layout_block_children(layout_box, ctx);
+        calculate_block_height(layout_box, containing.height);
+        containing.y + containing.height - b - d.margin.bottom - d.border.bottom -
+        d.padding.bottom - d.content.height
+    } else {
+        containing.y + d.margin.top + d.border.top + d.padding.top
+    };
+
+    // Layout children if not done
+    if d.content.height == 0.0 {
+        layout_block_children(layout_box, ctx);
+        calculate_block_height(layout_box, containing.height);
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+fn resolve_dimension(dim: &Dimension, containing: f64) -> f64 {
+    match dim {
+        Dimension::Length(v) => *v,
+        Dimension::Percentage(p) => containing * p / 100.0,
+        _ => 0.0,
+    }
+}
+
+fn resolve_dimension_or_auto(dim: &Dimension, containing: f64) -> Option<f64> {
+    match dim {
+        Dimension::Auto => None,
+        Dimension::Length(v) => Some(*v),
+        Dimension::Percentage(p) => Some(containing * p / 100.0),
+        _ => None,
+    }
+}
+
+fn calculate_shrink_to_fit_width(layout_box: &LayoutBox, available: f64) -> f64 {
+    // Simplified shrink-to-fit calculation
+    // In a full implementation, this would calculate preferred and minimum widths
+    let mut max_child_width = 0.0_f64;
+
+    for child in &layout_box.children {
+        let child_width = child.dimensions.margin_box().width;
+        max_child_width = max_child_width.max(child_width);
+    }
+
+    max_child_width.min(available)
+}
+
+// ============================================================
+// Margin Collapsing
+// ============================================================
+
+pub fn collapse_margins(top: f64, bottom: f64) -> f64 {
+    // Collapse adjacent margins
+    if top >= 0.0 && bottom >= 0.0 {
+        top.max(bottom)
+    } else if top < 0.0 && bottom < 0.0 {
+        top.min(bottom)
+    } else {
+        top + bottom
+    }
+}

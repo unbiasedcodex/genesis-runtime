@@ -93,6 +93,10 @@ fn run_auto_test() {
     runtime::print_char(61);
     runtime::print_char(10);
 
+    // Test 0: Browser UI (Framebuffer Graphics)
+    serial_print_str(91, 48, 93, 32, 71, 69, 66, 10);  // "[0] GEB\n"
+    commands::cmd_browser();
+
     // Wait for network to be ready (yield a few times)
     let mut wait: i64 = 0;
     while wait < 100 {
@@ -634,6 +638,14 @@ fn shell_execute() {
                 commands::line_get(2) == 114 && commands::line_get(3) == 108 &&
                 commands::line_get(4) == 32 {
             commands::cmd_curl();
+        }
+        // "browser" = 98, 114, 111, 119, 115, 101, 114
+        else if commands::cmd_match(98, 114, 111, 119, 115, 101, 114, 0) {
+            commands::cmd_browser();
+        }
+        // "geb" = 103, 101, 98 (alias for browser)
+        else if commands::cmd_match(103, 101, 98, 0, 0, 0, 0, 0) {
+            commands::cmd_browser();
         }
         else {
             // Unknown command

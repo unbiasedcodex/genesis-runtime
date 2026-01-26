@@ -1,0 +1,363 @@
+// Layout Engine Module
+// CSS Visual Formatting Model implementation
+
+pub mod box_model;
+pub mod block;
+pub mod inline;
+pub mod flex;
+
+// Re-export commonly used items
+pub use box_model::{Point, Size, Rect, EdgeSizes, BoxDimensions, BoxType, LayoutBox};
+pub use box_model::{LineBox, LineFragment, FragmentContent, LayoutContext, ContainingBlock};
+pub use block::{layout_block, BlockFormattingContext, FloatBox, MarginCollapse, collapse_margins};
+pub use inline::{layout_inline_container, InlineFormattingContext, align_line_box, align_vertical};
+pub use flex::layout_flex;
+
+use super::html::{Document, Node, NodeType, NodeData};
+use super::css::{ComputedStyle, Stylesheet, Display, Position, Float};
+
+// ============================================================
+// Layout Tree Builder
+// ============================================================
+
+pub struct LayoutTreeBuilder {
+    pub stylesheets: Vec<Stylesheet>,
+}
+
+impl LayoutTreeBuilder {
+    pub fn new() -> LayoutTreeBuilder {
+        LayoutTreeBuilder {
+            stylesheets: Vec::new(),
+        }
+    }
+
+    pub fn add_stylesheet(&mut self, stylesheet: Stylesheet) {
+        self.stylesheets.push(stylesheet);
+    }
+
+    // Build layout tree from DOM
+    pub fn build(&self, document: &Document, viewport_width: f64, viewport_height: f64) -> Option<LayoutBox> {
+        let html_idx = document.document_element?;
+
+        // Compute styles and build layout box
+        let mut root = self.build_layout_box(document, html_idx);
+
+        // Create layout context
+        let ctx = LayoutContext::new(viewport_width, viewport_height);
+
+        // Create initial containing block
+        let initial_containing = ContainingBlock::new(0.0, 0.0, viewport_width, viewport_height);
+
+        // Perform layout
+        layout_box_tree(&mut root, initial_containing, &ctx);
+
+        Some(root)
+    }
+
+    fn build_layout_box(&self, document: &Document, node_idx: usize) -> LayoutBox {
+        let node = match document.get_node(node_idx) {
+            Some(n) => n,
+            None => return LayoutBox::anonymous(BoxType::Anonymous),
+        };
+
+        match node.node_type {
+            NodeType::Element => {
+                // Compute style for this element
+                let style = document.compute_style(node_idx, &self.stylesheets);
+
+                // Check display: none
+                if style.display == Display::None {
+                    return LayoutBox::anonymous(BoxType::Anonymous);
+                }
+
+                // Create layout box
+                let box_type = BoxType::from_display(style.display);
+                let mut layout_box = LayoutBox::new(box_type, style.clone());
+                layout_box.node_index = Some(node_idx);
+                layout_box.position = style.position;
+                layout_box.float = style.float;
+
+                // Debug info
+                if let Some(tag) = node.tag_name() {
+                    layout_box.debug_tag = Some(tag.to_string());
+                }
+
+                // Build children
+                for &child_idx in &node.children {
+                    let child_box = self.build_layout_box(document, child_idx);
+
+                    // Handle display: contents
+                    if child_box.style.display == Display::Contents {
+                        // Flatten contents children into this box
+                        for grandchild in child_box.children {
+                            layout_box.add_child(grandchild);
+                        }
+                    } else if child_box.box_type != BoxType::Anonymous ||
+                              !child_box.children.is_empty() ||
+                              child_box.text.is_some() {
+                        layout_box.add_child(child_box);
+                    }
+                }
+
+                layout_box
+            },
+            NodeType::Text => {
+                let text = match node.text_content() {
+                    Some(t) if !t.trim().is_empty() => t.to_string(),
+                    _ => return LayoutBox::anonymous(BoxType::Anonymous),
+                };
+
+                // Inherit style from parent (simplified)
+                let style = ComputedStyle::default();
+                LayoutBox::text_box(text, style)
+            },
+            _ => LayoutBox::anonymous(BoxType::Anonymous),
+        }
+    }
+}
+
+// ============================================================
+// Layout Algorithm
+// ============================================================
+
+pub fn layout_box_tree(layout_box: &mut LayoutBox, containing: ContainingBlock, ctx: &LayoutContext) {
+    match layout_box.box_type {
+        BoxType::Block | BoxType::ListItem => {
+            layout_block(layout_box, containing, ctx);
+        },
+        BoxType::Inline | BoxType::InlineBlock | BoxType::Text | BoxType::Anonymous => {
+            layout_inline_container(layout_box, &containing, ctx);
+        },
+        BoxType::Flex | BoxType::FlexItem => {
+            layout_flex(layout_box, containing, ctx);
+        },
+        BoxType::Grid | BoxType::GridItem => {
+            // Grid layout not fully implemented, fall back to block
+            layout_block(layout_box, containing, ctx);
+        },
+        BoxType::Table | BoxType::TableRow | BoxType::TableCell => {
+            // Table layout not fully implemented, fall back to block
+            layout_block(layout_box, containing, ctx);
+        },
+    }
+}
+
+// ============================================================
+// Paint Tree
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub struct PaintCommand {
+    pub bounds: Rect,
+    pub command: PaintOperation,
+}
+
+#[derive(Clone, Debug)]
+pub enum PaintOperation {
+    Background {
+        color: super::css::Color,
+    },
+    Border {
+        top: BorderPaint,
+        right: BorderPaint,
+        bottom: BorderPaint,
+        left: BorderPaint,
+    },
+    Text {
+        text: String,
+        x: f64,
+        y: f64,
+        font_size: f64,
+        color: super::css::Color,
+    },
+    Image {
+        url: String,
+    },
+    // More operations as needed
+}
+
+#[derive(Clone, Debug)]
+pub struct BorderPaint {
+    pub width: f64,
+    pub style: super::css::BorderStyle,
+    pub color: super::css::Color,
+}
+
+pub fn build_paint_list(layout_box: &LayoutBox) -> Vec<PaintCommand> {
+    let mut commands = Vec::new();
+    paint_layout_box(layout_box, &mut commands);
+    commands
+}
+
+fn paint_layout_box(layout_box: &LayoutBox, commands: &mut Vec<PaintCommand>) {
+    let d = &layout_box.dimensions;
+    let style = &layout_box.style;
+
+    // Paint background
+    if style.background_color.a > 0.0 {
+        commands.push(PaintCommand {
+            bounds: d.border_box(),
+            command: PaintOperation::Background {
+                color: style.background_color,
+            },
+        });
+    }
+
+    // Paint borders
+    if style.border_top_width > 0.0 || style.border_right_width > 0.0 ||
+       style.border_bottom_width > 0.0 || style.border_left_width > 0.0 {
+        commands.push(PaintCommand {
+            bounds: d.border_box(),
+            command: PaintOperation::Border {
+                top: BorderPaint {
+                    width: style.border_top_width,
+                    style: style.border_top_style,
+                    color: style.border_top_color,
+                },
+                right: BorderPaint {
+                    width: style.border_right_width,
+                    style: style.border_right_style,
+                    color: style.border_right_color,
+                },
+                bottom: BorderPaint {
+                    width: style.border_bottom_width,
+                    style: style.border_bottom_style,
+                    color: style.border_bottom_color,
+                },
+                left: BorderPaint {
+                    width: style.border_left_width,
+                    style: style.border_left_style,
+                    color: style.border_left_color,
+                },
+            },
+        });
+    }
+
+    // Paint text
+    if let Some(text) = &layout_box.text {
+        commands.push(PaintCommand {
+            bounds: d.content,
+            command: PaintOperation::Text {
+                text: text.clone(),
+                x: d.content.x,
+                y: d.content.y + style.font_size,
+                font_size: style.font_size,
+                color: style.color,
+            },
+        });
+    }
+
+    // Paint line boxes (for inline content)
+    for line in &layout_box.line_boxes {
+        for fragment in &line.fragments {
+            if let FragmentContent::Text { text, font_size, color } = &fragment.content {
+                commands.push(PaintCommand {
+                    bounds: Rect::new(fragment.x, fragment.y, fragment.width, fragment.height),
+                    command: PaintOperation::Text {
+                        text: text.clone(),
+                        x: fragment.x,
+                        y: fragment.y + font_size * 0.8,
+                        font_size: *font_size,
+                        color: *color,
+                    },
+                });
+            }
+        }
+    }
+
+    // Paint children
+    for child in &layout_box.children {
+        paint_layout_box(child, commands);
+    }
+}
+
+// ============================================================
+// Hit Testing
+// ============================================================
+
+impl LayoutBox {
+    // Find the layout box at a point
+    pub fn hit_test(&self, x: f64, y: f64) -> Option<&LayoutBox> {
+        // Check if point is in this box's border box
+        if !self.dimensions.border_box().contains(x, y) {
+            return None;
+        }
+
+        // Check children (in reverse order for proper z-order)
+        for child in self.children.iter().rev() {
+            if let Some(hit) = child.hit_test(x, y) {
+                return Some(hit);
+            }
+        }
+
+        // Point is in this box
+        Some(self)
+    }
+
+    // Find all boxes containing a point
+    pub fn hit_test_all(&self, x: f64, y: f64, results: &mut Vec<usize>) {
+        if self.dimensions.border_box().contains(x, y) {
+            if let Some(idx) = self.node_index {
+                results.push(idx);
+            }
+
+            for child in &self.children {
+                child.hit_test_all(x, y, results);
+            }
+        }
+    }
+}
+
+// ============================================================
+// Convenience Functions
+// ============================================================
+
+pub fn layout_document(
+    document: &Document,
+    stylesheets: &[Stylesheet],
+    viewport_width: f64,
+    viewport_height: f64,
+) -> Option<LayoutBox> {
+    let mut builder = LayoutTreeBuilder::new();
+    for sheet in stylesheets {
+        builder.add_stylesheet(sheet.clone());
+    }
+    builder.build(document, viewport_width, viewport_height)
+}
+
+pub fn get_element_bounds(layout_box: &LayoutBox, node_idx: usize) -> Option<Rect> {
+    if layout_box.node_index == Some(node_idx) {
+        return Some(layout_box.dimensions.border_box());
+    }
+
+    for child in &layout_box.children {
+        if let Some(bounds) = get_element_bounds(child, node_idx) {
+            return Some(bounds);
+        }
+    }
+
+    None
+}
+
+pub fn get_text_content_bounds(layout_box: &LayoutBox) -> Vec<Rect> {
+    let mut bounds = Vec::new();
+
+    for line in &layout_box.line_boxes {
+        for fragment in &line.fragments {
+            if matches!(fragment.content, FragmentContent::Text { .. }) {
+                bounds.push(Rect::new(
+                    fragment.x,
+                    fragment.y,
+                    fragment.width,
+                    fragment.height,
+                ));
+            }
+        }
+    }
+
+    for child in &layout_box.children {
+        bounds.extend(get_text_content_bounds(child));
+    }
+
+    bounds
+}
