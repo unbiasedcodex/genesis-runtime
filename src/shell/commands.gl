@@ -1733,13 +1733,6 @@ pub fn cmd_http() {
 
     // Check for HTTPS
     let is_https = read_byte(URL_STATE_ADDR + URL_STATE_HTTPS);
-    if is_https == 1 {
-        print_str(69, 82, 82, 58, 32, 72, 84, 84);    // "ERR: HTT"
-        print_str(80, 83, 32, 110, 111, 116, 32, 115); // "PS not s"
-        print_str(117, 112, 112, 111, 114, 116, 101, 100); // "upported"
-        putchar(10);
-        return;
-    }
 
     // Show parsed info
     print_str(72, 111, 115, 116, 58, 32, 0, 0);  // "Host: "
@@ -1801,6 +1794,49 @@ pub fn cmd_http() {
     print_str(100, 33, 0, 0, 0, 0, 0, 0);              // "d!"
     putchar(10);
 
+    // TLS handshake for HTTPS
+    if is_https == 1 {
+        print_str(84, 76, 83, 32, 104, 97, 110, 100);  // "TLS hand"
+        print_str(115, 104, 97, 107, 101, 46, 46, 46); // "shake..."
+        putchar(10);
+
+        // Get hostname length
+        let mut host_len: i64 = 0;
+        while host_len < 128 {
+            if read_byte(URL_HOST_ADDR + host_len) == 0 {
+                host_len = host_len + 1;
+                while host_len < 128 && read_byte(URL_HOST_ADDR + host_len) == 0 {
+                    host_len = host_len + 1;
+                }
+                host_len = host_len - 1;
+                while host_len > 0 && read_byte(URL_HOST_ADDR + host_len - 1) == 0 {
+                    host_len = host_len - 1;
+                }
+                host_len = host_len + 1;
+                while host_len > 0 && read_byte(URL_HOST_ADDR + host_len - 1) == 0 {
+                    host_len = host_len - 1;
+                }
+            }
+            host_len = host_len + 1;
+        }
+        host_len = 0;
+        while read_byte(URL_HOST_ADDR + host_len) != 0 && host_len < 128 {
+            host_len = host_len + 1;
+        }
+
+        let tls_result = runtime::tls_connect(sock, URL_HOST_ADDR, host_len);
+        if tls_result < 0 {
+            print_str(69, 82, 82, 58, 32, 84, 76, 83);  // "ERR: TLS"
+            print_str(32, 102, 97, 105, 108, 101, 100, 0); // " failed"
+            putchar(10);
+            runtime::net_close(sock);
+            return;
+        }
+
+        print_str(84, 76, 83, 32, 79, 75, 0, 0);  // "TLS OK"
+        putchar(10);
+    }
+
     // Build HTTP request
     print_str(83, 101, 110, 100, 105, 110, 103, 32);  // "Sending "
     print_str(114, 101, 113, 117, 101, 115, 116, 46); // "request."
@@ -1809,11 +1845,20 @@ pub fn cmd_http() {
 
     let req_len = http_build_get_request(port);
 
-    let sent = runtime::net_send_data(sock, HTTP_TX_BUF, req_len);
+    // Send request (TLS or plain)
+    let mut sent: i64 = 0;
+    if is_https == 1 {
+        sent = runtime::tls_send(sock, HTTP_TX_BUF, req_len);
+    } else {
+        sent = runtime::net_send_data(sock, HTTP_TX_BUF, req_len);
+    }
     if sent < 0 {
         print_str(69, 82, 82, 58, 32, 83, 101, 110);  // "ERR: Sen"
         print_str(100, 0, 0, 0, 0, 0, 0, 0);           // "d"
         putchar(10);
+        if is_https == 1 {
+            runtime::tls_close(sock);
+        }
         runtime::net_close(sock);
         return;
     }
@@ -1828,7 +1873,13 @@ pub fn cmd_http() {
     let mut done: i64 = 0;
 
     while done == 0 && total_recv < max_recv {
-        let recv_len = runtime::net_recv_data(sock, HTTP_RX_BODY_BUF + total_recv, max_recv - total_recv);
+        // Receive data (TLS or plain)
+        let mut recv_len: i64 = 0;
+        if is_https == 1 {
+            recv_len = runtime::tls_recv(sock, HTTP_RX_BODY_BUF + total_recv, max_recv - total_recv);
+        } else {
+            recv_len = runtime::net_recv_data(sock, HTTP_RX_BODY_BUF + total_recv, max_recv - total_recv);
+        }
         if recv_len > 0 {
             total_recv = total_recv + recv_len;
         } else if recv_len < 0 {
@@ -1842,6 +1893,10 @@ pub fn cmd_http() {
         }
     }
 
+    // Close connection (TLS first if HTTPS)
+    if is_https == 1 {
+        runtime::tls_close(sock);
+    }
     runtime::net_close(sock);
 
     // Parse and display response

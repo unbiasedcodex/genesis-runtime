@@ -571,6 +571,12 @@ pub const SYS_NET_GETIP: i64 = 64;
 pub const SYS_NET_GETMAC: i64 = 65;
 pub const SYS_NET_POLL: i64 = 66;
 
+// TLS syscalls
+pub const SYS_TLS_CONNECT: i64 = 80;
+pub const SYS_TLS_SEND: i64 = 81;
+pub const SYS_TLS_RECV: i64 = 82;
+pub const SYS_TLS_CLOSE: i64 = 83;
+
 // Network status info types
 pub const NET_STATUS_LINK: i64 = 0;       // Link up/down
 pub const NET_STATUS_RX_COUNT: i64 = 1;   // RX packet count
@@ -669,6 +675,44 @@ pub fn net_close(sock_id: i64) -> i64 {
 // Poll network (process pending packets)
 pub fn net_poll() -> i64 {
     syscall0(SYS_NET_POLL)
+}
+
+// ============================================================================
+// TLS Wrappers
+// ============================================================================
+
+// TLS handshake on connected socket
+// sock_id: socket already connected via net_connect
+// hostname_addr: address of hostname string
+// hostname_len: length of hostname
+// Returns: 0 on success, negative error
+pub fn tls_connect(sock_id: i64, hostname_addr: i64, hostname_len: i64) -> i64 {
+    syscall3(SYS_TLS_CONNECT, sock_id, hostname_addr, hostname_len)
+}
+
+// Send data over TLS connection
+// sock_id: TLS-enabled socket
+// data_addr: address of data to send
+// len: length of data
+// Returns: bytes sent, or negative error
+pub fn tls_send(sock_id: i64, data_addr: i64, len: i64) -> i64 {
+    syscall3(SYS_TLS_SEND, sock_id, data_addr, len)
+}
+
+// Receive data over TLS connection
+// sock_id: TLS-enabled socket
+// buf_addr: address of receive buffer
+// max_len: maximum bytes to receive
+// Returns: bytes received, or negative error
+pub fn tls_recv(sock_id: i64, buf_addr: i64, max_len: i64) -> i64 {
+    syscall3(SYS_TLS_RECV, sock_id, buf_addr, max_len)
+}
+
+// Close TLS connection
+// sock_id: TLS-enabled socket
+// Returns: 0 on success
+pub fn tls_close(sock_id: i64) -> i64 {
+    syscall1(SYS_TLS_CLOSE, sock_id)
 }
 
 // ============================================================================
