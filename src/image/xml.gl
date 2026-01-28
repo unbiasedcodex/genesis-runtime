@@ -1,0 +1,423 @@
+// Minimal XML Parser for SVG
+// Supports elements, attributes, text nodes, and comments
+
+use super::ImageError;
+
+// ============================================================
+// XML Node Types
+// ============================================================
+
+#[derive(Clone, Debug)]
+pub enum XmlNode {
+    Element {
+        name: String,
+        attributes: Vec<(String, String)>,
+        children: Vec<XmlNode>,
+    },
+    Text(String),
+    Comment(String),
+}
+
+impl XmlNode {
+    pub fn element(name: &str) -> XmlNode {
+        XmlNode::Element {
+            name: name.to_string(),
+            attributes: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            XmlNode::Element { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn get_attr(&self, attr_name: &str) -> Option<&str> {
+        match self {
+            XmlNode::Element { attributes, .. } => {
+                for (name, value) in attributes {
+                    if name == attr_name {
+                        return Some(value);
+                    }
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    pub fn children(&self) -> &[XmlNode] {
+        match self {
+            XmlNode::Element { children, .. } => children,
+            _ => &[],
+        }
+    }
+
+    pub fn find_child(&self, tag_name: &str) -> Option<&XmlNode> {
+        for child in self.children() {
+            if let XmlNode::Element { name, .. } = child {
+                if name == tag_name {
+                    return Some(child);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_children(&self, tag_name: &str) -> Vec<&XmlNode> {
+        let mut result = Vec::new();
+        for child in self.children() {
+            if let XmlNode::Element { name, .. } = child {
+                if name == tag_name {
+                    result.push(child);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn text_content(&self) -> String {
+        match self {
+            XmlNode::Text(text) => text.clone(),
+            XmlNode::Element { children, .. } => {
+                let mut result = String::new();
+                for child in children {
+                    result.push_str(&child.text_content());
+                }
+                result
+            },
+            _ => String::new(),
+        }
+    }
+}
+
+// ============================================================
+// XML Parser
+// ============================================================
+
+pub struct XmlParser<'a> {
+    input: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> XmlParser<'a> {
+    pub fn new(input: &'a [u8]) -> XmlParser<'a> {
+        XmlParser { input, pos: 0 }
+    }
+
+    pub fn parse(&mut self) -> Result<XmlNode, ImageError> {
+        // Skip BOM if present
+        if self.input.len() >= 3 &&
+           self.input[0] == 0xEF && self.input[1] == 0xBB && self.input[2] == 0xBF {
+            self.pos = 3;
+        }
+
+        self.skip_whitespace();
+
+        // Skip XML declaration if present
+        if self.starts_with(b"<?xml") {
+            self.skip_until(b"?>");
+            self.pos += 2;
+            self.skip_whitespace();
+        }
+
+        // Skip DOCTYPE if present
+        if self.starts_with(b"<!DOCTYPE") {
+            self.skip_until(b">");
+            self.pos += 1;
+            self.skip_whitespace();
+        }
+
+        // Parse root element
+        self.parse_element()
+    }
+
+    fn parse_element(&mut self) -> Result<XmlNode, ImageError> {
+        self.skip_whitespace();
+
+        if !self.consume(b'<') {
+            return Err(ImageError::ParseError);
+        }
+
+        // Check for comment
+        if self.starts_with(b"!--") {
+            self.pos += 3;
+            let start = self.pos;
+            self.skip_until(b"-->");
+            let comment = self.slice_str(start, self.pos);
+            self.pos += 3;
+            return Ok(XmlNode::Comment(comment));
+        }
+
+        // Check for CDATA
+        if self.starts_with(b"![CDATA[") {
+            self.pos += 8;
+            let start = self.pos;
+            self.skip_until(b"]]>");
+            let text = self.slice_str(start, self.pos);
+            self.pos += 3;
+            return Ok(XmlNode::Text(text));
+        }
+
+        // Parse element name
+        let name = self.parse_name()?;
+        let mut attributes = Vec::new();
+
+        // Parse attributes
+        loop {
+            self.skip_whitespace();
+
+            if self.peek() == Some(b'/') || self.peek() == Some(b'>') {
+                break;
+            }
+
+            let attr_name = self.parse_name()?;
+            self.skip_whitespace();
+
+            if !self.consume(b'=') {
+                // Attribute without value
+                attributes.push((attr_name, String::new()));
+                continue;
+            }
+
+            self.skip_whitespace();
+            let attr_value = self.parse_attribute_value()?;
+            attributes.push((attr_name, attr_value));
+        }
+
+        // Check for self-closing tag
+        if self.consume(b'/') {
+            if !self.consume(b'>') {
+                return Err(ImageError::ParseError);
+            }
+            return Ok(XmlNode::Element {
+                name,
+                attributes,
+                children: Vec::new(),
+            });
+        }
+
+        if !self.consume(b'>') {
+            return Err(ImageError::ParseError);
+        }
+
+        // Parse children
+        let mut children = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+
+            if self.starts_with(b"</") {
+                // End tag
+                self.pos += 2;
+                let end_name = self.parse_name()?;
+                if end_name != name {
+                    return Err(ImageError::ParseError);
+                }
+                self.skip_whitespace();
+                if !self.consume(b'>') {
+                    return Err(ImageError::ParseError);
+                }
+                break;
+            }
+
+            if self.peek() == Some(b'<') {
+                // Child element
+                let child = self.parse_element()?;
+                children.push(child);
+            } else if self.pos < self.input.len() {
+                // Text content
+                let text = self.parse_text()?;
+                if !text.trim().is_empty() {
+                    children.push(XmlNode::Text(text));
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(XmlNode::Element {
+            name,
+            attributes,
+            children,
+        })
+    }
+
+    fn parse_name(&mut self) -> Result<String, ImageError> {
+        let start = self.pos;
+
+        while self.pos < self.input.len() {
+            let c = self.input[self.pos];
+            if is_name_char(c) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        if self.pos == start {
+            return Err(ImageError::ParseError);
+        }
+
+        Ok(self.slice_str(start, self.pos))
+    }
+
+    fn parse_attribute_value(&mut self) -> Result<String, ImageError> {
+        let quote = self.peek().ok_or(ImageError::ParseError)?;
+        if quote != b'"' && quote != b'\'' {
+            return Err(ImageError::ParseError);
+        }
+        self.pos += 1;
+
+        let start = self.pos;
+        while self.pos < self.input.len() && self.input[self.pos] != quote {
+            self.pos += 1;
+        }
+        let value = self.slice_str(start, self.pos);
+
+        if !self.consume(quote) {
+            return Err(ImageError::ParseError);
+        }
+
+        Ok(decode_entities(&value))
+    }
+
+    fn parse_text(&mut self) -> Result<String, ImageError> {
+        let start = self.pos;
+        while self.pos < self.input.len() && self.input[self.pos] != b'<' {
+            self.pos += 1;
+        }
+        let text = self.slice_str(start, self.pos);
+        Ok(decode_entities(&text))
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.input.len() {
+            let c = self.input[self.pos];
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn skip_until(&mut self, pattern: &[u8]) {
+        while self.pos + pattern.len() <= self.input.len() {
+            if self.starts_with(pattern) {
+                return;
+            }
+            self.pos += 1;
+        }
+        self.pos = self.input.len();
+    }
+
+    fn starts_with(&self, pattern: &[u8]) -> bool {
+        if self.pos + pattern.len() > self.input.len() {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < pattern.len() {
+            if self.input[self.pos + i] != pattern[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn peek(&self) -> Option<u8> {
+        if self.pos < self.input.len() {
+            Some(self.input[self.pos])
+        } else {
+            None
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn slice_str(&self, start: usize, end: usize) -> String {
+        String::from_utf8_lossy(&self.input[start..end]).to_string()
+    }
+}
+
+fn is_name_char(c: u8) -> bool {
+    (c >= b'a' && c <= b'z') ||
+    (c >= b'A' && c <= b'Z') ||
+    (c >= b'0' && c <= b'9') ||
+    c == b'_' || c == b'-' || c == b':' || c == b'.'
+}
+
+fn decode_entities(text: &str) -> String {
+    let mut result = String::new();
+    let bytes = text.as_bytes();
+    let mut i: usize = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Find entity end
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b';' && j - i < 10 {
+                j += 1;
+            }
+
+            if j < bytes.len() && bytes[j] == b';' {
+                let entity = &text[i + 1..j];
+                let decoded = match entity {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    _ if entity.starts_with('#') => {
+                        // Numeric entity
+                        let num_str = &entity[1..];
+                        let code = if num_str.starts_with('x') || num_str.starts_with('X') {
+                            u32::from_str_radix(&num_str[1..], 16).ok()
+                        } else {
+                            num_str.parse::<u32>().ok()
+                        };
+                        if let Some(c) = code.and_then(char::from_u32) {
+                            result.push(c);
+                            i = j + 1;
+                            continue;
+                        }
+                        "&"
+                    },
+                    _ => "&",
+                };
+                result.push_str(decoded);
+                if decoded != "&" {
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+pub fn parse(data: &[u8]) -> Result<XmlNode, ImageError> {
+    let mut parser = XmlParser::new(data);
+    parser.parse()
+}
+
+pub fn parse_str(data: &str) -> Result<XmlNode, ImageError> {
+    parse(data.as_bytes())
+}

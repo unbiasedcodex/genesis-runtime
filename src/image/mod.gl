@@ -1,0 +1,175 @@
+// Image Decoding Module
+// Provides decoders for PNG, JPEG, GIF, WebP, and SVG image formats
+
+pub mod common;
+pub mod deflate;
+pub mod png;
+pub mod jpeg;
+pub mod gif;
+pub mod webp;
+pub mod xml;
+pub mod svg;
+
+// Re-export commonly used items
+pub use common::{ImageBuffer, ImageFormat, PixelFormat, AnimatedImage, AnimationFrame};
+pub use common::{image_create, image_destroy, image_get_pixel, image_set_pixel, image_blit_to_ctx};
+
+// ============================================================
+// Format Detection
+// ============================================================
+
+pub const IMG_FORMAT_UNKNOWN: i32 = 0;
+pub const IMG_FORMAT_PNG: i32 = 1;
+pub const IMG_FORMAT_JPEG: i32 = 2;
+pub const IMG_FORMAT_GIF: i32 = 3;
+pub const IMG_FORMAT_WEBP: i32 = 4;
+pub const IMG_FORMAT_SVG: i32 = 5;
+pub const IMG_FORMAT_BMP: i32 = 6;
+
+// Detect image format from magic bytes
+pub fn detect_format(data: &[u8]) -> ImageFormat {
+    if data.len() < 8 {
+        return ImageFormat::Unknown;
+    }
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if data.len() >= 8 &&
+       data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+       data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A {
+        return ImageFormat::Png;
+    }
+
+    // JPEG: FF D8 FF
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return ImageFormat::Jpeg;
+    }
+
+    // GIF: 47 49 46 38 (GIF8)
+    if data.len() >= 4 &&
+       data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x38 {
+        return ImageFormat::Gif;
+    }
+
+    // WebP: RIFF....WEBP
+    if data.len() >= 12 &&
+       data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+       data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50 {
+        return ImageFormat::Webp;
+    }
+
+    // SVG: Check for <?xml or <svg
+    if data.len() >= 5 {
+        // <?xml
+        if data[0] == 0x3C && data[1] == 0x3F && data[2] == 0x78 && data[3] == 0x6D && data[4] == 0x6C {
+            return ImageFormat::Svg;
+        }
+        // <svg (with possible whitespace before)
+        let start = skip_whitespace(data);
+        if start + 4 <= data.len() {
+            if data[start] == 0x3C && data[start + 1] == 0x73 &&
+               data[start + 2] == 0x76 && data[start + 3] == 0x67 {
+                return ImageFormat::Svg;
+            }
+        }
+    }
+
+    // BMP: 42 4D (BM)
+    if data.len() >= 2 && data[0] == 0x42 && data[1] == 0x4D {
+        return ImageFormat::Bmp;
+    }
+
+    ImageFormat::Unknown
+}
+
+fn skip_whitespace(data: &[u8]) -> usize {
+    let mut i: usize = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b != 0x20 && b != 0x09 && b != 0x0A && b != 0x0D {
+            break;
+        }
+        i = i + 1;
+    }
+    i
+}
+
+// ============================================================
+// Unified Decode Interface
+// ============================================================
+
+// Decode an image from raw data
+pub fn decode_image(data: &[u8]) -> Result<ImageBuffer, ImageError> {
+    let format = detect_format(data);
+
+    match format {
+        ImageFormat::Png => png::decode(data),
+        ImageFormat::Jpeg => jpeg::decode(data),
+        ImageFormat::Gif => {
+            // For static GIF, just get first frame
+            let anim = gif::decode(data)?;
+            if anim.frame_count > 0 {
+                Ok(anim.frames[0].buffer.clone())
+            } else {
+                Err(ImageError::NoFrames)
+            }
+        },
+        ImageFormat::Webp => webp::decode(data),
+        ImageFormat::Svg => {
+            // SVG needs dimensions - use default 256x256
+            svg::render(data, 256, 256)
+        },
+        ImageFormat::Bmp => Err(ImageError::UnsupportedFormat),
+        ImageFormat::Unknown => Err(ImageError::UnknownFormat),
+    }
+}
+
+// Decode an animated image (GIF)
+pub fn decode_animated(data: &[u8]) -> Result<AnimatedImage, ImageError> {
+    let format = detect_format(data);
+
+    match format {
+        ImageFormat::Gif => gif::decode(data),
+        ImageFormat::Webp => {
+            // Check if it's animated WebP
+            webp::decode_animated(data)
+        },
+        ImageFormat::Png => {
+            // APNG support could be added here
+            let img = png::decode(data)?;
+            Ok(AnimatedImage::from_static(img))
+        },
+        _ => {
+            // For static images, wrap in single-frame animation
+            let img = decode_image(data)?;
+            Ok(AnimatedImage::from_static(img))
+        }
+    }
+}
+
+// Decode SVG with specific dimensions
+pub fn decode_svg(data: &[u8], width: u32, height: u32) -> Result<ImageBuffer, ImageError> {
+    svg::render(data, width, height)
+}
+
+// ============================================================
+// Error Types
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImageError {
+    UnknownFormat,
+    UnsupportedFormat,
+    InvalidData,
+    InvalidHeader,
+    InvalidChunk,
+    DecompressionFailed,
+    InvalidFilter,
+    InvalidHuffman,
+    InvalidDct,
+    InvalidMarker,
+    TruncatedData,
+    OutOfMemory,
+    NoFrames,
+    InvalidPath,
+    ParseError,
+}

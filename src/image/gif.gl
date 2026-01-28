@@ -1,0 +1,608 @@
+// GIF Decoder (GIF89a)
+// Supports LZW compression, multiple frames, transparency, and animation
+
+use super::common::{ImageBuffer, PixelFormat, AnimatedImage, AnimationFrame, DisposeOp, BlendOp,
+                    read_u8, read_u16_le};
+use super::ImageError;
+
+// ============================================================
+// GIF Constants
+// ============================================================
+
+const GIF87A_SIGNATURE: &[u8] = b"GIF87a";
+const GIF89A_SIGNATURE: &[u8] = b"GIF89a";
+
+const BLOCK_IMAGE: u8 = 0x2C;      // Image descriptor
+const BLOCK_EXTENSION: u8 = 0x21;   // Extension block
+const BLOCK_TRAILER: u8 = 0x3B;     // End of GIF
+
+const EXT_GRAPHIC_CONTROL: u8 = 0xF9;  // Graphic control extension
+const EXT_COMMENT: u8 = 0xFE;           // Comment extension
+const EXT_PLAINTEXT: u8 = 0x01;         // Plain text extension
+const EXT_APPLICATION: u8 = 0xFF;       // Application extension
+
+// Disposal methods
+const DISPOSE_NONE: u8 = 0;
+const DISPOSE_KEEP: u8 = 1;
+const DISPOSE_BACKGROUND: u8 = 2;
+const DISPOSE_PREVIOUS: u8 = 3;
+
+// ============================================================
+// LZW Constants
+// ============================================================
+
+const MAX_LZW_BITS: u8 = 12;
+const MAX_TABLE_SIZE: usize = 4096;
+
+// ============================================================
+// GIF Context
+// ============================================================
+
+struct GifContext {
+    width: u16,
+    height: u16,
+    global_color_table: Vec<u32>,  // ARGB colors
+    background_color_index: u8,
+    has_global_color_table: bool,
+
+    // Current frame settings
+    frame_x: u16,
+    frame_y: u16,
+    frame_width: u16,
+    frame_height: u16,
+    frame_interlaced: bool,
+    frame_local_color_table: Vec<u32>,
+    frame_has_local_table: bool,
+
+    // Graphic control extension
+    transparent_index: Option<u8>,
+    delay_time: u16,  // in 1/100ths of a second
+    dispose_method: u8,
+
+    // Animation info
+    loop_count: u32,
+}
+
+impl GifContext {
+    fn new() -> GifContext {
+        GifContext {
+            width: 0,
+            height: 0,
+            global_color_table: Vec::new(),
+            background_color_index: 0,
+            has_global_color_table: false,
+            frame_x: 0,
+            frame_y: 0,
+            frame_width: 0,
+            frame_height: 0,
+            frame_interlaced: false,
+            frame_local_color_table: Vec::new(),
+            frame_has_local_table: false,
+            transparent_index: None,
+            delay_time: 0,
+            dispose_method: 0,
+            loop_count: 0,
+        }
+    }
+
+    fn get_color_table(&self) -> &Vec<u32> {
+        if self.frame_has_local_table {
+            &self.frame_local_color_table
+        } else {
+            &self.global_color_table
+        }
+    }
+
+    fn get_background_color(&self) -> u32 {
+        if self.has_global_color_table &&
+           (self.background_color_index as usize) < self.global_color_table.len() {
+            self.global_color_table[self.background_color_index as usize]
+        } else {
+            0xFF000000  // Black
+        }
+    }
+}
+
+// ============================================================
+// GIF Decoder
+// ============================================================
+
+pub fn decode(data: &[u8]) -> Result<AnimatedImage, ImageError> {
+    if data.len() < 13 {
+        return Err(ImageError::TruncatedData);
+    }
+
+    // Check signature
+    let sig = &data[0..6];
+    if sig != GIF87A_SIGNATURE && sig != GIF89A_SIGNATURE {
+        return Err(ImageError::InvalidHeader);
+    }
+
+    let mut ctx = GifContext::new();
+
+    // Parse logical screen descriptor
+    ctx.width = read_u16_le(data, 6);
+    ctx.height = read_u16_le(data, 8);
+
+    let packed = data[10];
+    ctx.has_global_color_table = (packed & 0x80) != 0;
+    let color_resolution = ((packed >> 4) & 0x07) + 1;
+    let global_table_size = 1 << ((packed & 0x07) + 1);
+
+    ctx.background_color_index = data[11];
+    let _pixel_aspect_ratio = data[12];
+
+    let mut pos: usize = 13;
+
+    // Parse global color table
+    if ctx.has_global_color_table {
+        ctx.global_color_table = parse_color_table(data, &mut pos, global_table_size)?;
+    }
+
+    // Create animated image
+    let mut anim = AnimatedImage::new(ctx.width as u32, ctx.height as u32);
+    anim.background_color = ctx.get_background_color();
+
+    // Parse blocks
+    while pos < data.len() {
+        let block_type = data[pos];
+        pos += 1;
+
+        match block_type {
+            BLOCK_IMAGE => {
+                // Parse image descriptor
+                parse_image_descriptor(&mut ctx, data, &mut pos)?;
+
+                // Decode frame
+                let frame = decode_frame(&mut ctx, data, &mut pos)?;
+                anim.add_frame(frame);
+
+                // Reset frame-specific settings
+                ctx.transparent_index = None;
+                ctx.delay_time = 0;
+                ctx.dispose_method = 0;
+                ctx.frame_has_local_table = false;
+            },
+            BLOCK_EXTENSION => {
+                parse_extension(&mut ctx, data, &mut pos)?;
+            },
+            BLOCK_TRAILER => break,
+            _ => {
+                // Unknown block, try to skip
+                break;
+            },
+        }
+    }
+
+    anim.loop_count = ctx.loop_count;
+    Ok(anim)
+}
+
+fn parse_color_table(data: &[u8], pos: &mut usize, size: usize) -> Result<Vec<u32>, ImageError> {
+    if *pos + size * 3 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let mut table = Vec::with_capacity(size);
+    let mut i: usize = 0;
+    while i < size {
+        let r = data[*pos] as u32;
+        let g = data[*pos + 1] as u32;
+        let b = data[*pos + 2] as u32;
+        table.push(0xFF000000 | (r << 16) | (g << 8) | b);
+        *pos += 3;
+        i += 1;
+    }
+
+    Ok(table)
+}
+
+fn parse_image_descriptor(ctx: &mut GifContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 9 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    ctx.frame_x = read_u16_le(data, *pos);
+    ctx.frame_y = read_u16_le(data, *pos + 2);
+    ctx.frame_width = read_u16_le(data, *pos + 4);
+    ctx.frame_height = read_u16_le(data, *pos + 6);
+
+    let packed = data[*pos + 8];
+    let has_local_table = (packed & 0x80) != 0;
+    ctx.frame_interlaced = (packed & 0x40) != 0;
+    let local_table_size = if has_local_table { 1 << ((packed & 0x07) + 1) } else { 0 };
+
+    *pos += 9;
+
+    // Parse local color table
+    if has_local_table {
+        ctx.frame_local_color_table = parse_color_table(data, pos, local_table_size)?;
+        ctx.frame_has_local_table = true;
+    } else {
+        ctx.frame_has_local_table = false;
+    }
+
+    Ok(())
+}
+
+fn parse_extension(ctx: &mut GifContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos >= data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let ext_type = data[*pos];
+    *pos += 1;
+
+    match ext_type {
+        EXT_GRAPHIC_CONTROL => {
+            if *pos + 5 > data.len() {
+                return Err(ImageError::TruncatedData);
+            }
+
+            let _block_size = data[*pos];  // Should be 4
+            let packed = data[*pos + 1];
+            ctx.dispose_method = (packed >> 2) & 0x07;
+            let has_transparent = (packed & 0x01) != 0;
+            ctx.delay_time = read_u16_le(data, *pos + 2);
+
+            if has_transparent {
+                ctx.transparent_index = Some(data[*pos + 4]);
+            } else {
+                ctx.transparent_index = None;
+            }
+
+            *pos += 5;
+            skip_sub_blocks(data, pos);
+        },
+        EXT_APPLICATION => {
+            // Check for NETSCAPE2.0 loop extension
+            if *pos + 1 > data.len() {
+                return Err(ImageError::TruncatedData);
+            }
+
+            let block_size = data[*pos] as usize;
+            *pos += 1;
+
+            if block_size == 11 && *pos + 11 <= data.len() {
+                let app_id = &data[*pos..*pos + 11];
+                if app_id == b"NETSCAPE2.0" || app_id == b"ANIMEXTS1.0" {
+                    *pos += 11;
+                    // Read loop count
+                    if *pos + 3 <= data.len() {
+                        let _sub_block_size = data[*pos];
+                        let _sub_block_id = data[*pos + 1];
+                        ctx.loop_count = read_u16_le(data, *pos + 2) as u32;
+                        *pos += 4;
+                    }
+                } else {
+                    *pos += block_size;
+                }
+            } else {
+                *pos += block_size;
+            }
+            skip_sub_blocks(data, pos);
+        },
+        _ => {
+            // Skip unknown extension
+            skip_sub_blocks(data, pos);
+        },
+    }
+
+    Ok(())
+}
+
+fn skip_sub_blocks(data: &[u8], pos: &mut usize) {
+    while *pos < data.len() {
+        let size = data[*pos] as usize;
+        *pos += 1;
+        if size == 0 {
+            break;
+        }
+        *pos += size;
+    }
+}
+
+// ============================================================
+// Frame Decoding
+// ============================================================
+
+fn decode_frame(ctx: &mut GifContext, data: &[u8], pos: &mut usize) -> Result<AnimationFrame, ImageError> {
+    if *pos >= data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let min_code_size = data[*pos];
+    *pos += 1;
+
+    if min_code_size < 2 || min_code_size > 11 {
+        return Err(ImageError::InvalidData);
+    }
+
+    // Collect LZW data from sub-blocks
+    let mut lzw_data = Vec::new();
+    while *pos < data.len() {
+        let block_size = data[*pos] as usize;
+        *pos += 1;
+
+        if block_size == 0 {
+            break;
+        }
+
+        if *pos + block_size > data.len() {
+            return Err(ImageError::TruncatedData);
+        }
+
+        lzw_data.extend_from_slice(&data[*pos..*pos + block_size]);
+        *pos += block_size;
+    }
+
+    // Decode LZW data
+    let pixel_count = (ctx.frame_width as usize) * (ctx.frame_height as usize);
+    let indices = lzw_decode(&lzw_data, min_code_size, pixel_count)?;
+
+    // Create frame buffer
+    let mut buffer = ImageBuffer::new_rgba(ctx.frame_width as u32, ctx.frame_height as u32);
+    let color_table = ctx.get_color_table();
+
+    // Handle interlacing
+    let row_order = if ctx.frame_interlaced {
+        get_interlace_order(ctx.frame_height as usize)
+    } else {
+        let mut order = Vec::with_capacity(ctx.frame_height as usize);
+        let mut i: usize = 0;
+        while i < ctx.frame_height as usize {
+            order.push(i);
+            i += 1;
+        }
+        order
+    };
+
+    // Convert indices to pixels
+    let mut src_idx: usize = 0;
+    for &y in &row_order {
+        let mut x: usize = 0;
+        while x < ctx.frame_width as usize {
+            if src_idx >= indices.len() {
+                break;
+            }
+
+            let index = indices[src_idx] as usize;
+            src_idx += 1;
+
+            let color = if ctx.transparent_index == Some(index as u8) {
+                0x00000000  // Fully transparent
+            } else if index < color_table.len() {
+                color_table[index]
+            } else {
+                0xFF000000  // Black fallback
+            };
+
+            buffer.set_pixel(x as u32, y as u32, color);
+            x += 1;
+        }
+    }
+
+    // Create animation frame
+    let mut frame = AnimationFrame::new(buffer, (ctx.delay_time as u32) * 10);  // Convert to ms
+    frame.x_offset = ctx.frame_x as u32;
+    frame.y_offset = ctx.frame_y as u32;
+
+    frame.dispose_op = match ctx.dispose_method {
+        DISPOSE_BACKGROUND => DisposeOp::Background,
+        DISPOSE_PREVIOUS => DisposeOp::Previous,
+        _ => DisposeOp::None,
+    };
+
+    frame.blend_op = if ctx.transparent_index.is_some() {
+        BlendOp::Over
+    } else {
+        BlendOp::Source
+    };
+
+    Ok(frame)
+}
+
+fn get_interlace_order(height: usize) -> Vec<usize> {
+    let mut order = Vec::with_capacity(height);
+
+    // Pass 1: Every 8th row, starting from row 0
+    let mut y: usize = 0;
+    while y < height {
+        order.push(y);
+        y += 8;
+    }
+
+    // Pass 2: Every 8th row, starting from row 4
+    y = 4;
+    while y < height {
+        order.push(y);
+        y += 8;
+    }
+
+    // Pass 3: Every 4th row, starting from row 2
+    y = 2;
+    while y < height {
+        order.push(y);
+        y += 4;
+    }
+
+    // Pass 4: Every 2nd row, starting from row 1
+    y = 1;
+    while y < height {
+        order.push(y);
+        y += 2;
+    }
+
+    order
+}
+
+// ============================================================
+// LZW Decompression
+// ============================================================
+
+struct LzwDecoder {
+    min_code_size: u8,
+    clear_code: u16,
+    eoi_code: u16,
+    code_size: u8,
+    next_code: u16,
+    table: Vec<(u16, u8)>,  // (prefix, suffix)
+    stack: Vec<u8>,
+}
+
+impl LzwDecoder {
+    fn new(min_code_size: u8) -> LzwDecoder {
+        let clear_code = 1 << min_code_size;
+        let eoi_code = clear_code + 1;
+
+        LzwDecoder {
+            min_code_size,
+            clear_code,
+            eoi_code,
+            code_size: min_code_size + 1,
+            next_code: eoi_code + 1,
+            table: Vec::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.code_size = self.min_code_size + 1;
+        self.next_code = self.eoi_code + 1;
+        self.table.clear();
+    }
+
+    fn output_string(&mut self, code: u16, output: &mut Vec<u8>) -> u8 {
+        self.stack.clear();
+        let mut c = code;
+
+        // Walk the table to build the string
+        while c >= self.clear_code + 2 {
+            let idx = (c - self.clear_code - 2) as usize;
+            if idx >= self.table.len() {
+                // Invalid code
+                return 0;
+            }
+            let (prefix, suffix) = self.table[idx];
+            self.stack.push(suffix);
+            c = prefix;
+        }
+
+        // c is now a literal byte
+        let first_byte = c as u8;
+        output.push(first_byte);
+
+        // Output stack in reverse
+        while !self.stack.is_empty() {
+            output.push(self.stack.pop().unwrap());
+        }
+
+        first_byte
+    }
+
+    fn add_entry(&mut self, prefix: u16, suffix: u8) {
+        if self.next_code < MAX_TABLE_SIZE as u16 {
+            self.table.push((prefix, suffix));
+            self.next_code += 1;
+
+            // Increase code size if needed
+            if self.next_code > (1 << self.code_size) && self.code_size < MAX_LZW_BITS {
+                self.code_size += 1;
+            }
+        }
+    }
+}
+
+fn lzw_decode(data: &[u8], min_code_size: u8, expected_pixels: usize) -> Result<Vec<u8>, ImageError> {
+    let mut decoder = LzwDecoder::new(min_code_size);
+    let mut output = Vec::with_capacity(expected_pixels);
+
+    let mut bit_buf: u32 = 0;
+    let mut bit_count: u8 = 0;
+    let mut pos: usize = 0;
+
+    let mut prev_code: Option<u16> = None;
+
+    loop {
+        // Refill bit buffer
+        while bit_count < 24 && pos < data.len() {
+            bit_buf |= (data[pos] as u32) << bit_count;
+            bit_count += 8;
+            pos += 1;
+        }
+
+        if bit_count < decoder.code_size {
+            break;  // Not enough bits
+        }
+
+        // Read code
+        let mask = (1u32 << decoder.code_size) - 1;
+        let code = (bit_buf & mask) as u16;
+        bit_buf >>= decoder.code_size;
+        bit_count -= decoder.code_size;
+
+        if code == decoder.clear_code {
+            decoder.reset();
+            prev_code = None;
+            continue;
+        }
+
+        if code == decoder.eoi_code {
+            break;
+        }
+
+        if prev_code.is_none() {
+            // First code after clear - must be literal
+            if code < decoder.clear_code {
+                output.push(code as u8);
+                prev_code = Some(code);
+            }
+            continue;
+        }
+
+        let prev = prev_code.unwrap();
+
+        if code < decoder.next_code {
+            // Code is in table
+            let first_byte = decoder.output_string(code, &mut output);
+            decoder.add_entry(prev, first_byte);
+        } else if code == decoder.next_code {
+            // Special case: code not yet in table
+            let first_byte = if prev < decoder.clear_code {
+                prev as u8
+            } else {
+                let idx = (prev - decoder.clear_code - 2) as usize;
+                if idx < decoder.table.len() {
+                    // Walk to find first byte
+                    let mut c = prev;
+                    while c >= decoder.clear_code + 2 {
+                        let entry_idx = (c - decoder.clear_code - 2) as usize;
+                        c = decoder.table[entry_idx].0;
+                    }
+                    c as u8
+                } else {
+                    0
+                }
+            };
+
+            output.push(first_byte);
+            decoder.output_string(prev, &mut output);
+            // Remove the duplicate first byte we just added
+            output.pop();
+            let fb = decoder.output_string(code, &mut output);
+
+            decoder.add_entry(prev, first_byte);
+        } else {
+            // Invalid code
+            return Err(ImageError::InvalidData);
+        }
+
+        prev_code = Some(code);
+
+        if output.len() >= expected_pixels {
+            break;
+        }
+    }
+
+    Ok(output)
+}

@@ -8,6 +8,7 @@ use super::ui::{
 };
 use super::super::layout::{PaintCommand, PaintOperation, Rect};
 use super::super::css::Color;
+use super::super::image::{decode_image, decode_svg, ImageBuffer, ImageFormat, detect_format};
 
 // ============================================================
 // Browser Configuration
@@ -90,6 +91,16 @@ pub struct Browser {
 
     // Content area
     pub content_rect: UIRect,
+
+    // Image cache: URL -> decoded RGBA data with dimensions
+    image_cache: std::collections::HashMap<String, CachedImage>,
+}
+
+// Cached decoded image
+struct CachedImage {
+    data: Vec<u8>,  // RGBA pixel data
+    width: u32,
+    height: u32,
 }
 
 pub struct FindResult {
@@ -127,6 +138,7 @@ impl Browser {
             find_current: 0,
             hover_link: None,
             content_rect: UIRect { x: 0, y: 0, width: 0, height: 0 },
+            image_cache: std::collections::HashMap::new(),
         };
 
         // Create initial tab
@@ -369,11 +381,17 @@ impl Browser {
         commands.push(UICommand::Clip { rect: self.content_rect });
 
         // Render page content
-        if let Some(tab) = self.active_tab() {
-            let paint_commands = tab.get_paint_commands();
-            for cmd in paint_commands {
-                commands.push(self.translate_paint_command(cmd, tab.scroll_x, tab.scroll_y));
-            }
+        // First, collect paint commands and scroll info
+        let (paint_cmds, scroll_x, scroll_y) = if let Some(tab) = self.active_tab() {
+            (tab.get_paint_commands().to_vec(), tab.scroll_x, tab.scroll_y)
+        } else {
+            (Vec::new(), 0, 0)
+        };
+
+        // Now translate commands (handle images with mutable access to self)
+        for cmd in &paint_cmds {
+            let translated = self.translate_paint_command_mut(cmd, scroll_x, scroll_y);
+            commands.push(translated);
         }
 
         commands.push(UICommand::UnClip);
@@ -388,7 +406,7 @@ impl Browser {
         commands
     }
 
-    fn translate_paint_command(&self, cmd: &PaintCommand, scroll_x: i32, scroll_y: i32) -> UICommand {
+    fn translate_paint_command_mut(&mut self, cmd: &PaintCommand, scroll_x: i32, scroll_y: i32) -> UICommand {
         let x = cmd.bounds.x as i32 - scroll_x + self.content_rect.x;
         let y = cmd.bounds.y as i32 - scroll_y + self.content_rect.y;
 
@@ -423,18 +441,85 @@ impl Browser {
                 }
             },
             PaintOperation::Image { url } => {
-                // Image placeholder
-                UICommand::FillRect {
-                    rect: UIRect {
-                        x,
-                        y,
-                        width: cmd.bounds.width as u32,
-                        height: cmd.bounds.height as u32,
-                    },
-                    color: Color::new(200, 200, 200, 1.0),
-                }
+                // Try to decode image from cache or fetch
+                self.render_image(url, x, y, cmd.bounds.width as u32, cmd.bounds.height as u32)
             },
         }
+    }
+
+    // Render an image, using cache if available
+    fn render_image(&mut self, url: &str, x: i32, y: i32, target_width: u32, target_height: u32) -> UICommand {
+        // Check cache first
+        if let Some(cached) = self.image_cache.get(url) {
+            // Scale image to fit target dimensions
+            let scaled = scale_image_data(&cached.data, cached.width, cached.height,
+                                          target_width, target_height);
+            return UICommand::Image {
+                data: scaled,
+                x,
+                y,
+                width: target_width,
+                height: target_height,
+            };
+        }
+
+        // Try to fetch and decode image
+        if let Some(tab) = self.active_tab_mut() {
+            // Get image data from tab's resource cache
+            if let Some(image_data) = tab.get_resource_data(url) {
+                // Detect format and decode
+                let format = detect_format(&image_data);
+
+                let decoded = match format {
+                    ImageFormat::Svg => {
+                        // SVG needs target dimensions
+                        decode_svg(&image_data, target_width, target_height)
+                    },
+                    _ => decode_image(&image_data),
+                };
+
+                if let Ok(img) = decoded {
+                    // Convert ImageBuffer to RGBA data
+                    let rgba_data = img.to_rgba();
+                    let pixel_data = image_to_rgba_vec(&rgba_data);
+
+                    // Cache the decoded image
+                    self.image_cache.insert(url.to_string(), CachedImage {
+                        data: pixel_data.clone(),
+                        width: img.width,
+                        height: img.height,
+                    });
+
+                    // Scale to fit target
+                    let scaled = scale_image_data(&pixel_data, img.width, img.height,
+                                                  target_width, target_height);
+
+                    return UICommand::Image {
+                        data: scaled,
+                        x,
+                        y,
+                        width: target_width,
+                        height: target_height,
+                    };
+                }
+            }
+        }
+
+        // Fallback: show placeholder
+        UICommand::FillRect {
+            rect: UIRect {
+                x,
+                y,
+                width: target_width,
+                height: target_height,
+            },
+            color: Color::new(200, 200, 200, 1.0),
+        }
+    }
+
+    // Clear image cache (call when navigating to new page)
+    pub fn clear_image_cache(&mut self) {
+        self.image_cache.clear();
     }
 
     // --------------------------------------------------------
@@ -834,6 +919,89 @@ impl Browser {
 
         self.update_tab_bar();
     }
+}
+
+// ============================================================
+// Image Helper Functions
+// ============================================================
+
+// Convert ImageBuffer to RGBA Vec
+fn image_to_rgba_vec(img: &ImageBuffer) -> Vec<u8> {
+    let mut result = Vec::with_capacity((img.width * img.height * 4) as usize);
+
+    let mut y: u32 = 0;
+    while y < img.height {
+        let mut x: u32 = 0;
+        while x < img.width {
+            let pixel = img.get_pixel(x, y);
+            // ARGB to RGBA
+            result.push(((pixel >> 16) & 0xFF) as u8); // R
+            result.push(((pixel >> 8) & 0xFF) as u8);  // G
+            result.push((pixel & 0xFF) as u8);         // B
+            result.push(((pixel >> 24) & 0xFF) as u8); // A
+            x += 1;
+        }
+        y += 1;
+    }
+
+    result
+}
+
+// Scale image data using bilinear interpolation
+fn scale_image_data(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
+    if src_width == dst_width && src_height == dst_height {
+        return src.to_vec();
+    }
+
+    let mut result = vec![0u8; (dst_width * dst_height * 4) as usize];
+
+    let x_ratio = if dst_width > 1 { (src_width - 1) as f64 / (dst_width - 1) as f64 } else { 0.0 };
+    let y_ratio = if dst_height > 1 { (src_height - 1) as f64 / (dst_height - 1) as f64 } else { 0.0 };
+
+    let mut dy: u32 = 0;
+    while dy < dst_height {
+        let mut dx: u32 = 0;
+        while dx < dst_width {
+            let src_x = (dx as f64) * x_ratio;
+            let src_y = (dy as f64) * y_ratio;
+
+            let x0 = src_x.floor() as u32;
+            let y0 = src_y.floor() as u32;
+            let x1 = (x0 + 1).min(src_width - 1);
+            let y1 = (y0 + 1).min(src_height - 1);
+
+            let x_frac = src_x - x0 as f64;
+            let y_frac = src_y - y0 as f64;
+
+            // Get four surrounding pixels
+            let idx00 = ((y0 * src_width + x0) * 4) as usize;
+            let idx10 = ((y0 * src_width + x1) * 4) as usize;
+            let idx01 = ((y1 * src_width + x0) * 4) as usize;
+            let idx11 = ((y1 * src_width + x1) * 4) as usize;
+
+            // Bilinear interpolation for each channel
+            let dst_idx = ((dy * dst_width + dx) * 4) as usize;
+            let mut c: usize = 0;
+            while c < 4 {
+                let v00 = src.get(idx00 + c).copied().unwrap_or(0) as f64;
+                let v10 = src.get(idx10 + c).copied().unwrap_or(0) as f64;
+                let v01 = src.get(idx01 + c).copied().unwrap_or(0) as f64;
+                let v11 = src.get(idx11 + c).copied().unwrap_or(0) as f64;
+
+                let v0 = v00 * (1.0 - x_frac) + v10 * x_frac;
+                let v1 = v01 * (1.0 - x_frac) + v11 * x_frac;
+                let v = v0 * (1.0 - y_frac) + v1 * y_frac;
+
+                result[dst_idx + c] = v.round().min(255.0).max(0.0) as u8;
+                c += 1;
+            }
+
+            dx += 1;
+        }
+        dy += 1;
+    }
+
+    result
 }
 
 // ============================================================

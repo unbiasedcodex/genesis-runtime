@@ -165,6 +165,13 @@ pub enum UICommand {
         rect: UIRect,
     },
     UnClip,
+    Image {
+        data: Vec<u8>,        // RGBA pixel data
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

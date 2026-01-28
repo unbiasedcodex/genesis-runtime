@@ -1,0 +1,1064 @@
+// SVG Renderer
+// Supports basic SVG shapes, paths, and fills
+// Uses scanline rasterization
+
+use super::common::{ImageBuffer, PixelFormat, alpha_blend, clamp_u8};
+use super::xml::{self, XmlNode};
+use super::ImageError;
+
+// ============================================================
+// SVG Constants
+// ============================================================
+
+const PI: f64 = 3.14159265358979323846;
+
+// ============================================================
+// Color Parsing
+// ============================================================
+
+fn parse_color(color_str: &str) -> u32 {
+    let s = color_str.trim();
+
+    // Named colors
+    match s.to_lowercase().as_str() {
+        "black" => return 0xFF000000,
+        "white" => return 0xFFFFFFFF,
+        "red" => return 0xFFFF0000,
+        "green" => return 0xFF008000,
+        "blue" => return 0xFF0000FF,
+        "yellow" => return 0xFFFFFF00,
+        "cyan" | "aqua" => return 0xFF00FFFF,
+        "magenta" | "fuchsia" => return 0xFFFF00FF,
+        "gray" | "grey" => return 0xFF808080,
+        "silver" => return 0xFFC0C0C0,
+        "maroon" => return 0xFF800000,
+        "olive" => return 0xFF808000,
+        "navy" => return 0xFF000080,
+        "purple" => return 0xFF800080,
+        "teal" => return 0xFF008080,
+        "orange" => return 0xFFFFA500,
+        "lime" => return 0xFF00FF00,
+        "transparent" => return 0x00000000,
+        "none" => return 0x00000000,
+        _ => {}
+    }
+
+    // Hex color
+    if s.starts_with('#') {
+        let hex = &s[1..];
+        if hex.len() == 3 {
+            // #RGB
+            let r = u8::from_str_radix(&hex[0..1], 16).unwrap_or(0) * 17;
+            let g = u8::from_str_radix(&hex[1..2], 16).unwrap_or(0) * 17;
+            let b = u8::from_str_radix(&hex[2..3], 16).unwrap_or(0) * 17;
+            return 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        } else if hex.len() == 6 {
+            // #RRGGBB
+            let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+            let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+            let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+            return 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        } else if hex.len() == 8 {
+            // #RRGGBBAA
+            let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+            let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+            let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+            let a = u8::from_str_radix(&hex[6..8], 16).unwrap_or(255);
+            return ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
+    }
+
+    // rgb() or rgba()
+    if s.starts_with("rgb") {
+        let inner = s.trim_start_matches("rgba(").trim_start_matches("rgb(").trim_end_matches(')');
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() >= 3 {
+            let r = parse_color_component(parts[0]);
+            let g = parse_color_component(parts[1]);
+            let b = parse_color_component(parts[2]);
+            let a = if parts.len() >= 4 {
+                parse_alpha(parts[3])
+            } else {
+                255
+            };
+            return ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
+    }
+
+    0xFF000000  // Default black
+}
+
+fn parse_color_component(s: &str) -> u8 {
+    let s = s.trim();
+    if s.ends_with('%') {
+        let pct: f64 = s.trim_end_matches('%').parse().unwrap_or(0.0);
+        clamp_u8((pct * 2.55) as i32)
+    } else {
+        s.parse::<u8>().unwrap_or(0)
+    }
+}
+
+fn parse_alpha(s: &str) -> u8 {
+    let s = s.trim();
+    if s.ends_with('%') {
+        let pct: f64 = s.trim_end_matches('%').parse().unwrap_or(100.0);
+        clamp_u8((pct * 2.55) as i32)
+    } else {
+        let a: f64 = s.parse().unwrap_or(1.0);
+        clamp_u8((a * 255.0) as i32)
+    }
+}
+
+fn parse_float(s: &str) -> f64 {
+    let s = s.trim();
+    // Handle units
+    let num = if s.ends_with("px") || s.ends_with("pt") {
+        &s[..s.len() - 2]
+    } else if s.ends_with('%') {
+        // Percentages need context, treat as raw for now
+        s.trim_end_matches('%')
+    } else {
+        s
+    };
+    num.parse().unwrap_or(0.0)
+}
+
+// ============================================================
+// Path Data Types
+// ============================================================
+
+#[derive(Clone, Debug)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn new(x: f64, y: f64) -> Point {
+        Point { x, y }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PathCommand {
+    MoveTo(Point),
+    LineTo(Point),
+    CurveTo(Point, Point, Point),  // Control1, Control2, End
+    QuadTo(Point, Point),          // Control, End
+    ArcTo {
+        rx: f64, ry: f64,
+        x_rotation: f64,
+        large_arc: bool,
+        sweep: bool,
+        end: Point,
+    },
+    ClosePath,
+}
+
+#[derive(Clone)]
+struct Path {
+    commands: Vec<PathCommand>,
+}
+
+impl Path {
+    fn new() -> Path {
+        Path { commands: Vec::new() }
+    }
+
+    fn move_to(&mut self, x: f64, y: f64) {
+        self.commands.push(PathCommand::MoveTo(Point::new(x, y)));
+    }
+
+    fn line_to(&mut self, x: f64, y: f64) {
+        self.commands.push(PathCommand::LineTo(Point::new(x, y)));
+    }
+
+    fn curve_to(&mut self, cx1: f64, cy1: f64, cx2: f64, cy2: f64, x: f64, y: f64) {
+        self.commands.push(PathCommand::CurveTo(
+            Point::new(cx1, cy1),
+            Point::new(cx2, cy2),
+            Point::new(x, y),
+        ));
+    }
+
+    fn quad_to(&mut self, cx: f64, cy: f64, x: f64, y: f64) {
+        self.commands.push(PathCommand::QuadTo(
+            Point::new(cx, cy),
+            Point::new(x, y),
+        ));
+    }
+
+    fn close(&mut self) {
+        self.commands.push(PathCommand::ClosePath);
+    }
+}
+
+// ============================================================
+// SVG Context
+// ============================================================
+
+struct SvgContext {
+    width: f64,
+    height: f64,
+    view_box: Option<(f64, f64, f64, f64)>,  // min_x, min_y, width, height
+
+    // Current transform
+    scale_x: f64,
+    scale_y: f64,
+    translate_x: f64,
+    translate_y: f64,
+}
+
+impl SvgContext {
+    fn new(width: f64, height: f64) -> SvgContext {
+        SvgContext {
+            width,
+            height,
+            view_box: None,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            translate_x: 0.0,
+            translate_y: 0.0,
+        }
+    }
+
+    fn set_view_box(&mut self, min_x: f64, min_y: f64, vb_width: f64, vb_height: f64) {
+        self.view_box = Some((min_x, min_y, vb_width, vb_height));
+        // Update transform
+        self.scale_x = self.width / vb_width;
+        self.scale_y = self.height / vb_height;
+        self.translate_x = -min_x;
+        self.translate_y = -min_y;
+    }
+
+    fn transform_x(&self, x: f64) -> f64 {
+        (x + self.translate_x) * self.scale_x
+    }
+
+    fn transform_y(&self, y: f64) -> f64 {
+        (y + self.translate_y) * self.scale_y
+    }
+}
+
+// ============================================================
+// Edge for Scanline Rasterization
+// ============================================================
+
+#[derive(Clone)]
+struct Edge {
+    y_min: i32,
+    y_max: i32,
+    x: f64,           // Current X at y_min
+    dx: f64,          // X increment per scanline
+    direction: i32,   // +1 or -1 for winding
+}
+
+impl Edge {
+    fn from_line(x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Edge> {
+        let y_min = y0.min(y1) as i32;
+        let y_max = y0.max(y1) as i32;
+
+        if y_min == y_max {
+            return None;  // Horizontal line
+        }
+
+        let (x_start, direction) = if y0 < y1 {
+            (x0, 1)
+        } else {
+            (x1, -1)
+        };
+
+        let dy = (y_max - y_min) as f64;
+        let dx = (x1 - x0).abs() / dy * if (x1 > x0) == (y1 > y0) { 1.0 } else { -1.0 };
+
+        Some(Edge {
+            y_min,
+            y_max,
+            x: x_start,
+            dx,
+            direction,
+        })
+    }
+}
+
+// ============================================================
+// Rasterizer
+// ============================================================
+
+struct Rasterizer {
+    edges: Vec<Edge>,
+    width: i32,
+    height: i32,
+}
+
+impl Rasterizer {
+    fn new(width: i32, height: i32) -> Rasterizer {
+        Rasterizer {
+            edges: Vec::new(),
+            width,
+            height,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.edges.clear();
+    }
+
+    fn add_edge(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
+        if let Some(edge) = Edge::from_line(x0, y0, x1, y1) {
+            self.edges.push(edge);
+        }
+    }
+
+    fn add_path(&mut self, path: &Path, ctx: &SvgContext) {
+        let mut current = Point::new(0.0, 0.0);
+        let mut start = Point::new(0.0, 0.0);
+
+        for cmd in &path.commands {
+            match cmd {
+                PathCommand::MoveTo(p) => {
+                    let x = ctx.transform_x(p.x);
+                    let y = ctx.transform_y(p.y);
+                    current = Point::new(x, y);
+                    start = current.clone();
+                },
+                PathCommand::LineTo(p) => {
+                    let x = ctx.transform_x(p.x);
+                    let y = ctx.transform_y(p.y);
+                    self.add_edge(current.x, current.y, x, y);
+                    current = Point::new(x, y);
+                },
+                PathCommand::CurveTo(c1, c2, p) => {
+                    let cx1 = ctx.transform_x(c1.x);
+                    let cy1 = ctx.transform_y(c1.y);
+                    let cx2 = ctx.transform_x(c2.x);
+                    let cy2 = ctx.transform_y(c2.y);
+                    let x = ctx.transform_x(p.x);
+                    let y = ctx.transform_y(p.y);
+
+                    // Flatten cubic bezier to line segments
+                    self.flatten_cubic(current.x, current.y, cx1, cy1, cx2, cy2, x, y);
+                    current = Point::new(x, y);
+                },
+                PathCommand::QuadTo(c, p) => {
+                    let cx = ctx.transform_x(c.x);
+                    let cy = ctx.transform_y(c.y);
+                    let x = ctx.transform_x(p.x);
+                    let y = ctx.transform_y(p.y);
+
+                    // Flatten quadratic bezier
+                    self.flatten_quad(current.x, current.y, cx, cy, x, y);
+                    current = Point::new(x, y);
+                },
+                PathCommand::ArcTo { rx, ry, x_rotation, large_arc, sweep, end } => {
+                    let ex = ctx.transform_x(end.x);
+                    let ey = ctx.transform_y(end.y);
+                    let srx = *rx * ctx.scale_x;
+                    let sry = *ry * ctx.scale_y;
+
+                    // Flatten arc to line segments
+                    self.flatten_arc(current.x, current.y, srx, sry, *x_rotation, *large_arc, *sweep, ex, ey);
+                    current = Point::new(ex, ey);
+                },
+                PathCommand::ClosePath => {
+                    self.add_edge(current.x, current.y, start.x, start.y);
+                    current = start.clone();
+                },
+            }
+        }
+    }
+
+    fn flatten_cubic(&mut self, x0: f64, y0: f64, cx1: f64, cy1: f64, cx2: f64, cy2: f64, x3: f64, y3: f64) {
+        // Adaptive subdivision
+        let steps = 16;
+        let mut prev_x = x0;
+        let mut prev_y = y0;
+
+        let mut i = 1;
+        while i <= steps {
+            let t = (i as f64) / (steps as f64);
+            let mt = 1.0 - t;
+            let mt2 = mt * mt;
+            let mt3 = mt2 * mt;
+            let t2 = t * t;
+            let t3 = t2 * t;
+
+            let x = mt3 * x0 + 3.0 * mt2 * t * cx1 + 3.0 * mt * t2 * cx2 + t3 * x3;
+            let y = mt3 * y0 + 3.0 * mt2 * t * cy1 + 3.0 * mt * t2 * cy2 + t3 * y3;
+
+            self.add_edge(prev_x, prev_y, x, y);
+            prev_x = x;
+            prev_y = y;
+            i += 1;
+        }
+    }
+
+    fn flatten_quad(&mut self, x0: f64, y0: f64, cx: f64, cy: f64, x2: f64, y2: f64) {
+        let steps = 12;
+        let mut prev_x = x0;
+        let mut prev_y = y0;
+
+        let mut i = 1;
+        while i <= steps {
+            let t = (i as f64) / (steps as f64);
+            let mt = 1.0 - t;
+            let mt2 = mt * mt;
+            let t2 = t * t;
+
+            let x = mt2 * x0 + 2.0 * mt * t * cx + t2 * x2;
+            let y = mt2 * y0 + 2.0 * mt * t * cy + t2 * y2;
+
+            self.add_edge(prev_x, prev_y, x, y);
+            prev_x = x;
+            prev_y = y;
+            i += 1;
+        }
+    }
+
+    fn flatten_arc(&mut self, x0: f64, y0: f64, rx: f64, ry: f64, rotation: f64, _large_arc: bool, _sweep: bool, x1: f64, y1: f64) {
+        // Simplified arc - just draw line for now
+        // Full arc calculation is complex
+        let steps = 16;
+        let mut prev_x = x0;
+        let mut prev_y = y0;
+
+        let mut i = 1;
+        while i <= steps {
+            let t = (i as f64) / (steps as f64);
+            let x = x0 + t * (x1 - x0);
+            let y = y0 + t * (y1 - y0);
+            self.add_edge(prev_x, prev_y, x, y);
+            prev_x = x;
+            prev_y = y;
+            i += 1;
+        }
+    }
+
+    fn fill(&self, image: &mut ImageBuffer, color: u32) {
+        if self.edges.is_empty() {
+            return;
+        }
+
+        // Find Y range
+        let mut y_min = self.height;
+        let mut y_max = 0;
+        for edge in &self.edges {
+            if edge.y_min < y_min {
+                y_min = edge.y_min;
+            }
+            if edge.y_max > y_max {
+                y_max = edge.y_max;
+            }
+        }
+
+        y_min = y_min.max(0);
+        y_max = y_max.min(self.height);
+
+        // Scanline fill
+        let mut active_edges: Vec<(f64, i32)> = Vec::new();  // (x, direction)
+
+        let mut y = y_min;
+        while y < y_max {
+            active_edges.clear();
+
+            // Collect edges at this scanline
+            for edge in &self.edges {
+                if edge.y_min <= y && edge.y_max > y {
+                    let x = edge.x + (y - edge.y_min) as f64 * edge.dx;
+                    active_edges.push((x, edge.direction));
+                }
+            }
+
+            // Sort by X
+            active_edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Fill spans using non-zero winding rule
+            let mut winding = 0;
+            let mut i: usize = 0;
+            while i + 1 < active_edges.len() {
+                let (x1, dir1) = active_edges[i];
+                winding += dir1;
+
+                if winding != 0 {
+                    let (x2, _) = active_edges[i + 1];
+                    let start_x = x1.ceil() as i32;
+                    let end_x = x2.floor() as i32;
+
+                    let mut x = start_x.max(0);
+                    while x <= end_x && x < self.width {
+                        let existing = image.get_pixel(x as u32, y as u32);
+                        let blended = alpha_blend(color, existing);
+                        image.set_pixel(x as u32, y as u32, blended);
+                        x += 1;
+                    }
+                }
+
+                i += 1;
+            }
+
+            y += 1;
+        }
+    }
+}
+
+// ============================================================
+// Path Parser
+// ============================================================
+
+fn parse_path_data(d: &str) -> Path {
+    let mut path = Path::new();
+    let mut chars = d.chars().peekable();
+
+    let mut current_x: f64 = 0.0;
+    let mut current_y: f64 = 0.0;
+    let mut start_x: f64 = 0.0;
+    let mut start_y: f64 = 0.0;
+    let mut last_control_x: f64 = 0.0;
+    let mut last_control_y: f64 = 0.0;
+    let mut last_cmd: char = ' ';
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == ',' {
+            chars.next();
+            continue;
+        }
+
+        let cmd = if c.is_alphabetic() {
+            chars.next();
+            c
+        } else {
+            // Repeat last command
+            last_cmd
+        };
+
+        match cmd {
+            'M' => {
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                path.move_to(x, y);
+                current_x = x;
+                current_y = y;
+                start_x = x;
+                start_y = y;
+                last_cmd = 'L';  // Subsequent coords are LineTo
+            },
+            'm' => {
+                let dx = parse_number(&mut chars);
+                let dy = parse_number(&mut chars);
+                let x = current_x + dx;
+                let y = current_y + dy;
+                path.move_to(x, y);
+                current_x = x;
+                current_y = y;
+                start_x = x;
+                start_y = y;
+                last_cmd = 'l';
+            },
+            'L' => {
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                path.line_to(x, y);
+                current_x = x;
+                current_y = y;
+                last_cmd = 'L';
+            },
+            'l' => {
+                let dx = parse_number(&mut chars);
+                let dy = parse_number(&mut chars);
+                let x = current_x + dx;
+                let y = current_y + dy;
+                path.line_to(x, y);
+                current_x = x;
+                current_y = y;
+                last_cmd = 'l';
+            },
+            'H' => {
+                let x = parse_number(&mut chars);
+                path.line_to(x, current_y);
+                current_x = x;
+                last_cmd = 'H';
+            },
+            'h' => {
+                let dx = parse_number(&mut chars);
+                path.line_to(current_x + dx, current_y);
+                current_x += dx;
+                last_cmd = 'h';
+            },
+            'V' => {
+                let y = parse_number(&mut chars);
+                path.line_to(current_x, y);
+                current_y = y;
+                last_cmd = 'V';
+            },
+            'v' => {
+                let dy = parse_number(&mut chars);
+                path.line_to(current_x, current_y + dy);
+                current_y += dy;
+                last_cmd = 'v';
+            },
+            'C' => {
+                let cx1 = parse_number(&mut chars);
+                let cy1 = parse_number(&mut chars);
+                let cx2 = parse_number(&mut chars);
+                let cy2 = parse_number(&mut chars);
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                path.curve_to(cx1, cy1, cx2, cy2, x, y);
+                last_control_x = cx2;
+                last_control_y = cy2;
+                current_x = x;
+                current_y = y;
+                last_cmd = 'C';
+            },
+            'c' => {
+                let cx1 = current_x + parse_number(&mut chars);
+                let cy1 = current_y + parse_number(&mut chars);
+                let cx2 = current_x + parse_number(&mut chars);
+                let cy2 = current_y + parse_number(&mut chars);
+                let x = current_x + parse_number(&mut chars);
+                let y = current_y + parse_number(&mut chars);
+                path.curve_to(cx1, cy1, cx2, cy2, x, y);
+                last_control_x = cx2;
+                last_control_y = cy2;
+                current_x = x;
+                current_y = y;
+                last_cmd = 'c';
+            },
+            'S' => {
+                let cx1 = 2.0 * current_x - last_control_x;
+                let cy1 = 2.0 * current_y - last_control_y;
+                let cx2 = parse_number(&mut chars);
+                let cy2 = parse_number(&mut chars);
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                path.curve_to(cx1, cy1, cx2, cy2, x, y);
+                last_control_x = cx2;
+                last_control_y = cy2;
+                current_x = x;
+                current_y = y;
+                last_cmd = 'S';
+            },
+            's' => {
+                let cx1 = 2.0 * current_x - last_control_x;
+                let cy1 = 2.0 * current_y - last_control_y;
+                let cx2 = current_x + parse_number(&mut chars);
+                let cy2 = current_y + parse_number(&mut chars);
+                let x = current_x + parse_number(&mut chars);
+                let y = current_y + parse_number(&mut chars);
+                path.curve_to(cx1, cy1, cx2, cy2, x, y);
+                last_control_x = cx2;
+                last_control_y = cy2;
+                current_x = x;
+                current_y = y;
+                last_cmd = 's';
+            },
+            'Q' => {
+                let cx = parse_number(&mut chars);
+                let cy = parse_number(&mut chars);
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                path.quad_to(cx, cy, x, y);
+                last_control_x = cx;
+                last_control_y = cy;
+                current_x = x;
+                current_y = y;
+                last_cmd = 'Q';
+            },
+            'q' => {
+                let cx = current_x + parse_number(&mut chars);
+                let cy = current_y + parse_number(&mut chars);
+                let x = current_x + parse_number(&mut chars);
+                let y = current_y + parse_number(&mut chars);
+                path.quad_to(cx, cy, x, y);
+                last_control_x = cx;
+                last_control_y = cy;
+                current_x = x;
+                current_y = y;
+                last_cmd = 'q';
+            },
+            'Z' | 'z' => {
+                path.close();
+                current_x = start_x;
+                current_y = start_y;
+                last_cmd = 'Z';
+            },
+            'A' | 'a' => {
+                // Skip arc commands for now (complex)
+                let _ = parse_number(&mut chars); // rx
+                let _ = parse_number(&mut chars); // ry
+                let _ = parse_number(&mut chars); // x-rotation
+                let _ = parse_number(&mut chars); // large-arc
+                let _ = parse_number(&mut chars); // sweep
+                let x = parse_number(&mut chars);
+                let y = parse_number(&mut chars);
+                let (target_x, target_y) = if cmd == 'A' {
+                    (x, y)
+                } else {
+                    (current_x + x, current_y + y)
+                };
+                path.line_to(target_x, target_y);
+                current_x = target_x;
+                current_y = target_y;
+                last_cmd = cmd;
+            },
+            _ => {
+                chars.next();
+            }
+        }
+    }
+
+    path
+}
+
+fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> f64 {
+    // Skip whitespace and commas
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == ',' {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    let mut s = String::new();
+
+    // Handle sign
+    if let Some(&c) = chars.peek() {
+        if c == '-' || c == '+' {
+            s.push(c);
+            chars.next();
+        }
+    }
+
+    // Integer part
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            s.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Decimal part
+    if let Some(&'.') = chars.peek() {
+        s.push('.');
+        chars.next();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                s.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Exponent
+    if let Some(&c) = chars.peek() {
+        if c == 'e' || c == 'E' {
+            s.push(c);
+            chars.next();
+            if let Some(&c) = chars.peek() {
+                if c == '-' || c == '+' {
+                    s.push(c);
+                    chars.next();
+                }
+            }
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    s.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    s.parse().unwrap_or(0.0)
+}
+
+// ============================================================
+// SVG Element Rendering
+// ============================================================
+
+fn render_element(node: &XmlNode, ctx: &SvgContext, raster: &mut Rasterizer, image: &mut ImageBuffer) {
+    let name = match node.name() {
+        Some(n) => n,
+        None => return,
+    };
+
+    // Get fill and stroke colors
+    let fill_str = node.get_attr("fill").unwrap_or("black");
+    let fill_color = parse_color(fill_str);
+
+    let stroke_str = node.get_attr("stroke").unwrap_or("none");
+    let stroke_color = parse_color(stroke_str);
+
+    let opacity_str = node.get_attr("opacity").unwrap_or("1");
+    let opacity: f64 = opacity_str.parse().unwrap_or(1.0);
+
+    match name {
+        "rect" => {
+            let x = parse_float(node.get_attr("x").unwrap_or("0"));
+            let y = parse_float(node.get_attr("y").unwrap_or("0"));
+            let width = parse_float(node.get_attr("width").unwrap_or("0"));
+            let height = parse_float(node.get_attr("height").unwrap_or("0"));
+            let rx = parse_float(node.get_attr("rx").unwrap_or("0"));
+            let ry = parse_float(node.get_attr("ry").unwrap_or("0"));
+
+            let mut path = Path::new();
+            if rx > 0.0 || ry > 0.0 {
+                // Rounded rectangle
+                let rx = rx.min(width / 2.0);
+                let ry = if ry == 0.0 { rx } else { ry.min(height / 2.0) };
+                path.move_to(x + rx, y);
+                path.line_to(x + width - rx, y);
+                path.quad_to(x + width, y, x + width, y + ry);
+                path.line_to(x + width, y + height - ry);
+                path.quad_to(x + width, y + height, x + width - rx, y + height);
+                path.line_to(x + rx, y + height);
+                path.quad_to(x, y + height, x, y + height - ry);
+                path.line_to(x, y + ry);
+                path.quad_to(x, y, x + rx, y);
+                path.close();
+            } else {
+                path.move_to(x, y);
+                path.line_to(x + width, y);
+                path.line_to(x + width, y + height);
+                path.line_to(x, y + height);
+                path.close();
+            }
+
+            raster.clear();
+            raster.add_path(&path, ctx);
+            raster.fill(image, apply_opacity(fill_color, opacity));
+        },
+        "circle" => {
+            let cx = parse_float(node.get_attr("cx").unwrap_or("0"));
+            let cy = parse_float(node.get_attr("cy").unwrap_or("0"));
+            let r = parse_float(node.get_attr("r").unwrap_or("0"));
+
+            let mut path = Path::new();
+            // Approximate circle with bezier curves
+            let k: f64 = 0.5522847498;  // Magic number for circle approximation
+            path.move_to(cx + r, cy);
+            path.curve_to(cx + r, cy + r * k, cx + r * k, cy + r, cx, cy + r);
+            path.curve_to(cx - r * k, cy + r, cx - r, cy + r * k, cx - r, cy);
+            path.curve_to(cx - r, cy - r * k, cx - r * k, cy - r, cx, cy - r);
+            path.curve_to(cx + r * k, cy - r, cx + r, cy - r * k, cx + r, cy);
+            path.close();
+
+            raster.clear();
+            raster.add_path(&path, ctx);
+            raster.fill(image, apply_opacity(fill_color, opacity));
+        },
+        "ellipse" => {
+            let cx = parse_float(node.get_attr("cx").unwrap_or("0"));
+            let cy = parse_float(node.get_attr("cy").unwrap_or("0"));
+            let rx = parse_float(node.get_attr("rx").unwrap_or("0"));
+            let ry = parse_float(node.get_attr("ry").unwrap_or("0"));
+
+            let mut path = Path::new();
+            let k: f64 = 0.5522847498;
+            path.move_to(cx + rx, cy);
+            path.curve_to(cx + rx, cy + ry * k, cx + rx * k, cy + ry, cx, cy + ry);
+            path.curve_to(cx - rx * k, cy + ry, cx - rx, cy + ry * k, cx - rx, cy);
+            path.curve_to(cx - rx, cy - ry * k, cx - rx * k, cy - ry, cx, cy - ry);
+            path.curve_to(cx + rx * k, cy - ry, cx + rx, cy - ry * k, cx + rx, cy);
+            path.close();
+
+            raster.clear();
+            raster.add_path(&path, ctx);
+            raster.fill(image, apply_opacity(fill_color, opacity));
+        },
+        "line" => {
+            let x1 = parse_float(node.get_attr("x1").unwrap_or("0"));
+            let y1 = parse_float(node.get_attr("y1").unwrap_or("0"));
+            let x2 = parse_float(node.get_attr("x2").unwrap_or("0"));
+            let y2 = parse_float(node.get_attr("y2").unwrap_or("0"));
+
+            // Lines need stroke, not fill - simplified rendering
+            let tx1 = ctx.transform_x(x1) as i32;
+            let ty1 = ctx.transform_y(y1) as i32;
+            let tx2 = ctx.transform_x(x2) as i32;
+            let ty2 = ctx.transform_y(y2) as i32;
+            draw_line(image, tx1, ty1, tx2, ty2, stroke_color);
+        },
+        "polyline" | "polygon" => {
+            if let Some(points_str) = node.get_attr("points") {
+                let points = parse_points(points_str);
+                if points.len() >= 2 {
+                    let mut path = Path::new();
+                    path.move_to(points[0].0, points[0].1);
+                    let mut i: usize = 1;
+                    while i < points.len() {
+                        path.line_to(points[i].0, points[i].1);
+                        i += 1;
+                    }
+                    if name == "polygon" {
+                        path.close();
+                    }
+
+                    raster.clear();
+                    raster.add_path(&path, ctx);
+                    raster.fill(image, apply_opacity(fill_color, opacity));
+                }
+            }
+        },
+        "path" => {
+            if let Some(d) = node.get_attr("d") {
+                let path = parse_path_data(d);
+                raster.clear();
+                raster.add_path(&path, ctx);
+                raster.fill(image, apply_opacity(fill_color, opacity));
+            }
+        },
+        "g" => {
+            // Group - render children
+            for child in node.children() {
+                render_element(child, ctx, raster, image);
+            }
+        },
+        "svg" => {
+            // Root or nested SVG
+            for child in node.children() {
+                render_element(child, ctx, raster, image);
+            }
+        },
+        _ => {
+            // Unknown element - try to render children
+            for child in node.children() {
+                render_element(child, ctx, raster, image);
+            }
+        }
+    }
+}
+
+fn parse_points(s: &str) -> Vec<(f64, f64)> {
+    let mut points = Vec::new();
+    let mut chars = s.chars().peekable();
+
+    loop {
+        let x = parse_number(&mut chars);
+
+        // Skip separator
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == ',' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let y = parse_number(&mut chars);
+        points.push((x, y));
+
+        if chars.peek().is_none() {
+            break;
+        }
+    }
+
+    points
+}
+
+fn apply_opacity(color: u32, opacity: f64) -> u32 {
+    let a = ((color >> 24) & 0xFF) as f64 * opacity;
+    ((a as u32) << 24) | (color & 0x00FFFFFF)
+}
+
+fn draw_line(image: &mut ImageBuffer, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    // Bresenham's line algorithm
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx - dy;
+    let mut x = x0;
+    let mut y = y0;
+
+    loop {
+        if x >= 0 && y >= 0 && x < image.width as i32 && y < image.height as i32 {
+            image.set_pixel(x as u32, y as u32, color);
+        }
+
+        if x == x1 && y == y1 {
+            break;
+        }
+
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+pub fn render(data: &[u8], width: u32, height: u32) -> Result<ImageBuffer, ImageError> {
+    // Parse XML
+    let root = xml::parse(data)?;
+
+    // Find SVG element
+    let svg = if root.name() == Some("svg") {
+        &root
+    } else if let Some(svg) = root.find_child("svg") {
+        svg
+    } else {
+        return Err(ImageError::InvalidData);
+    };
+
+    // Get dimensions from SVG or use provided
+    let svg_width = svg.get_attr("width").map(|s| parse_float(s)).unwrap_or(width as f64);
+    let svg_height = svg.get_attr("height").map(|s| parse_float(s)).unwrap_or(height as f64);
+
+    let mut ctx = SvgContext::new(width as f64, height as f64);
+
+    // Parse viewBox
+    if let Some(vb) = svg.get_attr("viewBox") {
+        let parts: Vec<&str> = vb.split_whitespace().collect();
+        if parts.len() == 4 {
+            let min_x = parts[0].parse().unwrap_or(0.0);
+            let min_y = parts[1].parse().unwrap_or(0.0);
+            let vb_width = parts[2].parse().unwrap_or(svg_width);
+            let vb_height = parts[3].parse().unwrap_or(svg_height);
+            ctx.set_view_box(min_x, min_y, vb_width, vb_height);
+        }
+    } else {
+        ctx.set_view_box(0.0, 0.0, svg_width, svg_height);
+    }
+
+    // Create image buffer
+    let mut image = ImageBuffer::new_rgba(width, height);
+
+    // Fill with white background (or transparent)
+    let mut y: u32 = 0;
+    while y < height {
+        let mut x: u32 = 0;
+        while x < width {
+            image.set_pixel(x, y, 0xFFFFFFFF);  // White background
+            x += 1;
+        }
+        y += 1;
+    }
+
+    // Create rasterizer
+    let mut raster = Rasterizer::new(width as i32, height as i32);
+
+    // Render SVG
+    render_element(svg, &ctx, &mut raster, &mut image);
+
+    Ok(image)
+}

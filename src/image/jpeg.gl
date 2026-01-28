@@ -1,0 +1,871 @@
+// JPEG Decoder (ITU-T T.81)
+// Baseline DCT decoder with Huffman coding
+// Supports YCbCr to RGB conversion
+
+use super::common::{ImageBuffer, PixelFormat, read_u8, read_u16_be, clamp_u8};
+use super::ImageError;
+
+// ============================================================
+// JPEG Markers
+// ============================================================
+
+const MARKER_SOI: u8 = 0xD8;   // Start of Image
+const MARKER_EOI: u8 = 0xD9;   // End of Image
+const MARKER_SOS: u8 = 0xDA;   // Start of Scan
+const MARKER_DQT: u8 = 0xDB;   // Define Quantization Table
+const MARKER_DHT: u8 = 0xC4;   // Define Huffman Table
+const MARKER_SOF0: u8 = 0xC0;  // Start of Frame (Baseline DCT)
+const MARKER_SOF2: u8 = 0xC2;  // Start of Frame (Progressive DCT)
+const MARKER_DRI: u8 = 0xDD;   // Define Restart Interval
+const MARKER_RST0: u8 = 0xD0; // Restart marker 0
+const MARKER_RST7: u8 = 0xD7; // Restart marker 7
+const MARKER_APP0: u8 = 0xE0;  // Application marker 0 (JFIF)
+const MARKER_APP1: u8 = 0xE1;  // Application marker 1 (EXIF)
+const MARKER_COM: u8 = 0xFE;   // Comment
+
+// ============================================================
+// Zigzag Order
+// ============================================================
+
+const ZIGZAG: [usize; 64] = [
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63
+];
+
+// ============================================================
+// Component Info
+// ============================================================
+
+#[derive(Clone, Copy)]
+struct Component {
+    id: u8,
+    h_sample: u8,    // Horizontal sampling factor
+    v_sample: u8,    // Vertical sampling factor
+    quant_table: u8, // Quantization table index
+    dc_table: u8,    // DC Huffman table index
+    ac_table: u8,    // AC Huffman table index
+    dc_pred: i32,    // DC prediction value
+}
+
+impl Component {
+    fn new() -> Component {
+        Component {
+            id: 0,
+            h_sample: 1,
+            v_sample: 1,
+            quant_table: 0,
+            dc_table: 0,
+            ac_table: 0,
+            dc_pred: 0,
+        }
+    }
+}
+
+// ============================================================
+// Huffman Table
+// ============================================================
+
+struct HuffmanTable {
+    codes: [u16; 256],    // Huffman codes
+    sizes: [u8; 256],     // Code sizes
+    values: [u8; 256],    // Symbol values
+    num_codes: usize,
+    max_code: [i32; 17],  // Maximum code for each length
+    val_ptr: [i32; 17],   // Value pointer for each length
+    min_code: [i32; 17],  // Minimum code for each length
+}
+
+impl HuffmanTable {
+    fn new() -> HuffmanTable {
+        HuffmanTable {
+            codes: [0; 256],
+            sizes: [0; 256],
+            values: [0; 256],
+            num_codes: 0,
+            max_code: [-1; 17],
+            val_ptr: [0; 17],
+            min_code: [0; 17],
+        }
+    }
+
+    fn build(&mut self, bits: &[u8; 16], huffval: &[u8]) {
+        // Generate code sizes
+        let mut k: usize = 0;
+        let mut i: usize = 0;
+        while i < 16 {
+            let mut j: u8 = 0;
+            while j < bits[i] {
+                self.sizes[k] = (i + 1) as u8;
+                k += 1;
+                j += 1;
+            }
+            i += 1;
+        }
+        self.num_codes = k;
+
+        // Generate codes
+        let mut code: u16 = 0;
+        let mut si = self.sizes[0];
+        k = 0;
+
+        while k < self.num_codes {
+            while self.sizes[k] == si {
+                self.codes[k] = code;
+                code += 1;
+                k += 1;
+            }
+            code <<= 1;
+            si += 1;
+        }
+
+        // Copy values
+        let mut i: usize = 0;
+        while i < self.num_codes && i < huffval.len() {
+            self.values[i] = huffval[i];
+            i += 1;
+        }
+
+        // Build lookup tables
+        let mut p: usize = 0;
+        let mut l: usize = 1;
+        while l <= 16 {
+            if bits[l - 1] != 0 {
+                self.val_ptr[l] = p as i32;
+                self.min_code[l] = self.codes[p] as i32;
+                p += bits[l - 1] as usize;
+                self.max_code[l] = self.codes[p - 1] as i32;
+            } else {
+                self.max_code[l] = -1;
+            }
+            l += 1;
+        }
+    }
+}
+
+// ============================================================
+// JPEG Context
+// ============================================================
+
+struct JpegContext {
+    width: u32,
+    height: u32,
+    num_components: u8,
+    components: [Component; 4],
+
+    // Quantization tables (up to 4)
+    quant_tables: [[i32; 64]; 4],
+
+    // Huffman tables (DC and AC, up to 4 each)
+    dc_tables: [HuffmanTable; 4],
+    ac_tables: [HuffmanTable; 4],
+
+    // Restart interval
+    restart_interval: u16,
+
+    // Sampling factors
+    max_h_sample: u8,
+    max_v_sample: u8,
+
+    // MCU dimensions
+    mcu_width: u32,
+    mcu_height: u32,
+    mcu_count_x: u32,
+    mcu_count_y: u32,
+}
+
+impl JpegContext {
+    fn new() -> JpegContext {
+        JpegContext {
+            width: 0,
+            height: 0,
+            num_components: 0,
+            components: [Component::new(); 4],
+            quant_tables: [[0; 64]; 4],
+            dc_tables: [HuffmanTable::new(), HuffmanTable::new(),
+                       HuffmanTable::new(), HuffmanTable::new()],
+            ac_tables: [HuffmanTable::new(), HuffmanTable::new(),
+                       HuffmanTable::new(), HuffmanTable::new()],
+            restart_interval: 0,
+            max_h_sample: 1,
+            max_v_sample: 1,
+            mcu_width: 8,
+            mcu_height: 8,
+            mcu_count_x: 0,
+            mcu_count_y: 0,
+        }
+    }
+}
+
+// ============================================================
+// Bit Reader for Scan Data
+// ============================================================
+
+struct ScanReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit_buf: u32,
+    bit_count: u8,
+}
+
+impl<'a> ScanReader<'a> {
+    fn new(data: &'a [u8]) -> ScanReader<'a> {
+        ScanReader {
+            data,
+            pos: 0,
+            bit_buf: 0,
+            bit_count: 0,
+        }
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        if self.pos < self.data.len() {
+            let b = self.data[self.pos];
+            self.pos += 1;
+            b
+        } else {
+            0
+        }
+    }
+
+    fn fill_bits(&mut self) {
+        while self.bit_count <= 24 && self.pos < self.data.len() {
+            let mut b = self.read_byte();
+            // Handle byte stuffing (0xFF 0x00 -> 0xFF)
+            if b == 0xFF {
+                let next = self.read_byte();
+                if next != 0x00 {
+                    // Marker found, back up
+                    self.pos -= 2;
+                    break;
+                }
+            }
+            self.bit_buf |= (b as u32) << (24 - self.bit_count);
+            self.bit_count += 8;
+        }
+    }
+
+    fn get_bits(&mut self, n: u8) -> i32 {
+        self.fill_bits();
+        let result = (self.bit_buf >> (32 - n)) as i32;
+        self.bit_buf <<= n;
+        self.bit_count -= n;
+        result
+    }
+
+    fn peek_bits(&mut self, n: u8) -> i32 {
+        self.fill_bits();
+        (self.bit_buf >> (32 - n)) as i32
+    }
+
+    fn skip_bits(&mut self, n: u8) {
+        self.bit_buf <<= n;
+        self.bit_count -= n;
+    }
+
+    fn decode_huffman(&mut self, table: &HuffmanTable) -> i32 {
+        self.fill_bits();
+
+        let mut l: usize = 1;
+        let mut code: i32 = 0;
+
+        while l <= 16 {
+            code = (code << 1) | ((self.bit_buf >> 31) as i32);
+            self.bit_buf <<= 1;
+            self.bit_count -= 1;
+
+            if code <= table.max_code[l] {
+                let idx = table.val_ptr[l] + code - table.min_code[l];
+                return table.values[idx as usize] as i32;
+            }
+            l += 1;
+        }
+
+        -1  // Error
+    }
+
+    fn receive_extend(&mut self, s: u8) -> i32 {
+        if s == 0 {
+            return 0;
+        }
+        let n = self.get_bits(s);
+        // Extend sign
+        if n < (1 << (s - 1)) {
+            n + (-1 << s) + 1
+        } else {
+            n
+        }
+    }
+}
+
+// ============================================================
+// JPEG Decoder
+// ============================================================
+
+pub fn decode(data: &[u8]) -> Result<ImageBuffer, ImageError> {
+    if data.len() < 2 {
+        return Err(ImageError::TruncatedData);
+    }
+
+    // Check SOI marker
+    if data[0] != 0xFF || data[1] != MARKER_SOI {
+        return Err(ImageError::InvalidHeader);
+    }
+
+    let mut ctx = JpegContext::new();
+    let mut pos: usize = 2;
+    let mut scan_data: Option<&[u8]> = None;
+
+    // Parse markers
+    while pos + 1 < data.len() {
+        if data[pos] != 0xFF {
+            pos += 1;
+            continue;
+        }
+
+        let marker = data[pos + 1];
+        pos += 2;
+
+        // Skip padding 0xFF bytes
+        if marker == 0xFF {
+            continue;
+        }
+
+        match marker {
+            MARKER_EOI => break,
+            MARKER_SOF0 => {
+                parse_sof(&mut ctx, data, &mut pos)?;
+            },
+            MARKER_SOF2 => {
+                // Progressive JPEG not supported
+                return Err(ImageError::InvalidMarker);
+            },
+            MARKER_DHT => {
+                parse_dht(&mut ctx, data, &mut pos)?;
+            },
+            MARKER_DQT => {
+                parse_dqt(&mut ctx, data, &mut pos)?;
+            },
+            MARKER_DRI => {
+                parse_dri(&mut ctx, data, &mut pos)?;
+            },
+            MARKER_SOS => {
+                parse_sos(&mut ctx, data, &mut pos)?;
+                // Find end of scan data
+                let scan_start = pos;
+                while pos + 1 < data.len() {
+                    if data[pos] == 0xFF && data[pos + 1] != 0x00 {
+                        let m = data[pos + 1];
+                        if m != 0xFF && !(m >= MARKER_RST0 && m <= MARKER_RST7) {
+                            break;
+                        }
+                    }
+                    pos += 1;
+                }
+                scan_data = Some(&data[scan_start..pos]);
+            },
+            _ => {
+                // Skip unknown markers
+                if pos + 1 < data.len() {
+                    let len = read_u16_be(data, pos) as usize;
+                    pos += len;
+                }
+            },
+        }
+    }
+
+    // Decode scan data
+    let scan = scan_data.ok_or(ImageError::InvalidData)?;
+    decode_scan(&mut ctx, scan)
+}
+
+fn parse_sof(ctx: &mut JpegContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 2 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let len = read_u16_be(data, *pos) as usize;
+    if *pos + len > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let precision = data[*pos + 2];
+    if precision != 8 {
+        return Err(ImageError::InvalidHeader);
+    }
+
+    ctx.height = read_u16_be(data, *pos + 3) as u32;
+    ctx.width = read_u16_be(data, *pos + 5) as u32;
+    ctx.num_components = data[*pos + 7];
+
+    if ctx.num_components != 1 && ctx.num_components != 3 {
+        return Err(ImageError::InvalidHeader);
+    }
+
+    ctx.max_h_sample = 1;
+    ctx.max_v_sample = 1;
+
+    let mut i: u8 = 0;
+    while i < ctx.num_components {
+        let offset = *pos + 8 + (i as usize) * 3;
+        ctx.components[i as usize].id = data[offset];
+        let sampling = data[offset + 1];
+        ctx.components[i as usize].h_sample = sampling >> 4;
+        ctx.components[i as usize].v_sample = sampling & 0x0F;
+        ctx.components[i as usize].quant_table = data[offset + 2];
+
+        if ctx.components[i as usize].h_sample > ctx.max_h_sample {
+            ctx.max_h_sample = ctx.components[i as usize].h_sample;
+        }
+        if ctx.components[i as usize].v_sample > ctx.max_v_sample {
+            ctx.max_v_sample = ctx.components[i as usize].v_sample;
+        }
+
+        i += 1;
+    }
+
+    // Calculate MCU dimensions
+    ctx.mcu_width = (ctx.max_h_sample as u32) * 8;
+    ctx.mcu_height = (ctx.max_v_sample as u32) * 8;
+    ctx.mcu_count_x = (ctx.width + ctx.mcu_width - 1) / ctx.mcu_width;
+    ctx.mcu_count_y = (ctx.height + ctx.mcu_height - 1) / ctx.mcu_height;
+
+    *pos += len;
+    Ok(())
+}
+
+fn parse_dht(ctx: &mut JpegContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 2 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let len = read_u16_be(data, *pos) as usize;
+    let end = *pos + len;
+    *pos += 2;
+
+    while *pos < end {
+        let info = data[*pos];
+        let table_class = (info >> 4) & 0x0F;  // 0 = DC, 1 = AC
+        let table_id = (info & 0x0F) as usize;
+        *pos += 1;
+
+        if table_id >= 4 {
+            return Err(ImageError::InvalidData);
+        }
+
+        // Read BITS (16 bytes)
+        let mut bits: [u8; 16] = [0; 16];
+        let mut total: usize = 0;
+        let mut i: usize = 0;
+        while i < 16 {
+            bits[i] = data[*pos + i];
+            total += bits[i] as usize;
+            i += 1;
+        }
+        *pos += 16;
+
+        // Read HUFFVAL
+        let huffval = &data[*pos..*pos + total];
+        *pos += total;
+
+        // Build table
+        if table_class == 0 {
+            ctx.dc_tables[table_id].build(&bits, huffval);
+        } else {
+            ctx.ac_tables[table_id].build(&bits, huffval);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_dqt(ctx: &mut JpegContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 2 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let len = read_u16_be(data, *pos) as usize;
+    let end = *pos + len;
+    *pos += 2;
+
+    while *pos < end {
+        let info = data[*pos];
+        let precision = (info >> 4) & 0x0F;  // 0 = 8-bit, 1 = 16-bit
+        let table_id = (info & 0x0F) as usize;
+        *pos += 1;
+
+        if table_id >= 4 {
+            return Err(ImageError::InvalidData);
+        }
+
+        let mut i: usize = 0;
+        while i < 64 {
+            if precision == 0 {
+                ctx.quant_tables[table_id][ZIGZAG[i]] = data[*pos] as i32;
+                *pos += 1;
+            } else {
+                ctx.quant_tables[table_id][ZIGZAG[i]] = read_u16_be(data, *pos) as i32;
+                *pos += 2;
+            }
+            i += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_dri(ctx: &mut JpegContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 4 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let _len = read_u16_be(data, *pos);
+    ctx.restart_interval = read_u16_be(data, *pos + 2);
+    *pos += 4;
+
+    Ok(())
+}
+
+fn parse_sos(ctx: &mut JpegContext, data: &[u8], pos: &mut usize) -> Result<(), ImageError> {
+    if *pos + 2 > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let len = read_u16_be(data, *pos) as usize;
+    if *pos + len > data.len() {
+        return Err(ImageError::TruncatedData);
+    }
+
+    let num_components = data[*pos + 2];
+    if num_components as u8 != ctx.num_components {
+        return Err(ImageError::InvalidData);
+    }
+
+    let mut i: u8 = 0;
+    while i < num_components {
+        let offset = *pos + 3 + (i as usize) * 2;
+        let id = data[offset];
+        let tables = data[offset + 1];
+
+        // Find component by ID
+        let mut j: u8 = 0;
+        while j < ctx.num_components {
+            if ctx.components[j as usize].id == id {
+                ctx.components[j as usize].dc_table = (tables >> 4) & 0x0F;
+                ctx.components[j as usize].ac_table = tables & 0x0F;
+                break;
+            }
+            j += 1;
+        }
+
+        i += 1;
+    }
+
+    *pos += len;
+    Ok(())
+}
+
+// ============================================================
+// Scan Decoding
+// ============================================================
+
+fn decode_scan(ctx: &mut JpegContext, scan_data: &[u8]) -> Result<ImageBuffer, ImageError> {
+    let mut reader = ScanReader::new(scan_data);
+    let mut image = ImageBuffer::new_rgba(ctx.width, ctx.height);
+
+    // Allocate MCU buffer
+    let mcu_pixels = (ctx.mcu_width * ctx.mcu_height) as usize;
+    let mut y_data = vec![0i32; mcu_pixels * 4];  // Support up to 2x2 subsampling
+    let mut cb_data = vec![0i32; 64];
+    let mut cr_data = vec![0i32; 64];
+
+    // DCT block buffer
+    let mut block = [0i32; 64];
+
+    // Reset DC predictions
+    let mut c: usize = 0;
+    while c < 4 {
+        ctx.components[c].dc_pred = 0;
+        c += 1;
+    }
+
+    let mut restart_count: u16 = 0;
+
+    let mut mcu_y: u32 = 0;
+    while mcu_y < ctx.mcu_count_y {
+        let mut mcu_x: u32 = 0;
+        while mcu_x < ctx.mcu_count_x {
+            // Check restart interval
+            if ctx.restart_interval > 0 {
+                if restart_count == ctx.restart_interval {
+                    restart_count = 0;
+                    // Reset DC predictions
+                    let mut c: usize = 0;
+                    while c < 4 {
+                        ctx.components[c].dc_pred = 0;
+                        c += 1;
+                    }
+                    // Align to byte boundary
+                    reader.bit_count = 0;
+                    reader.bit_buf = 0;
+                }
+                restart_count += 1;
+            }
+
+            if ctx.num_components == 1 {
+                // Grayscale
+                decode_block(&mut reader, &mut block, ctx, 0)?;
+                idct_block(&block, &ctx.quant_tables[ctx.components[0].quant_table as usize], &mut y_data, 0, 8);
+            } else {
+                // Color (YCbCr)
+                // Decode Y blocks
+                let h_blocks = ctx.components[0].h_sample as usize;
+                let v_blocks = ctx.components[0].v_sample as usize;
+                let y_stride = h_blocks * 8;
+
+                let mut vy: usize = 0;
+                while vy < v_blocks {
+                    let mut hx: usize = 0;
+                    while hx < h_blocks {
+                        decode_block(&mut reader, &mut block, ctx, 0)?;
+                        let offset = vy * y_stride * 8 + hx * 8;
+                        idct_block(&block, &ctx.quant_tables[ctx.components[0].quant_table as usize],
+                                  &mut y_data, offset, y_stride);
+                        hx += 1;
+                    }
+                    vy += 1;
+                }
+
+                // Decode Cb
+                decode_block(&mut reader, &mut block, ctx, 1)?;
+                idct_block(&block, &ctx.quant_tables[ctx.components[1].quant_table as usize],
+                          &mut cb_data, 0, 8);
+
+                // Decode Cr
+                decode_block(&mut reader, &mut block, ctx, 2)?;
+                idct_block(&block, &ctx.quant_tables[ctx.components[2].quant_table as usize],
+                          &mut cr_data, 0, 8);
+            }
+
+            // Convert MCU to pixels
+            let base_x = mcu_x * ctx.mcu_width;
+            let base_y = mcu_y * ctx.mcu_height;
+
+            if ctx.num_components == 1 {
+                // Grayscale output
+                let mut py: u32 = 0;
+                while py < ctx.mcu_height && base_y + py < ctx.height {
+                    let mut px: u32 = 0;
+                    while px < ctx.mcu_width && base_x + px < ctx.width {
+                        let y_val = clamp_u8(y_data[(py * 8 + px) as usize] + 128) as u32;
+                        let pixel = 0xFF000000 | (y_val << 16) | (y_val << 8) | y_val;
+                        image.set_pixel(base_x + px, base_y + py, pixel);
+                        px += 1;
+                    }
+                    py += 1;
+                }
+            } else {
+                // YCbCr to RGB conversion
+                let h_sample = ctx.components[0].h_sample as u32;
+                let v_sample = ctx.components[0].v_sample as u32;
+                let y_stride = (h_sample * 8) as usize;
+
+                let mut py: u32 = 0;
+                while py < ctx.mcu_height && base_y + py < ctx.height {
+                    let mut px: u32 = 0;
+                    while px < ctx.mcu_width && base_x + px < ctx.width {
+                        let y_idx = (py * y_stride as u32 + px) as usize;
+                        let c_x = (px * 8 / ctx.mcu_width) as usize;
+                        let c_y = (py * 8 / ctx.mcu_height) as usize;
+                        let c_idx = c_y * 8 + c_x;
+
+                        let y = y_data[y_idx] + 128;
+                        let cb = cb_data[c_idx];
+                        let cr = cr_data[c_idx];
+
+                        let (r, g, b) = ycbcr_to_rgb(y, cb, cr);
+                        let pixel = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                        image.set_pixel(base_x + px, base_y + py, pixel);
+                        px += 1;
+                    }
+                    py += 1;
+                }
+            }
+
+            mcu_x += 1;
+        }
+        mcu_y += 1;
+    }
+
+    Ok(image)
+}
+
+fn decode_block(reader: &mut ScanReader, block: &mut [i32; 64], ctx: &mut JpegContext, comp: usize) -> Result<(), ImageError> {
+    // Clear block
+    let mut i: usize = 0;
+    while i < 64 {
+        block[i] = 0;
+        i += 1;
+    }
+
+    let dc_table = ctx.components[comp].dc_table as usize;
+    let ac_table = ctx.components[comp].ac_table as usize;
+
+    // Decode DC coefficient
+    let dc_cat = reader.decode_huffman(&ctx.dc_tables[dc_table]);
+    if dc_cat < 0 {
+        return Err(ImageError::InvalidHuffman);
+    }
+
+    let dc_diff = reader.receive_extend(dc_cat as u8);
+    ctx.components[comp].dc_pred += dc_diff;
+    block[0] = ctx.components[comp].dc_pred;
+
+    // Decode AC coefficients
+    let mut k: usize = 1;
+    while k < 64 {
+        let ac_val = reader.decode_huffman(&ctx.ac_tables[ac_table]);
+        if ac_val < 0 {
+            return Err(ImageError::InvalidHuffman);
+        }
+
+        let run = (ac_val >> 4) & 0x0F;
+        let size = ac_val & 0x0F;
+
+        if size == 0 {
+            if run == 0 {
+                // EOB - end of block
+                break;
+            } else if run == 15 {
+                // ZRL - skip 16 zeros
+                k += 16;
+            }
+        } else {
+            k += run as usize;
+            if k >= 64 {
+                break;
+            }
+            block[ZIGZAG[k]] = reader.receive_extend(size as u8);
+            k += 1;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// Inverse DCT (AAN algorithm, scaled integers)
+// ============================================================
+
+fn idct_block(block: &[i32; 64], quant: &[i32; 64], output: &mut [i32], offset: usize, stride: usize) {
+    // Dequantize
+    let mut dequant = [0i32; 64];
+    let mut i: usize = 0;
+    while i < 64 {
+        dequant[i] = block[i] * quant[i];
+        i += 1;
+    }
+
+    // IDCT rows
+    let mut workspace = [0i32; 64];
+    let mut y: usize = 0;
+    while y < 8 {
+        idct_row(&dequant[y * 8..y * 8 + 8], &mut workspace[y * 8..y * 8 + 8]);
+        y += 1;
+    }
+
+    // IDCT columns
+    let mut x: usize = 0;
+    while x < 8 {
+        let mut col = [0i32; 8];
+        let mut y: usize = 0;
+        while y < 8 {
+            col[y] = workspace[y * 8 + x];
+            y += 1;
+        }
+
+        let mut out_col = [0i32; 8];
+        idct_row(&col, &mut out_col);
+
+        y = 0;
+        while y < 8 {
+            output[offset + y * stride + x] = (out_col[y] + 4) >> 3;
+            y += 1;
+        }
+        x += 1;
+    }
+}
+
+fn idct_row(input: &[i32], output: &mut [i32]) {
+    // Fixed-point IDCT constants (scaled by 4096)
+    const C1: i32 = 4017;   // cos(pi/16) * 4096
+    const C2: i32 = 3784;   // cos(2*pi/16) * 4096
+    const C3: i32 = 3406;   // cos(3*pi/16) * 4096
+    const C5: i32 = 2276;   // cos(5*pi/16) * 4096
+    const C6: i32 = 1567;   // cos(6*pi/16) * 4096
+    const C7: i32 = 799;    // cos(7*pi/16) * 4096
+
+    let x0 = input[0] << 11;
+    let x1 = input[4] << 11;
+    let x2 = input[6];
+    let x3 = input[2];
+    let x4 = input[1];
+    let x5 = input[7];
+    let x6 = input[5];
+    let x7 = input[3];
+
+    // First stage
+    let tmp0 = x0 + x1;
+    let tmp1 = x0 - x1;
+
+    let tmp2 = (x2 * C6 - x3 * C2) >> 12;
+    let tmp3 = (x2 * C2 + x3 * C6) >> 12;
+
+    let tmp4 = tmp0 + tmp3;
+    let tmp5 = tmp1 + tmp2;
+    let tmp6 = tmp1 - tmp2;
+    let tmp7 = tmp0 - tmp3;
+
+    // Second stage
+    let tmp10 = (x4 * C7 - x5 * C1) >> 12;
+    let tmp11 = (x4 * C1 + x5 * C7) >> 12;
+    let tmp12 = (x6 * C3 - x7 * C5) >> 12;
+    let tmp13 = (x6 * C5 + x7 * C3) >> 12;
+
+    let z5 = tmp10 - tmp12;
+    let z2 = tmp10 + tmp12;
+    let z4 = tmp11 - tmp13;
+    let z3 = tmp11 + tmp13;
+
+    output[0] = (tmp4 + z3) >> 8;
+    output[7] = (tmp4 - z3) >> 8;
+    output[1] = (tmp5 + z4) >> 8;
+    output[6] = (tmp5 - z4) >> 8;
+    output[2] = (tmp6 + z5) >> 8;
+    output[5] = (tmp6 - z5) >> 8;
+    output[3] = (tmp7 + z2) >> 8;
+    output[4] = (tmp7 - z2) >> 8;
+}
+
+// ============================================================
+// Color Conversion
+// ============================================================
+
+fn ycbcr_to_rgb(y: i32, cb: i32, cr: i32) -> (u8, u8, u8) {
+    // ITU-R BT.601 conversion
+    // R = Y + 1.402 * Cr
+    // G = Y - 0.344136 * Cb - 0.714136 * Cr
+    // B = Y + 1.772 * Cb
+
+    // Fixed-point (scaled by 256)
+    let r = y + ((cr * 359) >> 8);
+    let g = y - ((cb * 88 + cr * 183) >> 8);
+    let b = y + ((cb * 454) >> 8);
+
+    (clamp_u8(r), clamp_u8(g), clamp_u8(b))
+}

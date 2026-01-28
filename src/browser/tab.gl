@@ -186,6 +186,32 @@ impl ResourceLoader {
         let data = self.fetch(url)?;
         String::from_utf8(data).map_err(|_| LoadError::InvalidData)
     }
+
+    pub fn fetch_image(&mut self, url: &str) -> Result<Vec<u8>, LoadError> {
+        let resolved_url = self.resolve_url(url);
+
+        // Check cache first
+        if let Some(ResourceData::Image(data)) = self.cache.get(&resolved_url) {
+            return Ok(data.clone());
+        }
+
+        // Fetch image data
+        let data = fetch_url(&resolved_url)?;
+
+        // Cache it
+        self.cache.insert(resolved_url.clone(), ResourceData::Image(data.clone()));
+
+        Ok(data)
+    }
+
+    pub fn get_cached_image(&self, url: &str) -> Option<&Vec<u8>> {
+        let resolved_url = self.resolve_url(url);
+        if let Some(ResourceData::Image(data)) = self.cache.get(&resolved_url) {
+            Some(data)
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================
@@ -552,6 +578,14 @@ impl Tab {
 
     pub fn get_paint_commands(&self) -> &[PaintCommand] {
         &self.paint_commands
+    }
+
+    // Get image data for a URL (fetches if not cached)
+    pub fn get_resource_data(&mut self, url: &str) -> Option<Vec<u8>> {
+        match self.resource_loader.fetch_image(url) {
+            Ok(data) => Some(data),
+            Err(_) => None,
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

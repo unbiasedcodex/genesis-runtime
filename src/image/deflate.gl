@@ -1,0 +1,505 @@
+// DEFLATE Decompression (RFC 1951)
+// Used by PNG, gzip, and zlib compression
+
+use super::ImageError;
+
+// ============================================================
+// Constants
+// ============================================================
+
+const MAX_BITS: usize = 15;
+const MAX_LIT_LEN_CODES: usize = 288;
+const MAX_DIST_CODES: usize = 32;
+const MAX_CODE_LEN_CODES: usize = 19;
+
+// Fixed Huffman code lengths for literal/length codes
+const FIXED_LIT_LEN_LENGTHS: [u8; 288] = [
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 0-15
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 16-31
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 32-47
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 48-63
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 64-79
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 80-95
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 96-111
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 112-127
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 128-143
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 144-159
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 160-175
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 176-191
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 192-207
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 208-223
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 224-239
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, // 240-255
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // 256-271
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, // 272-287
+];
+
+// Fixed Huffman code lengths for distance codes
+const FIXED_DIST_LENGTHS: [u8; 32] = [
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+];
+
+// Code length order for dynamic Huffman
+const CODE_LEN_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+];
+
+// Length extra bits
+const LENGTH_EXTRA_BITS: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+];
+
+// Length base values
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+];
+
+// Distance extra bits
+const DIST_EXTRA_BITS: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+];
+
+// Distance base values
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+    8193, 12289, 16385, 24577
+];
+
+// ============================================================
+// Bit Reader
+// ============================================================
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bit_buf: u32,
+    bit_count: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> BitReader<'a> {
+        BitReader {
+            data,
+            pos: 0,
+            bit_buf: 0,
+            bit_count: 0,
+        }
+    }
+
+    fn fill_bits(&mut self) {
+        while self.bit_count <= 24 && self.pos < self.data.len() {
+            self.bit_buf |= (self.data[self.pos] as u32) << self.bit_count;
+            self.pos += 1;
+            self.bit_count += 8;
+        }
+    }
+
+    fn read_bits(&mut self, n: u8) -> u32 {
+        self.fill_bits();
+        let mask = (1u32 << n) - 1;
+        let result = self.bit_buf & mask;
+        self.bit_buf >>= n;
+        self.bit_count -= n;
+        result
+    }
+
+    fn peek_bits(&mut self, n: u8) -> u32 {
+        self.fill_bits();
+        let mask = (1u32 << n) - 1;
+        self.bit_buf & mask
+    }
+
+    fn drop_bits(&mut self, n: u8) {
+        self.bit_buf >>= n;
+        self.bit_count -= n;
+    }
+
+    fn align_to_byte(&mut self) {
+        let discard = self.bit_count % 8;
+        if discard > 0 {
+            self.bit_buf >>= discard;
+            self.bit_count -= discard;
+        }
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        self.align_to_byte();
+        if self.bit_count >= 8 {
+            let result = (self.bit_buf & 0xFF) as u8;
+            self.bit_buf >>= 8;
+            self.bit_count -= 8;
+            result
+        } else if self.pos < self.data.len() {
+            let result = self.data[self.pos];
+            self.pos += 1;
+            result
+        } else {
+            0
+        }
+    }
+
+    fn read_u16_le(&mut self) -> u16 {
+        let lo = self.read_byte() as u16;
+        let hi = self.read_byte() as u16;
+        lo | (hi << 8)
+    }
+
+    fn bytes_remaining(&self) -> usize {
+        self.data.len() - self.pos + (self.bit_count / 8) as usize
+    }
+}
+
+// ============================================================
+// Huffman Table
+// ============================================================
+
+struct HuffmanTable {
+    counts: [u16; MAX_BITS + 1],    // Count of codes for each length
+    symbols: [u16; MAX_LIT_LEN_CODES], // Sorted symbols
+    max_len: u8,
+}
+
+impl HuffmanTable {
+    fn new() -> HuffmanTable {
+        HuffmanTable {
+            counts: [0; MAX_BITS + 1],
+            symbols: [0; MAX_LIT_LEN_CODES],
+            max_len: 0,
+        }
+    }
+
+    fn build(&mut self, lengths: &[u8], num_codes: usize) -> bool {
+        // Count code lengths
+        let mut i: usize = 0;
+        while i <= MAX_BITS {
+            self.counts[i] = 0;
+            i += 1;
+        }
+
+        self.max_len = 0;
+        i = 0;
+        while i < num_codes {
+            let len = lengths[i] as usize;
+            if len > 0 {
+                self.counts[len] += 1;
+                if len as u8 > self.max_len {
+                    self.max_len = len as u8;
+                }
+            }
+            i += 1;
+        }
+
+        // Check for valid code
+        if self.max_len == 0 {
+            return true;  // Empty tree is OK
+        }
+
+        // Compute offsets
+        let mut offsets: [u16; MAX_BITS + 1] = [0; MAX_BITS + 1];
+        let mut offset: u16 = 0;
+        i = 1;
+        while i <= MAX_BITS {
+            offsets[i] = offset;
+            offset += self.counts[i];
+            i += 1;
+        }
+
+        // Sort symbols by code length
+        i = 0;
+        while i < num_codes {
+            let len = lengths[i] as usize;
+            if len > 0 {
+                self.symbols[offsets[len] as usize] = i as u16;
+                offsets[len] += 1;
+            }
+            i += 1;
+        }
+
+        true
+    }
+
+    fn decode(&self, reader: &mut BitReader) -> i32 {
+        reader.fill_bits();
+
+        let mut code: u32 = 0;
+        let mut first: u32 = 0;
+        let mut index: u32 = 0;
+        let mut len: u8 = 1;
+
+        while len <= self.max_len {
+            code |= reader.peek_bits(1);
+            reader.drop_bits(1);
+
+            let count = self.counts[len as usize] as u32;
+            if code < first + count {
+                return self.symbols[(index + code - first) as usize] as i32;
+            }
+
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+            len += 1;
+        }
+
+        -1  // Invalid code
+    }
+}
+
+// ============================================================
+// DEFLATE Decompressor
+// ============================================================
+
+pub struct Inflater<'a> {
+    reader: BitReader<'a>,
+    output: Vec<u8>,
+    lit_len_table: HuffmanTable,
+    dist_table: HuffmanTable,
+}
+
+impl<'a> Inflater<'a> {
+    pub fn new(data: &'a [u8]) -> Inflater<'a> {
+        Inflater {
+            reader: BitReader::new(data),
+            output: Vec::new(),
+            lit_len_table: HuffmanTable::new(),
+            dist_table: HuffmanTable::new(),
+        }
+    }
+
+    pub fn inflate(&mut self) -> Result<Vec<u8>, ImageError> {
+        loop {
+            let bfinal = self.reader.read_bits(1);
+            let btype = self.reader.read_bits(2);
+
+            match btype {
+                0 => self.inflate_uncompressed()?,
+                1 => self.inflate_fixed()?,
+                2 => self.inflate_dynamic()?,
+                _ => return Err(ImageError::InvalidData),
+            }
+
+            if bfinal != 0 {
+                break;
+            }
+        }
+
+        Ok(std::mem::take(&mut self.output))
+    }
+
+    fn inflate_uncompressed(&mut self) -> Result<(), ImageError> {
+        self.reader.align_to_byte();
+
+        let len = self.reader.read_u16_le();
+        let nlen = self.reader.read_u16_le();
+
+        // Check complement
+        if len != !nlen {
+            return Err(ImageError::InvalidData);
+        }
+
+        // Copy literal bytes
+        let mut i: u16 = 0;
+        while i < len {
+            let b = self.reader.read_byte();
+            self.output.push(b);
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    fn inflate_fixed(&mut self) -> Result<(), ImageError> {
+        // Build fixed Huffman tables
+        self.lit_len_table.build(&FIXED_LIT_LEN_LENGTHS, 288);
+        self.dist_table.build(&FIXED_DIST_LENGTHS, 32);
+
+        self.inflate_codes()
+    }
+
+    fn inflate_dynamic(&mut self) -> Result<(), ImageError> {
+        let hlit = self.reader.read_bits(5) as usize + 257;
+        let hdist = self.reader.read_bits(5) as usize + 1;
+        let hclen = self.reader.read_bits(4) as usize + 4;
+
+        // Read code length code lengths
+        let mut code_len_lengths: [u8; 19] = [0; 19];
+        let mut i: usize = 0;
+        while i < hclen {
+            code_len_lengths[CODE_LEN_ORDER[i]] = self.reader.read_bits(3) as u8;
+            i += 1;
+        }
+
+        // Build code length table
+        let mut code_len_table = HuffmanTable::new();
+        if !code_len_table.build(&code_len_lengths, 19) {
+            return Err(ImageError::InvalidData);
+        }
+
+        // Read literal/length and distance code lengths
+        let mut lengths: [u8; 320] = [0; 320];  // 288 + 32
+        let total = hlit + hdist;
+        let mut idx: usize = 0;
+
+        while idx < total {
+            let sym = code_len_table.decode(&mut self.reader);
+            if sym < 0 {
+                return Err(ImageError::InvalidData);
+            }
+
+            if sym < 16 {
+                lengths[idx] = sym as u8;
+                idx += 1;
+            } else if sym == 16 {
+                // Repeat previous length 3-6 times
+                if idx == 0 {
+                    return Err(ImageError::InvalidData);
+                }
+                let repeat = self.reader.read_bits(2) as usize + 3;
+                let prev = lengths[idx - 1];
+                let mut r: usize = 0;
+                while r < repeat && idx < total {
+                    lengths[idx] = prev;
+                    idx += 1;
+                    r += 1;
+                }
+            } else if sym == 17 {
+                // Repeat 0 for 3-10 times
+                let repeat = self.reader.read_bits(3) as usize + 3;
+                let mut r: usize = 0;
+                while r < repeat && idx < total {
+                    lengths[idx] = 0;
+                    idx += 1;
+                    r += 1;
+                }
+            } else if sym == 18 {
+                // Repeat 0 for 11-138 times
+                let repeat = self.reader.read_bits(7) as usize + 11;
+                let mut r: usize = 0;
+                while r < repeat && idx < total {
+                    lengths[idx] = 0;
+                    idx += 1;
+                    r += 1;
+                }
+            }
+        }
+
+        // Build literal/length and distance tables
+        self.lit_len_table.build(&lengths[0..hlit], hlit);
+        self.dist_table.build(&lengths[hlit..hlit + hdist], hdist);
+
+        self.inflate_codes()
+    }
+
+    fn inflate_codes(&mut self) -> Result<(), ImageError> {
+        loop {
+            let sym = self.lit_len_table.decode(&mut self.reader);
+            if sym < 0 {
+                return Err(ImageError::InvalidData);
+            }
+
+            if sym < 256 {
+                // Literal byte
+                self.output.push(sym as u8);
+            } else if sym == 256 {
+                // End of block
+                break;
+            } else {
+                // Length-distance pair
+                let len_idx = (sym - 257) as usize;
+                if len_idx >= 29 {
+                    return Err(ImageError::InvalidData);
+                }
+
+                let length = LENGTH_BASE[len_idx] as usize +
+                    self.reader.read_bits(LENGTH_EXTRA_BITS[len_idx]) as usize;
+
+                let dist_sym = self.dist_table.decode(&mut self.reader);
+                if dist_sym < 0 || dist_sym >= 30 {
+                    return Err(ImageError::InvalidData);
+                }
+
+                let dist_idx = dist_sym as usize;
+                let distance = DIST_BASE[dist_idx] as usize +
+                    self.reader.read_bits(DIST_EXTRA_BITS[dist_idx]) as usize;
+
+                // Copy from back-reference
+                if distance > self.output.len() {
+                    return Err(ImageError::InvalidData);
+                }
+
+                let mut i: usize = 0;
+                while i < length {
+                    let pos = self.output.len() - distance;
+                    let b = self.output[pos];
+                    self.output.push(b);
+                    i += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+// Decompress DEFLATE data
+pub fn inflate(data: &[u8]) -> Result<Vec<u8>, ImageError> {
+    let mut inflater = Inflater::new(data);
+    inflater.inflate()
+}
+
+// Decompress zlib-wrapped DEFLATE data (as used in PNG)
+pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, ImageError> {
+    if data.len() < 6 {
+        return Err(ImageError::TruncatedData);
+    }
+
+    // Check zlib header
+    let cmf = data[0];
+    let flg = data[1];
+
+    // CM should be 8 (DEFLATE)
+    if (cmf & 0x0F) != 8 {
+        return Err(ImageError::InvalidData);
+    }
+
+    // Check header checksum
+    if ((cmf as u16) * 256 + (flg as u16)) % 31 != 0 {
+        return Err(ImageError::InvalidData);
+    }
+
+    // Check for preset dictionary (not supported)
+    if (flg & 0x20) != 0 {
+        return Err(ImageError::InvalidData);
+    }
+
+    // Decompress (skip 2-byte header, ignore 4-byte checksum at end)
+    let compressed = &data[2..data.len() - 4];
+    inflate(compressed)
+}
+
+// ============================================================
+// Adler-32 Checksum (for zlib verification)
+// ============================================================
+
+pub fn adler32(data: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65521;
+
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+
+    for &byte in data {
+        a = (a + byte as u32) % MOD_ADLER;
+        b = (b + a) % MOD_ADLER;
+    }
+
+    (b << 16) | a
+}

@@ -1,0 +1,551 @@
+// Common Image Structures and Utilities
+// Shared types for all image decoders
+
+use super::super::super::gfx::{GfxContext, blit_blend};
+
+// ============================================================
+// Image Format Enumeration
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImageFormat {
+    Unknown,
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Svg,
+    Bmp,
+}
+
+// ============================================================
+// Pixel Format
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PixelFormat {
+    Rgba,           // 32-bit RGBA (8 bits per channel)
+    Rgb,            // 24-bit RGB
+    Grayscale,      // 8-bit grayscale
+    GrayscaleAlpha, // 16-bit grayscale + alpha
+    Indexed,        // Palette-based (8-bit index)
+}
+
+impl PixelFormat {
+    pub fn bytes_per_pixel(&self) -> usize {
+        match self {
+            PixelFormat::Rgba => 4,
+            PixelFormat::Rgb => 3,
+            PixelFormat::Grayscale => 1,
+            PixelFormat::GrayscaleAlpha => 2,
+            PixelFormat::Indexed => 1,
+        }
+    }
+}
+
+// ============================================================
+// Image Buffer
+// ============================================================
+
+#[derive(Clone)]
+pub struct ImageBuffer {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub data: Vec<u8>,          // Raw pixel data
+    pub palette: Option<Vec<u32>>, // Optional palette for indexed images (ARGB)
+}
+
+impl ImageBuffer {
+    pub fn new(width: u32, height: u32, format: PixelFormat) -> ImageBuffer {
+        let bytes_per_pixel = format.bytes_per_pixel();
+        let size = (width as usize) * (height as usize) * bytes_per_pixel;
+        let data = vec![0u8; size];
+
+        ImageBuffer {
+            width,
+            height,
+            format,
+            data,
+            palette: None,
+        }
+    }
+
+    pub fn new_rgba(width: u32, height: u32) -> ImageBuffer {
+        ImageBuffer::new(width, height, PixelFormat::Rgba)
+    }
+
+    pub fn new_with_palette(width: u32, height: u32, palette: Vec<u32>) -> ImageBuffer {
+        let size = (width as usize) * (height as usize);
+        let data = vec![0u8; size];
+
+        ImageBuffer {
+            width,
+            height,
+            format: PixelFormat::Indexed,
+            data,
+            palette: Some(palette),
+        }
+    }
+
+    // Get stride (bytes per row)
+    pub fn stride(&self) -> usize {
+        (self.width as usize) * self.format.bytes_per_pixel()
+    }
+
+    // Get pixel at (x, y) as ARGB32
+    pub fn get_pixel(&self, x: u32, y: u32) -> u32 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+
+        let idx = ((y as usize) * (self.width as usize) + (x as usize)) * self.format.bytes_per_pixel();
+
+        match self.format {
+            PixelFormat::Rgba => {
+                let r = self.data[idx] as u32;
+                let g = self.data[idx + 1] as u32;
+                let b = self.data[idx + 2] as u32;
+                let a = self.data[idx + 3] as u32;
+                (a << 24) | (r << 16) | (g << 8) | b
+            },
+            PixelFormat::Rgb => {
+                let r = self.data[idx] as u32;
+                let g = self.data[idx + 1] as u32;
+                let b = self.data[idx + 2] as u32;
+                0xFF000000 | (r << 16) | (g << 8) | b
+            },
+            PixelFormat::Grayscale => {
+                let g = self.data[idx] as u32;
+                0xFF000000 | (g << 16) | (g << 8) | g
+            },
+            PixelFormat::GrayscaleAlpha => {
+                let g = self.data[idx] as u32;
+                let a = self.data[idx + 1] as u32;
+                (a << 24) | (g << 16) | (g << 8) | g
+            },
+            PixelFormat::Indexed => {
+                let index = self.data[idx] as usize;
+                if let Some(ref palette) = self.palette {
+                    if index < palette.len() {
+                        palette[index]
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            },
+        }
+    }
+
+    // Set pixel at (x, y) from ARGB32
+    pub fn set_pixel(&mut self, x: u32, y: u32, color: u32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        let idx = ((y as usize) * (self.width as usize) + (x as usize)) * self.format.bytes_per_pixel();
+
+        match self.format {
+            PixelFormat::Rgba => {
+                self.data[idx] = ((color >> 16) & 0xFF) as u8;     // R
+                self.data[idx + 1] = ((color >> 8) & 0xFF) as u8;  // G
+                self.data[idx + 2] = (color & 0xFF) as u8;         // B
+                self.data[idx + 3] = ((color >> 24) & 0xFF) as u8; // A
+            },
+            PixelFormat::Rgb => {
+                self.data[idx] = ((color >> 16) & 0xFF) as u8;     // R
+                self.data[idx + 1] = ((color >> 8) & 0xFF) as u8;  // G
+                self.data[idx + 2] = (color & 0xFF) as u8;         // B
+            },
+            PixelFormat::Grayscale => {
+                let r = ((color >> 16) & 0xFF) as u32;
+                let g = ((color >> 8) & 0xFF) as u32;
+                let b = (color & 0xFF) as u32;
+                // Standard luminance formula
+                self.data[idx] = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+            },
+            PixelFormat::GrayscaleAlpha => {
+                let r = ((color >> 16) & 0xFF) as u32;
+                let g = ((color >> 8) & 0xFF) as u32;
+                let b = (color & 0xFF) as u32;
+                self.data[idx] = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+                self.data[idx + 1] = ((color >> 24) & 0xFF) as u8;
+            },
+            PixelFormat::Indexed => {
+                // For indexed, find closest palette entry or use as index
+                self.data[idx] = (color & 0xFF) as u8;
+            },
+        }
+    }
+
+    // Set pixel from RGBA components (0-255)
+    pub fn set_pixel_rgba(&mut self, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        let idx = ((y as usize) * (self.width as usize) + (x as usize)) * self.format.bytes_per_pixel();
+
+        match self.format {
+            PixelFormat::Rgba => {
+                self.data[idx] = r;
+                self.data[idx + 1] = g;
+                self.data[idx + 2] = b;
+                self.data[idx + 3] = a;
+            },
+            PixelFormat::Rgb => {
+                self.data[idx] = r;
+                self.data[idx + 1] = g;
+                self.data[idx + 2] = b;
+            },
+            PixelFormat::Grayscale => {
+                self.data[idx] = ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8;
+            },
+            PixelFormat::GrayscaleAlpha => {
+                self.data[idx] = ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8;
+                self.data[idx + 1] = a;
+            },
+            PixelFormat::Indexed => {
+                // Not directly supported
+            },
+        }
+    }
+
+    // Convert to RGBA format
+    pub fn to_rgba(&self) -> ImageBuffer {
+        if self.format == PixelFormat::Rgba {
+            return self.clone();
+        }
+
+        let mut result = ImageBuffer::new_rgba(self.width, self.height);
+
+        let mut y: u32 = 0;
+        while y < self.height {
+            let mut x: u32 = 0;
+            while x < self.width {
+                let pixel = self.get_pixel(x, y);
+                result.set_pixel(x, y, pixel);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+
+        result
+    }
+
+    // Get raw data pointer for blitting
+    pub fn data_ptr(&self) -> u64 {
+        self.data.as_ptr() as u64
+    }
+}
+
+// ============================================================
+// Animation Frame
+// ============================================================
+
+#[derive(Clone)]
+pub struct AnimationFrame {
+    pub buffer: ImageBuffer,
+    pub delay_ms: u32,          // Delay in milliseconds
+    pub x_offset: u32,          // X offset within canvas
+    pub y_offset: u32,          // Y offset within canvas
+    pub dispose_op: DisposeOp,  // How to dispose this frame
+    pub blend_op: BlendOp,      // How to blend with previous
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DisposeOp {
+    None,           // Leave frame as-is
+    Background,     // Clear to background color
+    Previous,       // Restore previous frame
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BlendOp {
+    Source,         // Replace pixels
+    Over,           // Alpha blend over previous
+}
+
+impl AnimationFrame {
+    pub fn new(buffer: ImageBuffer, delay_ms: u32) -> AnimationFrame {
+        AnimationFrame {
+            buffer,
+            delay_ms,
+            x_offset: 0,
+            y_offset: 0,
+            dispose_op: DisposeOp::None,
+            blend_op: BlendOp::Source,
+        }
+    }
+}
+
+// ============================================================
+// Animated Image
+// ============================================================
+
+#[derive(Clone)]
+pub struct AnimatedImage {
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<AnimationFrame>,
+    pub frame_count: usize,
+    pub loop_count: u32,        // 0 = infinite loop
+    pub background_color: u32,  // ARGB background
+}
+
+impl AnimatedImage {
+    pub fn new(width: u32, height: u32) -> AnimatedImage {
+        AnimatedImage {
+            width,
+            height,
+            frames: Vec::new(),
+            frame_count: 0,
+            loop_count: 0,
+            background_color: 0,
+        }
+    }
+
+    pub fn from_static(buffer: ImageBuffer) -> AnimatedImage {
+        let width = buffer.width;
+        let height = buffer.height;
+        let frame = AnimationFrame::new(buffer, 0);
+
+        AnimatedImage {
+            width,
+            height,
+            frames: vec![frame],
+            frame_count: 1,
+            loop_count: 1,
+            background_color: 0,
+        }
+    }
+
+    pub fn add_frame(&mut self, frame: AnimationFrame) {
+        self.frames.push(frame);
+        self.frame_count = self.frames.len();
+    }
+
+    pub fn get_frame(&self, index: usize) -> Option<&AnimationFrame> {
+        self.frames.get(index)
+    }
+
+    // Render a specific frame to RGBA buffer (compositing if needed)
+    pub fn render_frame(&self, frame_index: usize) -> Option<ImageBuffer> {
+        if frame_index >= self.frame_count {
+            return None;
+        }
+
+        // Start with background
+        let mut canvas = ImageBuffer::new_rgba(self.width, self.height);
+
+        // Fill with background color
+        let mut y: u32 = 0;
+        while y < self.height {
+            let mut x: u32 = 0;
+            while x < self.width {
+                canvas.set_pixel(x, y, self.background_color);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+
+        // Composite frames up to and including the requested frame
+        let mut i: usize = 0;
+        while i <= frame_index {
+            let frame = &self.frames[i];
+            self.composite_frame(&mut canvas, frame);
+            i = i + 1;
+        }
+
+        Some(canvas)
+    }
+
+    fn composite_frame(&self, canvas: &mut ImageBuffer, frame: &AnimationFrame) {
+        let mut fy: u32 = 0;
+        while fy < frame.buffer.height {
+            let cy = frame.y_offset + fy;
+            if cy >= self.height {
+                break;
+            }
+
+            let mut fx: u32 = 0;
+            while fx < frame.buffer.width {
+                let cx = frame.x_offset + fx;
+                if cx >= self.width {
+                    break;
+                }
+
+                let src = frame.buffer.get_pixel(fx, fy);
+
+                match frame.blend_op {
+                    BlendOp::Source => {
+                        canvas.set_pixel(cx, cy, src);
+                    },
+                    BlendOp::Over => {
+                        let dst = canvas.get_pixel(cx, cy);
+                        let blended = alpha_blend(src, dst);
+                        canvas.set_pixel(cx, cy, blended);
+                    },
+                }
+
+                fx = fx + 1;
+            }
+            fy = fy + 1;
+        }
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+// Alpha blend two ARGB colors (src over dst)
+pub fn alpha_blend(src: u32, dst: u32) -> u32 {
+    let sa = (src >> 24) & 0xFF;
+    if sa == 0 {
+        return dst;
+    }
+    if sa == 255 {
+        return src;
+    }
+
+    let sr = (src >> 16) & 0xFF;
+    let sg = (src >> 8) & 0xFF;
+    let sb = src & 0xFF;
+
+    let da = (dst >> 24) & 0xFF;
+    let dr = (dst >> 16) & 0xFF;
+    let dg = (dst >> 8) & 0xFF;
+    let db = dst & 0xFF;
+
+    let inv_sa = 255 - sa;
+    let out_a = sa + (da * inv_sa) / 255;
+
+    if out_a == 0 {
+        return 0;
+    }
+
+    let out_r = (sr * sa + dr * da * inv_sa / 255) / out_a;
+    let out_g = (sg * sa + dg * da * inv_sa / 255) / out_a;
+    let out_b = (sb * sa + db * da * inv_sa / 255) / out_a;
+
+    (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b
+}
+
+// Clamp value to 0-255
+pub fn clamp_u8(val: i32) -> u8 {
+    if val < 0 { 0 }
+    else if val > 255 { 255 }
+    else { val as u8 }
+}
+
+// ============================================================
+// Legacy API (for compatibility with plan)
+// ============================================================
+
+pub fn image_create(width: u32, height: u32, format: PixelFormat) -> ImageBuffer {
+    ImageBuffer::new(width, height, format)
+}
+
+pub fn image_destroy(_img: ImageBuffer) {
+    // Automatic cleanup via drop
+}
+
+pub fn image_get_pixel(img: &ImageBuffer, x: u32, y: u32) -> u32 {
+    img.get_pixel(x, y)
+}
+
+pub fn image_set_pixel(img: &mut ImageBuffer, x: u32, y: u32, color: u32) {
+    img.set_pixel(x, y, color);
+}
+
+// Blit image to graphics context
+pub fn image_blit_to_ctx(img: &ImageBuffer, ctx: &GfxContext, x: i32, y: i32) {
+    // Convert to RGBA if needed and blit
+    let rgba = if img.format != PixelFormat::Rgba {
+        img.to_rgba()
+    } else {
+        img.clone()
+    };
+
+    // Create temporary buffer in ARGB format for graphics context
+    let mut argb_data: Vec<u8> = Vec::with_capacity((rgba.width * rgba.height * 4) as usize);
+
+    let mut py: u32 = 0;
+    while py < rgba.height {
+        let mut px: u32 = 0;
+        while px < rgba.width {
+            let pixel = rgba.get_pixel(px, py);
+            // Graphics context expects ARGB in memory order (actually BGRA due to little-endian)
+            argb_data.push((pixel & 0xFF) as u8);         // B
+            argb_data.push(((pixel >> 8) & 0xFF) as u8);  // G
+            argb_data.push(((pixel >> 16) & 0xFF) as u8); // R
+            argb_data.push(((pixel >> 24) & 0xFF) as u8); // A
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+
+    // Use the graphics blit function
+    blit_blend(ctx, x, y, argb_data.as_ptr() as u64, rgba.width, rgba.height);
+}
+
+// ============================================================
+// Byte Reading Utilities
+// ============================================================
+
+pub fn read_u8(data: &[u8], offset: usize) -> u8 {
+    if offset < data.len() {
+        data[offset]
+    } else {
+        0
+    }
+}
+
+pub fn read_u16_be(data: &[u8], offset: usize) -> u16 {
+    if offset + 1 < data.len() {
+        ((data[offset] as u16) << 8) | (data[offset + 1] as u16)
+    } else {
+        0
+    }
+}
+
+pub fn read_u16_le(data: &[u8], offset: usize) -> u16 {
+    if offset + 1 < data.len() {
+        (data[offset] as u16) | ((data[offset + 1] as u16) << 8)
+    } else {
+        0
+    }
+}
+
+pub fn read_u32_be(data: &[u8], offset: usize) -> u32 {
+    if offset + 3 < data.len() {
+        ((data[offset] as u32) << 24) |
+        ((data[offset + 1] as u32) << 16) |
+        ((data[offset + 2] as u32) << 8) |
+        (data[offset + 3] as u32)
+    } else {
+        0
+    }
+}
+
+pub fn read_u32_le(data: &[u8], offset: usize) -> u32 {
+    if offset + 3 < data.len() {
+        (data[offset] as u32) |
+        ((data[offset + 1] as u32) << 8) |
+        ((data[offset + 2] as u32) << 16) |
+        ((data[offset + 3] as u32) << 24)
+    } else {
+        0
+    }
+}
+
+pub fn read_i16_be(data: &[u8], offset: usize) -> i16 {
+    read_u16_be(data, offset) as i16
+}
+
+pub fn read_i32_be(data: &[u8], offset: usize) -> i32 {
+    read_u32_be(data, offset) as i32
+}
