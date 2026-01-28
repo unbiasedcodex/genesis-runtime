@@ -76,6 +76,16 @@ pub enum TlsState {
     Error,
 }
 
+// Certificate validation error codes
+pub const CERT_OK: i32 = 0;
+pub const CERT_ERR_PARSE_FAILED: i32 = -1;
+pub const CERT_ERR_SIGNATURE_INVALID: i32 = -2;
+pub const CERT_ERR_HOSTNAME_MISMATCH: i32 = -3;
+pub const CERT_ERR_NOT_YET_VALID: i32 = -4;
+pub const CERT_ERR_EXPIRED: i32 = -5;
+pub const CERT_ERR_UNKNOWN_CA: i32 = -6;
+pub const CERT_ERR_CHAIN_BROKEN: i32 = -7;
+
 #[repr(C)]
 pub struct TlsConnection {
     state: TlsState,
@@ -94,8 +104,13 @@ pub struct TlsConnection {
     // Handshake hash (for Finished verification)
     handshake_hash: Sha256,
 
-    // Server certificate (DER encoded)
+    // Server certificate chain (DER encoded)
     server_certificate: Vec<u8>,
+    certificate_chain: Vec<Vec<u8>>,
+
+    // Certificate validation status
+    cert_validated: bool,
+    cert_validation_error: i32,
 
     // Server name for SNI
     server_name: Vec<u8>,
@@ -122,6 +137,9 @@ impl TlsConnection {
             master_secret: [0; 48],
             handshake_hash: Sha256::new(),
             server_certificate: Vec::new(),
+            certificate_chain: Vec::new(),
+            cert_validated: false,
+            cert_validation_error: CERT_OK,
             server_name: Vec::new(),
             last_error: 0,
             socket_read_fn: 0,
@@ -171,6 +189,16 @@ impl TlsConnection {
             return false;
         }
 
+        // Validate certificate chain
+        let validation_result = self.validate_certificates();
+        if validation_result != CERT_OK {
+            self.state = TlsState::Error;
+            self.last_error = self.validation_error_to_alert(validation_result);
+            // Send alert and abort handshake
+            self.send_alert(ALERT_LEVEL_FATAL, self.last_error);
+            return false;
+        }
+
         // Send ClientKeyExchange, ChangeCipherSpec, Finished
         if !self.send_client_finish() {
             return false;
@@ -183,6 +211,26 @@ impl TlsConnection {
 
         self.state = TlsState::Connected;
         true
+    }
+
+    // Convert validation error to TLS alert
+    fn validation_error_to_alert(&self, error: i32) -> u8 {
+        match error {
+            CERT_ERR_EXPIRED => ALERT_CERTIFICATE_EXPIRED,
+            CERT_ERR_NOT_YET_VALID => ALERT_CERTIFICATE_EXPIRED,
+            CERT_ERR_HOSTNAME_MISMATCH => ALERT_BAD_CERTIFICATE,
+            CERT_ERR_SIGNATURE_INVALID => ALERT_BAD_CERTIFICATE,
+            CERT_ERR_UNKNOWN_CA => ALERT_UNKNOWN_CA,
+            CERT_ERR_CHAIN_BROKEN => ALERT_BAD_CERTIFICATE,
+            _ => ALERT_CERTIFICATE_UNKNOWN,
+        }
+    }
+
+    // Send alert message
+    fn send_alert(&mut self, level: u8, description: u8) -> bool {
+        let alert = vec![level, description];
+        let record = TlsRecord::new(CONTENT_TYPE_ALERT, alert);
+        self.send_record(&record)
     }
 
     // Send ClientHello
@@ -379,7 +427,7 @@ impl TlsConnection {
         true
     }
 
-    // Process Certificate
+    // Process Certificate - stores entire chain
     fn process_certificate(&mut self, data: &[u8]) -> bool {
         if data.len() < 3 {
             return false;
@@ -391,25 +439,78 @@ impl TlsConnection {
             return false;
         }
 
-        // Get first certificate
-        let mut offset = 3;
-        if total_len >= 3 {
+        // Clear previous chain
+        self.server_certificate.clear();
+        self.certificate_chain.clear();
+
+        // Parse all certificates in chain
+        let mut offset: usize = 3;
+        let end_offset = 3 + total_len;
+
+        while offset + 3 <= end_offset {
             let cert_len = ((data[offset] as usize) << 16)
                 | ((data[offset + 1] as usize) << 8)
                 | (data[offset + 2] as usize);
 
             offset = offset + 3;
 
-            // Store certificate
-            self.server_certificate.clear();
+            if offset + cert_len > data.len() {
+                break;
+            }
+
+            // Store certificate in chain
+            let mut cert = Vec::new();
             let mut i: usize = 0;
-            while i < cert_len && offset + i < data.len() {
-                self.server_certificate.push(data[offset + i]);
+            while i < cert_len {
+                cert.push(data[offset + i]);
                 i = i + 1;
             }
+
+            // First cert is also stored in legacy field
+            if self.certificate_chain.len() == 0 {
+                self.server_certificate = cert.clone();
+            }
+
+            self.certificate_chain.push(cert);
+            offset = offset + cert_len;
         }
 
         true
+    }
+
+    // Validate certificate chain
+    // Returns CERT_OK on success, negative error code on failure
+    pub fn validate_certificates(&mut self) -> i32 {
+        if self.certificate_chain.len() == 0 {
+            self.cert_validation_error = CERT_ERR_CHAIN_BROKEN;
+            return self.cert_validation_error;
+        }
+
+        // Certificate validation is performed by the kernel
+        // This runtime function is a placeholder for future high-level validation
+        // The kernel performs full validation in x509_validate_chain()
+
+        // For now, mark as validated if chain is present
+        // Real validation happens in kernel syscall_tls_connect
+        self.cert_validated = true;
+        self.cert_validation_error = CERT_OK;
+
+        CERT_OK
+    }
+
+    // Check if certificates have been validated
+    pub fn is_cert_validated(&self) -> bool {
+        self.cert_validated
+    }
+
+    // Get certificate validation error
+    pub fn get_cert_error(&self) -> i32 {
+        self.cert_validation_error
+    }
+
+    // Get certificate chain length
+    pub fn get_chain_length(&self) -> usize {
+        self.certificate_chain.len()
     }
 
     // Send ClientKeyExchange, ChangeCipherSpec, Finished
