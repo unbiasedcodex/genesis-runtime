@@ -169,6 +169,10 @@ fn run_auto_test() {
     // We'll test the cmd_http function by simulating the command
     test_http_request();
 
+    // Test 5: TLS handshake with certificate validation
+    serial_print_str(91, 53, 93, 32, 84, 76, 83, 10);  // "[5] TLS\n"
+    test_tls_handshake();
+
     // Test complete
     runtime::print_char(10);
     serial_print_str(61, 61, 61, 32, 68, 79, 78, 69);  // "=== DONE"
@@ -268,6 +272,62 @@ fn test_tcp_connect(target_ip: i64, target_port: i64, name1: i64, name2: i64, na
     serial_print_str(82, 69, 83, 58, 79, 75, 33, 10);  // "RES:OK!\n"
     runtime::net_close(sock);
     return 0;
+}
+
+fn test_tls_handshake() {
+    // Connect to amazon.com via socat proxy on gateway 10.0.2.2:4443
+    // 10.0.2.2 = (10*256*256*256) + (0*256*256) + (2*256) + 2 = 167772674
+    let target_ip: i64 = 167772674;
+    let target_port: i64 = 4443;
+
+    let sock = runtime::net_socket(1);  // TCP
+    if sock < 0 {
+        serial_print_str(84, 76, 83, 58, 83, 75, 69, 82);  // "TLS:SKER"
+        runtime::print_char(10);
+        return;
+    }
+
+    serial_print_str(67, 79, 78, 78, 58, 0, 0, 0);  // "CONN:"
+    print_ip_serial(target_ip);
+    runtime::print_char(58);  // :
+    print_num_serial(target_port);
+    runtime::print_char(10);
+
+    let conn = runtime::net_connect(sock, target_ip, target_port);
+    if conn < 0 {
+        serial_print_str(84, 76, 83, 58, 67, 69, 82, 82);  // "TLS:CERR"
+        runtime::print_char(10);
+        runtime::net_close(sock);
+        return;
+    }
+
+    serial_print_str(84, 67, 80, 58, 79, 75, 10, 0);  // "TCP:OK\n"
+
+    // TLS handshake with hostname "amazon.com" (10 bytes)
+    // Write hostname to a buffer
+    let hostname_buf: i64 = 0x490000;  // Temp buffer in user space
+    commands::write_byte(hostname_buf, 97);       // a
+    commands::write_byte(hostname_buf + 1, 109);  // m
+    commands::write_byte(hostname_buf + 2, 97);   // a
+    commands::write_byte(hostname_buf + 3, 122);  // z
+    commands::write_byte(hostname_buf + 4, 111);  // o
+    commands::write_byte(hostname_buf + 5, 110);  // n
+    commands::write_byte(hostname_buf + 6, 46);   // .
+    commands::write_byte(hostname_buf + 7, 99);   // c
+    commands::write_byte(hostname_buf + 8, 111);  // o
+    commands::write_byte(hostname_buf + 9, 109);  // m
+
+    let tls_result = runtime::tls_connect(sock, hostname_buf, 10);
+    if tls_result >= 0 {
+        serial_print_str(84, 76, 83, 58, 79, 75, 33, 10);  // "TLS:OK!\n"
+    } else {
+        serial_print_str(84, 76, 83, 58, 69, 82, 82, 58);  // "TLS:ERR:"
+        runtime::print_num(tls_result);
+        runtime::print_char(10);
+    }
+
+    runtime::tls_close(sock);
+    runtime::net_close(sock);
 }
 
 fn test_http_request() {
