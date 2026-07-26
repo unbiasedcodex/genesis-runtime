@@ -309,7 +309,7 @@ impl Document {
             PseudoClass::NthLastChild(expr) => {
                 if let Some(parent_idx) = self.get_node(node_idx).and_then(|n| n.parent) {
                     let siblings = self.child_elements(parent_idx);
-                    if let Some(pos) = siblings.iter().position(|&x| x == node_idx) {
+                    if let Some(pos) = self.index_of(&siblings, node_idx) {
                         let from_end = siblings.len() - pos;
                         return expr.matches(from_end as i32);
                     }
@@ -330,7 +330,7 @@ impl Document {
                     let tag = node.tag_name()?;
                     let parent_idx = node.parent?;
                     let siblings = self.get_elements_by_tag_name_in_parent(parent_idx, tag);
-                    if let Some(pos) = siblings.iter().position(|&x| x == node_idx) {
+                    if let Some(pos) = self.index_of(&siblings, node_idx) {
                         let from_end = siblings.len() - pos;
                         return expr.matches(from_end as i32);
                     }
@@ -450,11 +450,23 @@ impl Document {
         }
     }
 
+    // Explicit search: glc's VecIter has no position()
+    fn index_of(&self, list: &Vec<usize>, target: usize) -> Option<usize> {
+        let mut i = 0;
+        while i < list.len() {
+            if list[i] == target {
+                return Some(i);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
     fn get_sibling_index(&self, node_idx: usize) -> Option<usize> {
         let node = self.get_node(node_idx)?;
         let parent_idx = node.parent?;
         let siblings = self.child_elements(parent_idx);
-        siblings.iter().position(|&x| x == node_idx)
+        self.index_of(&siblings, node_idx)
     }
 
     fn get_type_index(&self, node_idx: usize) -> Option<usize> {
@@ -462,7 +474,7 @@ impl Document {
         let tag = node.tag_name()?;
         let parent_idx = node.parent?;
         let same_type = self.get_elements_by_tag_name_in_parent(parent_idx, tag);
-        same_type.iter().position(|&x| x == node_idx)
+        self.index_of(&same_type, node_idx)
     }
 
     fn get_elements_by_tag_name_in_parent(&self, parent_idx: usize, tag: &str) -> Vec<usize> {

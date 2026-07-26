@@ -20,12 +20,12 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       (src/crypto/mod.gl:24-25) with state threaded via context struct
       param (glc has no statics; freestanding.md:184). Update all users
       in src/crypto/.
-- [ ] 1.2 layout: `mut self` receiver -> `&mut self` (src/layout/inline.gl:69).
-- [ ] 1.3 html: `mut self` receiver -> `&mut self` (src/html/treebuilder.gl:422).
-- [ ] 1.4 layout: `0.0_f64` -> `0.0` (src/layout/block.gl:485).
-- [ ] 1.5 css: remove `<'a>` fn generic params, elide lifetimes
+- [x] 1.2 layout: `mut self` receiver -> `&mut self` (src/layout/inline.gl:69).
+- [x] 1.3 html: `mut self` receiver -> `&mut self` (src/html/treebuilder.gl:422).
+- [x] 1.4 layout: `0.0_f64` -> `0.0` (src/layout/block.gl:485).
+- [x] 1.5 css: remove `<'a>` fn generic params, elide lifetimes
       (src/css/parser.gl:865, src/css/mod.gl:497).
-- [ ] 1.6 closure param patterns `|&x|` / `|(a,b)|` (~20 sites, e.g.
+- [x] 1.6 closure param patterns `|&x|` / `|(a,b)|` (~20 sites, e.g.
       src/css/mod.gl:312 `.position(|&x| ...)`, src/html/treebuilder.gl:251
       `.retain(|&x| ...)`): rewrite as plain-param closures or explicit
       loops. DECIDED (checked reference.md:618-643): stdlib has NO
@@ -35,14 +35,14 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       sugar on Vec/String everywhere; html passed typeck so sugar seems
       accepted, but stdlib method NAMES not in reference.md will surface
       as errors in Phase 4.
-- [ ] 1.7 css: `F: FnMut(...)` bounds -> `fn(...)` pointer params
+- [x] 1.7 css: `F: FnMut(...)` bounds -> `fn(...)` pointer params
       (src/css/cascade.gl:1356 + grep for more).
 - [ ] 1.8 tls: remove `core::mem::transmute` x2 (src/tls/mod.gl:796,864);
       store callbacks as typed `fn(...)` fields (needs Phase 2.2 to parse).
 - [ ] 1.9 MOVED TO 2.10: there are 7 raw-string sites (6 in browser/mod.gl:
       318,370,395,434,458,523 + tab.gl:469), multi-line HTML/CSS bodies with
       embedded quotes — a glc lexer feature is cheaper than rewriting them.
-- [ ] 1.10 browser: `Key::Char('1') ..= Key::Char('9')` -> binding + guard
+- [x] 1.10 browser: `Key::Char('1') ..= Key::Char('9')` -> binding + guard
       (src/browser/main.gl:663).
 
 ## Phase 2 — glc parser/lexer pack (genesis-lang repo)

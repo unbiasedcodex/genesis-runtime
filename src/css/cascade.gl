@@ -762,12 +762,12 @@ impl StyleResolver {
                 }
             },
             "margin" => {
-                apply_box_shorthand(value, |t, r, b, l| {
+                if let Some((t, r, b, l)) = parse_box_shorthand(value) {
                     style.margin_top = t;
                     style.margin_right = r;
                     style.margin_bottom = b;
                     style.margin_left = l;
-                });
+                }
             },
             "margin-top" => {
                 if let Some(d) = parse_dimension(&value[0]) {
@@ -790,12 +790,12 @@ impl StyleResolver {
                 }
             },
             "padding" => {
-                apply_box_shorthand(value, |t, r, b, l| {
+                if let Some((t, r, b, l)) = parse_box_shorthand(value) {
                     style.padding_top = t;
                     style.padding_right = r;
                     style.padding_bottom = b;
                     style.padding_left = l;
-                });
+                }
             },
             "padding-top" => {
                 if let Some(d) = parse_dimension(&value[0]) {
@@ -1351,19 +1351,23 @@ fn parse_cursor(value: &CssValue) -> Option<Cursor> {
     }
 }
 
-fn apply_box_shorthand<F>(values: &[CssValue], mut apply: F)
-where
-    F: FnMut(Dimension, Dimension, Dimension, Dimension),
-{
-    let dims: Vec<Dimension> = values.iter()
-        .filter_map(|v| parse_dimension(v))
-        .collect();
+// Returns (top, right, bottom, left); glc has no closure generics, so
+// callers assign the four values themselves
+fn parse_box_shorthand(values: &[CssValue]) -> Option<(Dimension, Dimension, Dimension, Dimension)> {
+    let mut dims: Vec<Dimension> = Vec::new();
+    let mut i = 0;
+    while i < values.len() {
+        if let Some(d) = parse_dimension(&values[i]) {
+            dims.push(d);
+        }
+        i = i + 1;
+    }
 
     match dims.len() {
-        1 => apply(dims[0], dims[0], dims[0], dims[0]),
-        2 => apply(dims[0], dims[1], dims[0], dims[1]),
-        3 => apply(dims[0], dims[1], dims[2], dims[1]),
-        4 => apply(dims[0], dims[1], dims[2], dims[3]),
-        _ => {}
+        1 => Some((dims[0], dims[0], dims[0], dims[0])),
+        2 => Some((dims[0], dims[1], dims[0], dims[1])),
+        3 => Some((dims[0], dims[1], dims[2], dims[1])),
+        4 => Some((dims[0], dims[1], dims[2], dims[3])),
+        _ => None,
     }
 }

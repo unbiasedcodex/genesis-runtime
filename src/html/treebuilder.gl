@@ -248,7 +248,16 @@ impl Document {
     // Remove child from parent
     pub fn remove_child(&mut self, parent_idx: usize, child_idx: usize) {
         if let Some(parent) = self.nodes.get_mut(parent_idx) {
-            parent.children.retain(|&x| x != child_idx);
+            // Explicit rebuild: glc's Vec has no retain()
+            let mut kept: Vec<usize> = Vec::new();
+            let mut i = 0;
+            while i < parent.children.len() {
+                if parent.children[i] != child_idx {
+                    kept.push(parent.children[i]);
+                }
+                i = i + 1;
+            }
+            parent.children = kept;
         }
         if let Some(child) = self.nodes.get_mut(child_idx) {
             child.parent = None;
@@ -400,6 +409,18 @@ pub enum FormattingElement {
 }
 
 impl TreeBuilder {
+    // Explicit search: glc's VecIter has no position()
+    fn stack_index_of(&self, target: usize) -> Option<usize> {
+        let mut i = 0;
+        while i < self.open_elements.len() {
+            if self.open_elements[i] == target {
+                return Some(i);
+            }
+            i = i + 1;
+        }
+        None
+    }
+
     pub fn new(html: &str) -> TreeBuilder {
         TreeBuilder {
             document: Document::new(),
@@ -697,7 +718,7 @@ impl TreeBuilder {
                     self.open_elements.push(head_idx);
                     self.handle_in_head(token);
                     // Remove head from stack
-                    if let Some(pos) = self.open_elements.iter().position(|&x| x == head_idx) {
+                    if let Some(pos) = self.stack_index_of(head_idx) {
                         self.open_elements.remove(pos);
                     }
                 }
@@ -929,7 +950,7 @@ impl TreeBuilder {
                     }
                     self.generate_implied_end_tags();
                     if let Some(idx) = form_idx {
-                        if let Some(pos) = self.open_elements.iter().position(|&x| x == idx) {
+                        if let Some(pos) = self.stack_index_of(idx) {
                             self.open_elements.remove(pos);
                         }
                     }
