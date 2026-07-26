@@ -16,7 +16,7 @@ tls, browser FAIL. Root causes mapped below with exact locations.
 
 ## Phase 1 — Mechanical rewrites in the engine (no compiler changes)
 
-- [ ] 1.1 crypto: replace `static mut RNG_STATE`/`RNG_INITIALIZED`
+- [x] 1.1 crypto: replace `static mut RNG_STATE`/`RNG_INITIALIZED`
       (src/crypto/mod.gl:24-25) with state threaded via context struct
       param (glc has no statics; freestanding.md:184). Update all users
       in src/crypto/.

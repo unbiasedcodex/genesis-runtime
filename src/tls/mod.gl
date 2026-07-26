@@ -7,7 +7,7 @@ use record::{RecordLayer, TlsRecord, encrypt_record, decrypt_record};
 use record::{TLS_VERSION_1_2, CONTENT_TYPE_HANDSHAKE, CONTENT_TYPE_CHANGE_CIPHER_SPEC};
 use record::{CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_ALERT};
 
-use super::crypto::{sha256, hmac_sha256, hkdf_sha256, random_bytes, Sha256};
+use super::crypto::{sha256, hmac_sha256, hkdf_sha256, Rng, Sha256};
 use super::crypto::{aes_128_gcm_encrypt, aes_128_gcm_decrypt};
 
 // ============================================================
@@ -92,6 +92,7 @@ pub struct TlsConnection {
     record_layer: RecordLayer,
 
     // Handshake data
+    rng: Rng,
     client_random: [u8; 32],
     server_random: [u8; 32],
     session_id: Vec<u8>,
@@ -128,6 +129,9 @@ impl TlsConnection {
     pub fn new(server_name: &[u8]) -> TlsConnection {
         let mut conn = TlsConnection {
             state: TlsState::Initial,
+            // Deterministic default seed: reseed from real entropy (e.g.
+            // rdtsc/kernel syscall) before production handshakes
+            rng: Rng::from_seed(b"genesis_default_seed_12345"),
             record_layer: RecordLayer::new(true),
             client_random: [0; 32],
             server_random: [0; 32],
@@ -155,7 +159,7 @@ impl TlsConnection {
         }
 
         // Generate client random
-        let rand = random_bytes(32);
+        let rand = self.rng.bytes(32);
         i = 0;
         while i < 32 {
             conn.client_random[i] = rand[i];
@@ -519,7 +523,7 @@ impl TlsConnection {
         self.pre_master_secret.clear();
         self.pre_master_secret.push(3);  // TLS version major
         self.pre_master_secret.push(3);  // TLS version minor
-        let rand = random_bytes(46);
+        let rand = self.rng.bytes(46);
         let mut i: usize = 0;
         while i < 46 {
             self.pre_master_secret.push(rand[i]);

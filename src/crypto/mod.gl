@@ -21,77 +21,77 @@ pub use gcm::{aes_gcm_seal, aes_gcm_open};
 // Random Number Generation (Simple CSPRNG)
 // ============================================================
 
-static mut RNG_STATE: [u64; 4] = [0; 4];
-static mut RNG_INITIALIZED: bool = false;
-
-// Initialize RNG with seed
-pub fn rng_init(seed: &[u8]) {
-    unsafe {
-        // Use SHA-256 to expand seed
-        let hash = sha256(seed);
-
-        RNG_STATE[0] = u64_from_bytes(&hash[0..8]);
-        RNG_STATE[1] = u64_from_bytes(&hash[8..16]);
-        RNG_STATE[2] = u64_from_bytes(&hash[16..24]);
-        RNG_STATE[3] = u64_from_bytes(&hash[24..32]);
-
-        // Ensure non-zero state
-        if RNG_STATE[0] == 0 && RNG_STATE[1] == 0 && RNG_STATE[2] == 0 && RNG_STATE[3] == 0 {
-            RNG_STATE[0] = 1;
-        }
-
-        RNG_INITIALIZED = true;
-    }
+// RNG state as an explicit value: glc has no static items, so callers
+// own an Rng (seeded from entropy when available) and pass it around.
+pub struct Rng {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
 }
 
-// Generate random u64 (xoshiro256**)
-pub fn rng_u64() -> u64 {
-    unsafe {
-        if !RNG_INITIALIZED {
-            // Emergency initialization with fixed seed
-            rng_init(b"genesis_default_seed_12345");
+impl Rng {
+    // Seed via SHA-256 expansion
+    pub fn from_seed(seed: &[u8]) -> Rng {
+        let hash = sha256(seed);
+
+        let mut rng = Rng {
+            s0: u64_from_bytes(&hash[0..8]),
+            s1: u64_from_bytes(&hash[8..16]),
+            s2: u64_from_bytes(&hash[16..24]),
+            s3: u64_from_bytes(&hash[24..32]),
+        };
+
+        // Ensure non-zero state
+        if rng.s0 == 0 && rng.s1 == 0 && rng.s2 == 0 && rng.s3 == 0 {
+            rng.s0 = 1;
         }
 
-        let result = rotl64(RNG_STATE[1].wrapping_mul(5), 7).wrapping_mul(9);
+        rng
+    }
 
-        let t = RNG_STATE[1] << 17;
+    // Generate random u64 (xoshiro256**)
+    pub fn next_u64(&mut self) -> u64 {
+        let result = rotl64(self.s1.wrapping_mul(5), 7).wrapping_mul(9);
 
-        RNG_STATE[2] = RNG_STATE[2] ^ RNG_STATE[0];
-        RNG_STATE[3] = RNG_STATE[3] ^ RNG_STATE[1];
-        RNG_STATE[1] = RNG_STATE[1] ^ RNG_STATE[2];
-        RNG_STATE[0] = RNG_STATE[0] ^ RNG_STATE[3];
+        let t = self.s1 << 17;
 
-        RNG_STATE[2] = RNG_STATE[2] ^ t;
-        RNG_STATE[3] = rotl64(RNG_STATE[3], 45);
+        self.s2 = self.s2 ^ self.s0;
+        self.s3 = self.s3 ^ self.s1;
+        self.s1 = self.s1 ^ self.s2;
+        self.s0 = self.s0 ^ self.s3;
+
+        self.s2 = self.s2 ^ t;
+        self.s3 = rotl64(self.s3, 45);
 
         result
     }
-}
 
-// Fill buffer with random bytes
-pub fn rng_fill(buffer: &mut [u8]) {
-    let mut i: usize = 0;
-    while i < buffer.len() {
-        let r = rng_u64();
-        let mut j: usize = 0;
-        while j < 8 && i + j < buffer.len() {
-            buffer[i + j] = ((r >> (j * 8)) & 0xFF) as u8;
-            j = j + 1;
+    // Fill buffer with random bytes
+    pub fn fill(&mut self, buffer: &mut [u8]) {
+        let mut i: usize = 0;
+        while i < buffer.len() {
+            let r = self.next_u64();
+            let mut j: usize = 0;
+            while j < 8 && i + j < buffer.len() {
+                buffer[i + j] = ((r >> (j * 8)) & 0xFF) as u8;
+                j = j + 1;
+            }
+            i = i + 8;
         }
-        i = i + 8;
     }
-}
 
-// Generate random bytes as Vec
-pub fn random_bytes(len: usize) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let mut i: usize = 0;
-    while i < len {
-        buffer.push(0);
-        i = i + 1;
+    // Generate random bytes as Vec
+    pub fn bytes(&mut self, len: usize) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut i: usize = 0;
+        while i < len {
+            buffer.push(0);
+            i = i + 1;
+        }
+        self.fill(&mut buffer);
+        buffer
     }
-    rng_fill(&mut buffer);
-    buffer
 }
 
 fn rotl64(x: u64, k: u32) -> u64 {
@@ -146,22 +146,22 @@ pub fn secure_compare(a: &[u8], b: &[u8]) -> bool {
 // ============================================================
 
 // Generate random AES-128 key
-pub fn generate_aes_128_key() -> [u8; 16] {
+pub fn generate_aes_128_key(rng: &mut Rng) -> [u8; 16] {
     let mut key: [u8; 16] = [0; 16];
-    rng_fill(&mut key);
+    rng.fill(&mut key);
     key
 }
 
 // Generate random AES-256 key
-pub fn generate_aes_256_key() -> [u8; 32] {
+pub fn generate_aes_256_key(rng: &mut Rng) -> [u8; 32] {
     let mut key: [u8; 32] = [0; 32];
-    rng_fill(&mut key);
+    rng.fill(&mut key);
     key
 }
 
 // Generate random nonce for GCM
-pub fn generate_gcm_nonce() -> [u8; 12] {
+pub fn generate_gcm_nonce(rng: &mut Rng) -> [u8; 12] {
     let mut nonce: [u8; 12] = [0; 12];
-    rng_fill(&mut nonce);
+    rng.fill(&mut nonce);
     nonce
 }
