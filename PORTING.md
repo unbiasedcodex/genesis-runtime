@@ -28,8 +28,13 @@ tls, browser FAIL. Root causes mapped below with exact locations.
 - [ ] 1.6 closure param patterns `|&x|` / `|(a,b)|` (~20 sites, e.g.
       src/css/mod.gl:312 `.position(|&x| ...)`, src/html/treebuilder.gl:251
       `.retain(|&x| ...)`): rewrite as plain-param closures or explicit
-      loops. CHECK FIRST whether glc stdlib has .position/.retain/.iter()
-      (docs/reference.md Collections); if absent, use while loops.
+      loops. DECIDED (checked reference.md:618-643): stdlib has NO
+      .position/.retain — VecIter offers find/any/all/map/filter only,
+      in Vec::iter()/VecIter::* function style. Rewrite these sites as
+      explicit while loops. Wave-2 risk noted: engine uses method-call
+      sugar on Vec/String everywhere; html passed typeck so sugar seems
+      accepted, but stdlib method NAMES not in reference.md will surface
+      as errors in Phase 4.
 - [ ] 1.7 css: `F: FnMut(...)` bounds -> `fn(...)` pointer params
       (src/css/cascade.gl:1356 + grep for more).
 - [ ] 1.8 tls: remove `core::mem::transmute` x2 (src/tls/mod.gl:796,864);
