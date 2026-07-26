@@ -15,7 +15,7 @@ NASMFLAGS = -f elf64
 BUILD_DIR = build
 
 # Services
-SERVICES = init vfs console shell
+SERVICES = init vfs console shell geb
 
 # Default target
 all: $(SERVICES)
@@ -68,6 +68,18 @@ $(BUILD_DIR)/shell.o: src/shell/main.gl src/shell/commands.gl src/shell/runtime.
 $(BUILD_DIR)/shell_start.o: src/shell/start.asm | $(BUILD_DIR)
 	$(NASM) $(NASMFLAGS) -o $@ $<
 
+# Geb Browser (loads at native base 0x5000000)
+geb: $(BUILD_DIR)/geb.elf
+
+$(BUILD_DIR)/geb.elf: $(BUILD_DIR)/geb.o $(BUILD_DIR)/geb_start.o src/browser/userspace.ld
+	$(LD) -T src/browser/userspace.ld -m elf_x86_64 --nostdlib -o $@ $(BUILD_DIR)/geb_start.o $(BUILD_DIR)/geb.o
+
+$(BUILD_DIR)/geb.o: src/geb.gl src/geb_rt.gl $(wildcard src/html/*.gl) $(wildcard src/css/*.gl) $(wildcard src/layout/*.gl) $(wildcard src/js/*.gl) $(wildcard src/net/*.gl) $(wildcard src/image/*.gl) | $(BUILD_DIR)
+	$(GLC) build src/geb.gl $(GLCFLAGS) -o $@
+
+$(BUILD_DIR)/geb_start.o: src/browser/start.asm | $(BUILD_DIR)
+	$(NASM) $(NASMFLAGS) -o $@ $<
+
 # Create build directory
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -82,10 +94,15 @@ install: all
 	cp $(BUILD_DIR)/vfs.elf ../genesis-kernel/iso/boot/
 	cp $(BUILD_DIR)/console.elf ../genesis-kernel/iso/boot/
 	cp $(BUILD_DIR)/shell.elf ../genesis-kernel/iso/boot/
+	cp $(BUILD_DIR)/geb.elf ../genesis-kernel/iso/boot/
 
 # Check tools
 check:
 	@$(GLC) --version > /dev/null || (echo "Error: glc not found" && exit 1)
 	@echo "Tools OK"
 
-.PHONY: all clean install check $(SERVICES)
+# Check that the geb browser compiles
+check-geb: $(BUILD_DIR)/geb.o
+	@echo "geb compiles OK"
+
+.PHONY: all clean install check check-geb $(SERVICES)

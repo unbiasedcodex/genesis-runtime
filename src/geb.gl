@@ -1,0 +1,99 @@
+// Genesis Geb Browser
+// Standalone userspace process (native base 0x5000000)
+// Stage 1: framebuffer chrome skeleton + event loop
+
+mod geb_rt;
+// Future engine modules (Stage 2+):
+// mod html;
+// mod css;
+// mod layout;
+// mod js;
+// mod net;
+// mod image;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const KEY_QUIT: i64 = 113;  // 'q' quits the browser
+
+// Colors (ARGB format: 0xAARRGGBB)
+const COLOR_BG: i64 = 0xFF2D2D2D;       // Dark gray background
+const COLOR_TOOLBAR: i64 = 0xFF3C3C3C;  // Toolbar gray
+const COLOR_ADDR_BG: i64 = 0xFF202020;  // Address bar background
+
+// ============================================================================
+// Output Helpers
+// ============================================================================
+
+// Print "[GEB] UP\n"
+fn print_up() {
+    geb_rt::print_char(91);   // [
+    geb_rt::print_char(71);   // G
+    geb_rt::print_char(69);   // E
+    geb_rt::print_char(66);   // B
+    geb_rt::print_char(93);   // ]
+    geb_rt::print_char(32);   // space
+    geb_rt::print_char(85);   // U
+    geb_rt::print_char(80);   // P
+    geb_rt::print_char(10);   // newline
+}
+
+// Print "[GEB] NO FB\n"
+fn print_no_fb() {
+    geb_rt::print_char(91);   // [
+    geb_rt::print_char(71);   // G
+    geb_rt::print_char(69);   // E
+    geb_rt::print_char(66);   // B
+    geb_rt::print_char(93);   // ]
+    geb_rt::print_char(32);   // space
+    geb_rt::print_char(78);   // N
+    geb_rt::print_char(79);   // O
+    geb_rt::print_char(32);   // space
+    geb_rt::print_char(70);   // F
+    geb_rt::print_char(66);   // B
+    geb_rt::print_char(10);   // newline
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() {
+    print_up();
+
+    // Get framebuffer info
+    // Query 0 returns width, query 1 returns height
+    let fb_width = geb_rt::fb_info(0);
+    let fb_height = geb_rt::fb_info(1);
+
+    // Check if framebuffer is available
+    if fb_width <= 0 || fb_height <= 0 {
+        print_no_fb();
+        geb_rt::exit();
+        return;
+    }
+
+    // Draw browser chrome skeleton
+    geb_rt::fb_clear(COLOR_BG);
+
+    // Tab bar (top 30 pixels)
+    geb_rt::fb_rect(0, 0, fb_width, 30, COLOR_TOOLBAR);
+
+    // Address bar band (next 34 pixels)
+    geb_rt::fb_rect(0, 30, fb_width, 34, COLOR_ADDR_BG);
+
+    geb_rt::fb_swap();
+
+    // Main event loop
+    loop {
+        if geb_rt::kb_avail() != 0 {
+            let ch = geb_rt::kb_read();
+            if ch == KEY_QUIT {
+                geb_rt::exit();
+            }
+        } else {
+            geb_rt::yield_cpu();
+        }
+    }
+}

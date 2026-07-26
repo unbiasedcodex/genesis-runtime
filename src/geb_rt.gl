@@ -1,0 +1,220 @@
+// Genesis Runtime Library for Geb Browser
+// Syscall wrappers for userspace browser
+
+// ============================================================================
+// Syscall Numbers (must match kernel)
+// ============================================================================
+
+pub const SYS_YIELD: i64 = 0;
+pub const SYS_PRINT: i64 = 2;
+pub const SYS_EXIT: i64 = 5;
+
+// Keyboard syscalls
+pub const SYS_KB_READ: i64 = 16;
+pub const SYS_KB_AVAIL: i64 = 17;
+
+// Framebuffer syscalls
+pub const SYS_FB_INFO: i64 = 70;
+pub const SYS_FB_RECT: i64 = 72;
+pub const SYS_FB_SWAP: i64 = 73;
+pub const SYS_FB_CLEAR: i64 = 74;
+pub const SYS_FB_CHAR: i64 = 77;
+pub const SYS_FB_TEXT: i64 = 78;
+
+// Mouse syscalls
+pub const SYS_MOUSE_POS: i64 = 90;
+pub const SYS_MOUSE_BTN: i64 = 91;
+
+// ============================================================================
+// Low-level Syscall Functions
+// ============================================================================
+
+fn syscall0(num: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+fn syscall1(num: i64, arg1: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// For framebuffer syscalls that use R8/R9 for args 4/5
+fn syscall5_fb(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64, arg5: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r8") arg4,
+            in("r9") arg5,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// For framebuffer syscalls that use R8 for arg4
+fn syscall4_fb(num: i64, arg1: i64, arg2: i64, arg3: i64, arg4: i64) -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") num,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r8") arg4,
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Process Management
+// ============================================================================
+
+pub fn yield_cpu() {
+    syscall0(SYS_YIELD);
+}
+
+pub fn exit() {
+    syscall0(SYS_EXIT);
+}
+
+// ============================================================================
+// Serial I/O (for debugging)
+// ============================================================================
+
+pub fn print_char(c: i64) {
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 2,      // SYS_PRINT = 2 (literal constant)
+            in("rdi") c,
+            lateout("rax") _,
+            options(nostack, att_syntax)
+        );
+    }
+}
+
+pub fn print_num(n: i64) {
+    if n < 0 {
+        print_char(45);  // '-'
+        print_num(0 - n);
+        return;
+    }
+    if n >= 10 {
+        print_num(n / 10);
+    }
+    print_char(48 + (n % 10));
+}
+
+pub fn print_newline() {
+    print_char(10);
+}
+
+// ============================================================================
+// Keyboard Access
+// ============================================================================
+
+// Read character from keyboard buffer
+// Returns: ASCII character, or -1 if buffer empty
+pub fn kb_read() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 16,  // SYS_KB_READ = 16 (literal constant)
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// Check if keyboard buffer has data
+// Returns: 1 if data available, 0 otherwise
+pub fn kb_avail() -> i64 {
+    let mut result: i64 = 0;
+    unsafe {
+        asm!(
+            "int $$0x80",
+            in("rax") 17,  // SYS_KB_AVAIL = 17 (literal constant)
+            lateout("rax") result,
+            options(nostack, att_syntax)
+        );
+    }
+    result
+}
+
+// ============================================================================
+// Mouse Access
+// ============================================================================
+
+// Get mouse position (x in low 32 bits, y in high 32 bits)
+pub fn mouse_pos() -> i64 {
+    syscall0(SYS_MOUSE_POS)
+}
+
+// Get mouse button state
+pub fn mouse_btn() -> i64 {
+    syscall0(SYS_MOUSE_BTN)
+}
+
+// ============================================================================
+// Framebuffer Graphics Syscalls
+// ============================================================================
+
+// Get framebuffer info (query 0 = width, query 1 = height)
+pub fn fb_info(query: i64) -> i64 {
+    syscall1(SYS_FB_INFO, query)
+}
+
+// Draw a filled rectangle (uses R8/R9 for args 4/5)
+pub fn fb_rect(x: i64, y: i64, w: i64, h: i64, color: i64) -> i64 {
+    syscall5_fb(SYS_FB_RECT, x, y, w, h, color)
+}
+
+// Swap buffers (display back buffer)
+pub fn fb_swap() -> i64 {
+    syscall0(SYS_FB_SWAP)
+}
+
+// Clear framebuffer with color
+pub fn fb_clear(color: i64) -> i64 {
+    syscall1(SYS_FB_CLEAR, color)
+}
+
+// Draw character at position (uses R8 for arg4)
+pub fn fb_char(x: i64, y: i64, ch: i64, color: i64) -> i64 {
+    syscall4_fb(SYS_FB_CHAR, x, y, ch, color)
+}
+
+// Draw text string at position (text_addr is pointer to null-terminated string)
+pub fn fb_text(x: i64, y: i64, text_addr: i64, color: i64) -> i64 {
+    syscall4_fb(SYS_FB_TEXT, x, y, text_addr, color)
+}
