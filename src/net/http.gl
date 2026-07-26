@@ -19,7 +19,8 @@
 //   let body_addr = http_response_body_addr();
 //   let body_len = http_response_body_len();
 
-mod url;
+// url is declared by net/mod.gl; declaring it here too would load the
+// file twice and duplicate every symbol in the flat namespace
 
 // ============================================================
 // HTTP Constants
