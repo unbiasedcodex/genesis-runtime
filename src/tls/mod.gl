@@ -120,8 +120,8 @@ pub struct TlsConnection {
     last_error: u8,
 
     // Socket operations (function pointers stored as u64)
-    socket_read_fn: u64,
-    socket_write_fn: u64,
+    socket_read_fn: Option<fn(u64, &mut [u8]) -> i64>,
+    socket_write_fn: Option<fn(u64, &[u8]) -> i64>,
     socket_data: u64,
 }
 
@@ -146,8 +146,8 @@ impl TlsConnection {
             cert_validation_error: CERT_OK,
             server_name: Vec::new(),
             last_error: 0,
-            socket_read_fn: 0,
-            socket_write_fn: 0,
+            socket_read_fn: None,
+            socket_write_fn: None,
             socket_data: 0,
         };
 
@@ -176,8 +176,8 @@ impl TlsConnection {
         write_fn: fn(u64, &[u8]) -> i64,
         socket_data: u64,
     ) {
-        self.socket_read_fn = read_fn as u64;
-        self.socket_write_fn = write_fn as u64;
+        self.socket_read_fn = Some(read_fn);
+        self.socket_write_fn = Some(write_fn);
         self.socket_data = socket_data;
     }
 
@@ -792,13 +792,9 @@ impl TlsConnection {
 
     // Send raw data
     fn send_raw(&self, data: &[u8]) -> bool {
-        if self.socket_write_fn == 0 {
-            return false;
-        }
-
-        unsafe {
-            let write_fn: fn(u64, &[u8]) -> i64 = core::mem::transmute(self.socket_write_fn);
-            write_fn(self.socket_data, data) >= 0
+        match self.socket_write_fn {
+            Some(write_fn) => write_fn(self.socket_data, data) >= 0,
+            None => false,
         }
     }
 
@@ -860,14 +856,12 @@ impl TlsConnection {
 
     // Receive exact number of bytes
     fn recv_exact(&self, buffer: &mut [u8]) -> bool {
-        if self.socket_read_fn == 0 {
-            return false;
-        }
-
-        unsafe {
-            let read_fn: fn(u64, &mut [u8]) -> i64 = core::mem::transmute(self.socket_read_fn);
-            let result = read_fn(self.socket_data, buffer);
-            result as usize == buffer.len()
+        match self.socket_read_fn {
+            Some(read_fn) => {
+                let result = read_fn(self.socket_data, buffer);
+                result as usize == buffer.len()
+            },
+            None => false,
         }
     }
 

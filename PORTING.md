@@ -37,7 +37,7 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       as errors in Phase 4.
 - [x] 1.7 css: `F: FnMut(...)` bounds -> `fn(...)` pointer params
       (src/css/cascade.gl:1356 + grep for more).
-- [ ] 1.8 tls: remove `core::mem::transmute` x2 (src/tls/mod.gl:796,864);
+- [x] 1.8 tls: remove `core::mem::transmute` x2 (src/tls/mod.gl:796,864);
       store callbacks as typed `fn(...)` fields (needs Phase 2.2 to parse).
 - [ ] 1.9 MOVED TO 2.10: there are 7 raw-string sites (6 in browser/mod.gl:
       318,370,395,434,458,523 + tab.gl:469), multi-line HTML/CSS bodies with
@@ -46,6 +46,8 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       (src/browser/main.gl:663).
 
 ## Phase 2 — glc parser/lexer pack (genesis-lang repo)
+
+Phase 1 complete except 1.9 (moved to 2.10). Phase 2 items unblock the rest.
 
 - [ ] 2.1 Ignore unknown attributes (e.g. `#[test]`) and SKIP items annotated
       `#[cfg(test)]` via token-level balanced-brace skipping
