@@ -1,0 +1,78 @@
+name: Engine Port Check
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout genesis-runtime
+        uses: actions/checkout@v4
+        with:
+          path: genesis-runtime
+
+      - name: Checkout genesis-lang
+        uses: actions/checkout@v4
+        with:
+          repository: unbiasedcodex/genesis-lang
+          ref: ci
+          path: genesis-lang
+
+      - name: Install LLVM 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 llvm-18-dev libpolly-18-dev clang-18 libzstd-dev zlib1g-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            genesis-lang/target
+          key: cargo-kernel-${{ runner.os }}-${{ hashFiles('genesis-lang/Cargo.lock') }}
+
+      - name: Build glc
+        run: cargo build --release --manifest-path genesis-lang/Cargo.toml
+
+      - name: Probe engine modules
+        run: |
+          GLC=$GITHUB_WORKSPACE/genesis-lang/target/release/glc
+          cd genesis-runtime/src
+          mkdir -p /tmp/probe-logs
+          # Compile each engine directory standalone to map the port gaps.
+          # A probe failing is expected data, not a workflow failure.
+          for m in crypto image html css layout js net tls browser; do
+            printf 'mod %s;\n\nfn main() {\n}\n' "$m" > probe_$m.gl
+            if timeout 180 $GLC build probe_$m.gl --freestanding --emit-obj -o /tmp/probe_$m.o \
+                 > /tmp/probe-logs/$m.log 2>&1; then
+              echo "OK   $m" | tee -a /tmp/probe-logs/summary.txt
+            else
+              echo "FAIL $m" | tee -a /tmp/probe-logs/summary.txt
+            fi
+            rm -f probe_$m.gl
+          done
+          echo "=== summary ==="
+          cat /tmp/probe-logs/summary.txt
+
+      - name: Publish probe logs to ci-logs branch
+        if: always()
+        run: |
+          cd /tmp/probe-logs
+          git init -b ci-logs
+          git config user.name "ci"
+          git config user.email "ci@localhost"
+          git add -A
+          git commit -m "Engine probe logs for run ${{ github.run_id }} (${{ github.sha }})"
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ci-logs
