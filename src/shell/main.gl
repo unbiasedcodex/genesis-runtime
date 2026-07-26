@@ -703,9 +703,15 @@ fn shell_execute() {
         else if commands::cmd_match(98, 114, 111, 119, 115, 101, 114, 0) {
             commands::cmd_browser();
         }
-        // "geb" = 103, 101, 98 (alias for browser)
+        // "geb" = 103, 101, 98 - launch Geb browser process
         else if commands::cmd_match(103, 101, 98, 0, 0, 0, 0, 0) {
-            commands::cmd_browser();
+            // Exec "geb" module from RAMFS (name packed little-endian)
+            let geb_pid = runtime::exec(0x626567);
+            if geb_pid < 0 {
+                // "GEB?"
+                commands::print_str(71, 69, 66, 63, 0, 0, 0, 0);  // "GEB?"
+                commands::putchar(10);
+            }
         }
         else {
             // Unknown command
