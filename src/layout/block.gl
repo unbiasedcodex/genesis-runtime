@@ -482,7 +482,7 @@ fn resolve_dimension_or_auto(dim: &Dimension, containing: f64) -> Option<f64> {
 fn calculate_shrink_to_fit_width(layout_box: &LayoutBox, available: f64) -> f64 {
     // Simplified shrink-to-fit calculation
     // In a full implementation, this would calculate preferred and minimum widths
-    let mut max_child_width = 0.0_f64;
+    let mut max_child_width = 0.0;
 
     for child in &layout_box.children {
         let child_width = child.dimensions.margin_box().width;

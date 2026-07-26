@@ -34,8 +34,9 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       (src/css/cascade.gl:1356 + grep for more).
 - [ ] 1.8 tls: remove `core::mem::transmute` x2 (src/tls/mod.gl:796,864);
       store callbacks as typed `fn(...)` fields (needs Phase 2.2 to parse).
-- [ ] 1.9 browser: raw strings -> escaped normal strings
-      (src/browser/mod.gl:318 home HTML, src/browser/tab.gl:469 default CSS).
+- [ ] 1.9 MOVED TO 2.10: there are 7 raw-string sites (6 in browser/mod.gl:
+      318,370,395,434,458,523 + tab.gl:469), multi-line HTML/CSS bodies with
+      embedded quotes — a glc lexer feature is cheaper than rewriting them.
 - [ ] 1.10 browser: `Key::Char('1') ..= Key::Char('9')` -> binding + guard
       (src/browser/main.gl:663).
 
@@ -61,6 +62,7 @@ tls, browser FAIL. Root causes mapped below with exact locations.
       PatternKind::Ref exists; verify downstream semantics safe under HARC).
 - [ ] 2.8 `mut self` by-value receiver in parse_param (alternative to
       1.2/1.3 if cheaper; either side may close this).
+- [ ] 2.10 Raw strings r#"..."# (multi-line) in the lexer — replaces 1.9.
 - [ ] 2.9 Tests for each item following tests/ conventions; `cargo test`
       green in lang CI.
 

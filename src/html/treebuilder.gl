@@ -419,7 +419,7 @@ impl TreeBuilder {
     }
 
     // Parse HTML and return document
-    pub fn parse(mut self) -> Document {
+    pub fn parse(&mut self) -> Document {
         loop {
             let token = self.tokenizer.next_token();
             let is_eof = matches!(token, HtmlToken::EOF);

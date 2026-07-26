@@ -494,7 +494,7 @@ impl Document {
     }
 
     // Get all matching rules for a node
-    pub fn get_matching_rules<'a>(&self, node_idx: usize, stylesheet: &'a Stylesheet) -> Vec<(Specificity, &'a StyleRule)> {
+    pub fn get_matching_rules(&self, node_idx: usize, stylesheet: &Stylesheet) -> Vec<(Specificity, &StyleRule)> {
         let mut matched = Vec::new();
 
         for rule in stylesheet.get_style_rules() {

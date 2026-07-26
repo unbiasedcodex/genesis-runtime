@@ -660,7 +660,7 @@ impl Browser {
                         self.switch_tab(new_index);
                     }
                 },
-                Key::Char('1') ..= Key::Char('9') => {
+                Key::Char(digit) if digit >= '1' && digit <= '9' => {
                     if let Key::Char(c) = key {
                         let index = (c as usize) - ('1' as usize);
                         if index < self.tabs.len() {

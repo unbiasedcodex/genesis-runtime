@@ -862,7 +862,7 @@ impl Stylesheet {
         rules
     }
 
-    fn collect_style_rules<'a>(&'a self, rules: &'a [CssRule], result: &mut Vec<&'a StyleRule>) {
+    fn collect_style_rules(&self, rules: &[CssRule], result: &mut Vec<&StyleRule>) {
         for rule in rules {
             match rule {
                 CssRule::Style(style) => result.push(style),
