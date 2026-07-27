@@ -109,16 +109,45 @@ theme — values modelled as i64 where a pointer is required.
       Undefined vregs and calls to undefined functions now panic naming
       the function/callee instead of emitting a silent `i64 0`
       (llvm.rs get_vreg + unknown-callee arm).
-- [ ] 4.1 css / tls / layout: a plain `load i64` is passed where a pointer
+**MODULE SYSTEM FIXED (2026-07-27).** Five compiler bugs, all one theme -
+modules were barely wired: lowering skipped `impl` blocks inside modules
+(every constructor missing), typeck never checked module bodies (no
+expression had a type, so method calls became `unknown::len`), and types
+and functions declared in a module were registered only under
+`module::Name`, invisible to code in that same module. Plus: pointer
+stores now retype their slot, and callees resolve by longest suffix.
+Probe errors are now DIVERSE per module (below) instead of one shared
+blocker.
+
+Per-module state after the module fixes:
+- [ ] 4.5 crypto: `*mut u8` has no method `offset` (pointer arithmetic
+      missing from the stdlib/method table).
+- [ ] 4.6 image: `struct ImageBuffer has no field palette` - check whether
+      this is a genuine field gap or the bare-name aliasing picking a
+      same-named type from another module (duplicates: BitReader,
+      HuffmanTable, Point).
+- [ ] 4.7 html: `type mismatch: expected str, found &str`.
+- [ ] 4.8 css: `cannot dereference type f64`.
+- [ ] 4.9 layout: `undefined variable Position::Static` (enum variant from
+      a sibling module, cascade::Position).
+- [ ] 4.10 tls / browser: reference symbols from OTHER modules
+      (aes_gcm_seal from crypto). The probe compiles each module standalone,
+      so these are expected; add a combined probe unit (mod crypto; mod tls;
+      ...) to test them honestly.
+- [ ] 4.11 net: `url_parse` still unresolved - url is a sibling module of
+      http; check whether the bare-name alias covers cross-module calls in
+      lowering as well as typeck.
+
+- [x] 4.1 css / tls / layout: a plain `load i64` is passed where a pointer
       is expected (e.g. css: `%load2 = load i64, ptr %alloca1`). A local or
       field holding a reference is typed i64 by lowering. Find where the
       pointer type is lost (likely struct-field or let-binding types in
       ir/lower.rs) and keep the pointer type.
-- [ ] 4.2 image: a constant `i64 0` (is_const, is_null) reaches a pointer
+- [x] 4.2 image: a constant `i64 0` (is_const, is_null) reaches a pointer
       position — not an unknown call (that now panics). Candidates: the
       remaining `Constant::Struct` stub (llvm.rs ~1785) or an integer 0
       assigned to a pointer-typed slot.
-- [ ] 4.3 html / crypto: `ret i64 0` from a pointer-returning function —
+- [x] 4.3 html / crypto: `ret i64 0` from a pointer-returning function —
       same class as 4.2, on the return path.
 - [ ] 4.4 Re-run probe after each fix; expect modules to clear in order
       crypto/image (leaves) -> layout -> html/css -> tls -> browser.
