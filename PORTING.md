@@ -99,7 +99,31 @@ Phase 1 complete except 1.9 (moved to 2.10). Phase 2 items unblock the rest.
 - [ ] 3.5 Codegen tests (const table indexed in main; repeat-initializer;
       i64 case). Unblocks image, fixes silent miscompile in crypto.
 
-## Phase 4 — Wave-2 audit after Phases 1-3
+## Phase 4 — Wave-2: codegen type modelling (CURRENT FRONT)
+
+State after phases 1-3 (probe 2026-07-26): **every module now parses and
+type-checks**; all remaining failures are in LLVM codegen and share one
+theme — values modelled as i64 where a pointer is required.
+
+- [x] 4.0 Diagnostics: codegen no longer papers over missing values.
+      Undefined vregs and calls to undefined functions now panic naming
+      the function/callee instead of emitting a silent `i64 0`
+      (llvm.rs get_vreg + unknown-callee arm).
+- [ ] 4.1 css / tls / layout: a plain `load i64` is passed where a pointer
+      is expected (e.g. css: `%load2 = load i64, ptr %alloca1`). A local or
+      field holding a reference is typed i64 by lowering. Find where the
+      pointer type is lost (likely struct-field or let-binding types in
+      ir/lower.rs) and keep the pointer type.
+- [ ] 4.2 image: a constant `i64 0` (is_const, is_null) reaches a pointer
+      position — not an unknown call (that now panics). Candidates: the
+      remaining `Constant::Struct` stub (llvm.rs ~1785) or an integer 0
+      assigned to a pointer-typed slot.
+- [ ] 4.3 html / crypto: `ret i64 0` from a pointer-returning function —
+      same class as 4.2, on the return path.
+- [ ] 4.4 Re-run probe after each fix; expect modules to clear in order
+      crypto/image (leaves) -> layout -> html/css -> tls -> browser.
+
+## Phase 4b — Remaining source-side gaps
 
 - [ ] 4.1 Re-run probe; update the status table above.
 - [ ] 4.2 image: audit calls to std::mem::swap, sort_by, Peekable
