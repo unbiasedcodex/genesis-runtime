@@ -119,20 +119,16 @@ stores now retype their slot, and callees resolve by longest suffix.
 Probe errors are now DIVERSE per module (below) instead of one shared
 blocker.
 
-**OPEN REGRESSION (blocks merge to main).** With typeck now checking
-module bodies, the KERNEL no longer builds: 30 sites in src/net/arp.gl
-emit `add i1 %loadN, i64 %loadM` (and matching call-signature errors)
-for `arp_write_byte/arp_write_ip/arp_memcpy`. All of them are
-`pkt + ARP_*` where `let pkt = ARP_TX_BUF;` and
-`const ARP_TX_BUF: i64 = 0xD31000;` - so `pkt` is being typed bool.
-Kernel module bodies had never been type-checked before, so this is the
-first time inference runs there. Next step: dump the IR for
-`net::arp::arp_build_request` (glc --emit-llvm) and find where the
-const's type is lost - suspects are const registration inside modules
-(register_const_with_prefix uses define_var, which may not survive the
-scope in force when the module's functions are checked) and the
-first-wins bare-name aliasing added for types/functions. Until this is
-fixed, `main` must not take the genesis-lang ci branch.
+**REGRESSION RESOLVED + MERGED (2026-07-27).** Root cause: expression
+types are keyed by span, and every file was lexed from offset zero, so
+expressions at the same offset in different files shared one entry.
+Harmless while module bodies went unchecked; once they were checked the
+kernel picked up types from unrelated files (a pointer local typed bool
+at 30 sites in net/arp.gl). Fix: each source file now gets its own span
+range (lexer span_base + parse_with_span_base + a per-file base handed
+out during module resolution), and span-to-text lookups subtract that
+base. Full system CI green (KERNEL/MM OK/EST!/RES=0/TLS OK/MODS: 5/GEB)
+and all three repos merged to main.
 
 Per-module state after the module fixes:
 - [ ] 4.5 crypto: `*mut u8` has no method `offset` (pointer arithmetic
