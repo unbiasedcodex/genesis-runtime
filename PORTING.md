@@ -9,8 +9,13 @@ unchecked item.
 standalone and publishes logs to the `ci-logs` branch (`summary.txt` +
 per-module logs). System boot test lives in genesis-kernel's workflow.
 
-**Probe status (2026-07-26)**: net OK; crypto, image, html, css, layout, js,
-tls, browser FAIL. Root causes mapped below with exact locations.
+**Probe status (2026-07-26, after phase 2 parser pack)**: net OK.
+Parse phase now CLEAN for css, tls, image (they reach codegen and hit the
+const-array panic -> phase 3). crypto parses but fails LLVM verification
+("Function return type does not match operand type of return inst").
+layout: `matches!` (fixed in parser, pending probe). html: `ref` keyword
+(fixed, pending probe). browser/js: attributes and `use` in STATEMENT
+position inside fn bodies (new gap, see 2.11) plus raw strings (2.10).
 
 ---
 
@@ -68,7 +73,17 @@ Phase 1 complete except 1.9 (moved to 2.10). Phase 2 items unblock the rest.
 - [x] 2.7 `ref` / `ref mut` in struct-pattern fields (parser.rs:3584;
       PatternKind::Ref exists; verify downstream semantics safe under HARC).
 - [x] 2.8 CLOSED by 1.2/1.3 (call sites rewritten to &mut self instead).
-- [x] 2.10 Raw strings r#"..."# (multi-line) in the lexer — replaces 1.9.
+- [ ] 2.10 Raw strings r#"..."# (multi-line) in the lexer — replaces 1.9.
+- [x] 2.9b `matches!(value, pat [if guard])` desugared in the parser into a
+      match expression (63 sites in the engine).
+- [x] 2.9c `ref` accepted as a keyword token in binding and struct-field
+      patterns (the first attempt only handled it as an identifier).
+- [ ] 2.11 Attributes and `use` in STATEMENT position inside fn bodies
+      (browser/mod.gl ~9474, js/mod.gl:414): skip `#[...]`-annotated
+      statements and either support or skip in-body `use`.
+- [ ] 2.12 crypto LLVM verification error: "Function return type does not
+      match operand type of return inst" — find the offending function
+      (likely a fixed-array or struct return) and fix lowering.
 - [ ] 2.9 Tests for each item following tests/ conventions; `cargo test`
       green in lang CI.
 
