@@ -176,3 +176,13 @@ theme — values modelled as i64 where a pointer is required.
 - [x] Geb skeleton as PID 5 at native base 0x5000000; RAMFS 32MB + reserve
       fix; 5th GRUB module; `geb` shell command execs it — screenshot.
 - [x] net/mod.gl index + duplicate `mod url;` removed; engine probe workflow.
+- [x] Phase 1 source rewrites; phase 2 parser/lexer pack; phase 3 const
+      array codegen. Every engine module now parses and type-checks.
+- [x] Codegen diagnostics: undefined values and calls to undefined
+      functions now name the function instead of emitting a silent zero.
+      This exposed a real pre-existing bug (a match over void-returning
+      arms stored an undefined result), fixed by binding unit results
+      where they are produced.
+- [x] Full system CI green with the updated compiler (kernel + five
+      userspace services + QEMU boot: KERNEL/MM OK/EST!/TLS OK/MODS: 5/
+      GEB), then merged to main in all three repos.
