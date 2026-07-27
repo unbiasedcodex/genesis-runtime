@@ -49,27 +49,26 @@ tls, browser FAIL. Root causes mapped below with exact locations.
 
 Phase 1 complete except 1.9 (moved to 2.10). Phase 2 items unblock the rest.
 
-- [ ] 2.1 Ignore unknown attributes (e.g. `#[test]`) and SKIP items annotated
+- [x] 2.1 Ignore unknown attributes (e.g. `#[test]`) and SKIP items annotated
       `#[cfg(test)]` via token-level balanced-brace skipping
       (parser.rs:362-368 whitelist is repr/derive only). Kills ~half of
       html/js/browser error volume incl. `use super::*` and test raw strings.
-- [ ] 2.2 `fn(...) -> T` pointer TYPES in parse_type (parser.rs:3188).
+- [x] 2.2 `fn(...) -> T` pointer TYPES in parse_type (parser.rs:3188).
       AST TypeKind::FnPtr (ast.rs:548), typeck (infer.rs:3775) and IR
       (lower.rs:1448) already wired. Unblocks tls entirely.
-- [ ] 2.3 Keywords as method/field names after `.` (`.join` fails; join/spawn
+- [x] 2.3 Keywords as method/field names after `.` (`.join` fails; join/spawn
       are keywords, token.rs:150). Scope to post-dot position.
-- [ ] 2.4 Float literal suffixes `0.0_f64` in lexer (token.rs:42). (Optional
+- [x] 2.4 Float literal suffixes `0.0_f64` in lexer (token.rs:42). (Optional
       once 1.4 lands; still worth accepting.)
-- [ ] 2.5 Unicode char escapes `'\u{...}'` (token.rs:55 char regex; 54 sites
+- [x] 2.5 Unicode char escapes `'\u{...}'` (token.rs:55 char regex; 54 sites
       in html/css tokenizers).
-- [ ] 2.6 Char/int range patterns `'0'..='9'` in match (PatternKind::Range
+- [x] 2.6 Char/int range patterns `'0'..='9'` in match (PatternKind::Range
       exists ast.rs:891; parser hookup missing; check exhaustiveness
       handles Range or require wildcard arm).
-- [ ] 2.7 `ref` / `ref mut` in struct-pattern fields (parser.rs:3584;
+- [x] 2.7 `ref` / `ref mut` in struct-pattern fields (parser.rs:3584;
       PatternKind::Ref exists; verify downstream semantics safe under HARC).
-- [ ] 2.8 `mut self` by-value receiver in parse_param (alternative to
-      1.2/1.3 if cheaper; either side may close this).
-- [ ] 2.10 Raw strings r#"..."# (multi-line) in the lexer — replaces 1.9.
+- [x] 2.8 CLOSED by 1.2/1.3 (call sites rewritten to &mut self instead).
+- [x] 2.10 Raw strings r#"..."# (multi-line) in the lexer — replaces 1.9.
 - [ ] 2.9 Tests for each item following tests/ conventions; `cargo test`
       green in lang CI.
 
