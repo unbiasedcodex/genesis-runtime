@@ -65,8 +65,7 @@ jobs:
           done
           # Combined unit: how the engine is actually compiled into geb.gl,
           # so cross-module references (layout -> css, tls -> crypto) resolve.
-          cat > probe_all.gl <<'GL'
-mod crypto;
+          printf 'mod crypto;
 mod image;
 mod html;
 mod css;
@@ -76,7 +75,7 @@ mod tls;
 
 fn main() {
 }
-GL
+' > probe_all.gl
           if timeout 600 $GLC build probe_all.gl --freestanding --emit-obj -o /tmp/probe_all.o                > /tmp/probe-logs/combined.log 2>&1; then
             echo "OK   combined" | tee -a /tmp/probe-logs/summary.txt
           else
