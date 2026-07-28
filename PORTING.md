@@ -130,6 +130,32 @@ out during module resolution), and span-to-text lookups subtract that
 base. Full system CI green (KERNEL/MM OK/EST!/RES=0/TLS OK/MODS: 5/GEB)
 and all three repos merged to main.
 
+**STATE 2026-07-27 (evening).** The engine now compiles as ONE combined
+unit down to three type errors (the probe also runs each module alone,
+where cross-module references fail for reasons the real build never
+hits - `Position::Static`, `aes_gcm_seal` - ignore those).
+
+Combined-unit errors, now reported as file:offset:
+- [ ] 4.12 image/common.gl:1836 `struct ImageBuffer has no field palette`.
+      NOT reproduced by three minimal tests (all green, kept as
+      regression cases): nested generics in a struct field; struct+impl
+      inside an inline module; the nested-generic field placed last.
+      Remaining difference vs the engine: the module lives in SEPARATE
+      FILES (own span base each) and image/mod.gl re-exports the type
+      (`pub use common::{ImageBuffer, ...}`). Try a two-file repro next.
+- [ ] 4.13 html/tokenizer.gl:990 `expected str, found &str`.
+- [ ] 4.14 css/tokenizer.gl:2409 `expected &char, found char`
+      (`self.input.get(self.pos).copied()` shape).
+- [ ] 4.15 layout/box_model.gl:8780 `Vec<LayoutBox> has no method last_mut`.
+- [ ] 4.16 tls/record.gl:9574 `expected Vec<u8>, found TlsRecord`.
+- [ ] 4.17 NEW typeck gap: module-qualified associated functions
+      (`inner::Holder::new`) are reported as undefined variables. Mirror
+      of the suffix fallback already added to IR lowering.
+
+Tooling added this round: probe compiles a combined unit; type errors
+print `file:offset` (span registry in the parser); tests/codegen/*.gl are
+compiled by lang CI and their output published to that repo's ci-logs.
+
 Per-module state after the module fixes:
 - [ ] 4.5 crypto: `*mut u8` has no method `offset` (pointer arithmetic
       missing from the stdlib/method table).
