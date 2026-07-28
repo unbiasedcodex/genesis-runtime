@@ -1,0 +1,4 @@
+Compiling probe_tls.gl...
+Type error at tls/record.gl:8827: undefined variable `aes_gcm_seal`
+Error:   × Found 1 type error(s)
+

@@ -1,0 +1,7 @@
+Compiling probe_net.gl...
+
+Type checking successful!
+
+thread 'main' (3014) panicked at src/ir/llvm.rs:1289:29:
+codegen: call to undefined function `net::http::url::url_parse` in `net::http::http_request`                                  (missing definition or unsupported stdlib method)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

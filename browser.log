@@ -1,0 +1,9 @@
+Compiling probe_browser.gl...
+Parser error at Span { start: 1000009474, end: 1000009475 }: unexpected token: expected ), found #
+Parser error at Span { start: 1000032469, end: 1000032470 }: unexpected token: expected expression, found #
+Parser error at Span { start: 1000034510, end: 1000034513 }: unexpected token: expected item, found let
+Parser error at Span { start: 1000034574, end: 1000034578 }: unexpected token: expected item, found self
+Parser error at Span { start: 1000034626, end: 1000034627 }: unexpected token: expected item, found }
+Parser error at Span { start: 1000041684, end: 1000041685 }: unexpected token: expected item, found }
+Error:   × Found 6 parse error(s)
+

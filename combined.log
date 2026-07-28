@@ -1,0 +1,8 @@
+Compiling probe_all.gl...
+Type error at image/common.gl:1836: struct `ImageBuffer` has no field `palette`
+Type error at html/tokenizer.gl:990: type mismatch: expected `str`, found `&str`
+Type error at css/tokenizer.gl:2409: type mismatch: expected `&char`, found `char`
+Type error at layout/box_model.gl:8780: type `Vec<LayoutBox>` has no method `last_mut`
+Type error at tls/record.gl:9574: type mismatch: expected `Vec<u8>`, found `TlsRecord`
+Error:   × Found 5 type error(s)
+

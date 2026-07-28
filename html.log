@@ -1,0 +1,4 @@
+Compiling probe_html.gl...
+Type error at html/tokenizer.gl:990: type mismatch: expected `str`, found `&str`
+Error:   × Found 1 type error(s)
+

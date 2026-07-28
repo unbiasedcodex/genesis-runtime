@@ -1,0 +1,4 @@
+Compiling probe_layout.gl...
+Type error at layout/box_model.gl:7672: undefined variable `Position::Static`
+Error:   × Found 1 type error(s)
+

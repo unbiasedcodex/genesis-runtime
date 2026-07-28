@@ -1,0 +1,4 @@
+Compiling probe_image.gl...
+Type error at image/common.gl:1836: struct `ImageBuffer` has no field `palette`
+Error:   × Found 1 type error(s)
+
