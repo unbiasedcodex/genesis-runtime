@@ -1109,7 +1109,7 @@ fn parse_dimension(value: &CssValue) -> Option<Dimension> {
 
 fn parse_length(value: &CssValue) -> Option<f64> {
     match value {
-        CssValue::Length(n, _) => Some(*n),
+        CssValue::Length(n, _) => Some(n),
         CssValue::Number(n) if *n == 0.0 => Some(0.0),
         _ => None,
     }
@@ -1117,7 +1117,7 @@ fn parse_length(value: &CssValue) -> Option<f64> {
 
 fn parse_border_width(value: &CssValue) -> Option<f64> {
     match value {
-        CssValue::Length(n, _) => Some(*n),
+        CssValue::Length(n, _) => Some(n),
         CssValue::Number(n) if *n == 0.0 => Some(0.0),
         CssValue::Keyword(k) => match k.as_str() {
             "thin" => Some(1.0),
@@ -1167,7 +1167,7 @@ fn parse_font_family(values: &[CssValue]) -> Vec<String> {
 
 fn parse_font_size(value: &CssValue) -> Option<f64> {
     match value {
-        CssValue::Length(n, _) => Some(*n),
+        CssValue::Length(n, _) => Some(n),
         CssValue::Percentage(n) => Some(*n * 16.0 / 100.0), // Relative to 16px default
         CssValue::Keyword(k) => match k.as_str() {
             "xx-small" => Some(9.0),

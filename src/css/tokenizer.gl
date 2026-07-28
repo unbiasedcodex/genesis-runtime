@@ -71,9 +71,9 @@ impl CssToken {
 
     pub fn as_number(&self) -> Option<f64> {
         match self {
-            CssToken::Number(n, _) => Some(*n),
-            CssToken::Percentage(n) => Some(*n),
-            CssToken::Dimension(n, _) => Some(*n),
+            CssToken::Number(n, _) => Some(n),
+            CssToken::Percentage(n) => Some(n),
+            CssToken::Dimension(n, _) => Some(n),
             _ => None,
         }
     }

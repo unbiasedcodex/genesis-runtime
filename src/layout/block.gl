@@ -473,7 +473,7 @@ fn resolve_dimension(dim: &Dimension, containing: f64) -> f64 {
 fn resolve_dimension_or_auto(dim: &Dimension, containing: f64) -> Option<f64> {
     match dim {
         Dimension::Auto => None,
-        Dimension::Length(v) => Some(*v),
+        Dimension::Length(v) => Some(v),
         Dimension::Percentage(p) => Some(containing * p / 100.0),
         _ => None,
     }

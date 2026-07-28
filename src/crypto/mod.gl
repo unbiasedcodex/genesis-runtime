@@ -113,17 +113,16 @@ fn u64_from_bytes(bytes: &[u8]) -> u64 {
 // ============================================================
 
 // Securely zero memory
+//
+// Written as plain indexed stores: glc has no pointer offset method, no
+// core::ptr and no atomic fences. Indexing keeps the writes in program
+// order for the current backend.
 pub fn secure_zero(buffer: &mut [u8]) {
     let mut i: usize = 0;
     while i < buffer.len() {
-        unsafe {
-            let ptr = buffer.as_mut_ptr().offset(i as isize);
-            core::ptr::write_volatile(ptr, 0);
-        }
+        buffer[i] = 0;
         i = i + 1;
     }
-    // Memory barrier to prevent optimization
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 // Constant-time comparison

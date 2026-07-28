@@ -665,7 +665,7 @@ impl CssValue {
                 Some(px)
             },
             CssValue::Number(n) if *n == 0.0 => Some(0.0),
-            CssValue::Percentage(n) => Some(*n), // Context dependent
+            CssValue::Percentage(n) => Some(n), // Context dependent
             _ => None,
         }
     }
@@ -682,7 +682,7 @@ impl CssValue {
                 };
                 Some(deg)
             },
-            CssValue::Number(n) => Some(*n),
+            CssValue::Number(n) => Some(n),
             _ => None,
         }
     }
